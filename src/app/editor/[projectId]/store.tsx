@@ -280,18 +280,23 @@ function createEditorStore(initial: { snapThresholdPx: number }) {
       })),
 
     runCommand: async (command) => {
-      set({ saveStatus: "saving" });
+      // historyBusy gates Undo/Redo for the FULL duration of execute(), not
+      // just the undo()/redo() calls themselves — otherwise a command still
+      // pushing to undoStack (some, like reorder, take 500ms-2s) leaves the
+      // Undo button clickable and targeting the previous, wrong entry.
+      set({ historyBusy: true, saveStatus: "saving" });
       try {
         await command.execute();
         set((state) => ({
           undoStack: [...state.undoStack, command].slice(-MAX_HISTORY),
           redoStack: [],
+          historyBusy: false,
           saveStatus: "saved",
           lastSavedAt: Date.now(),
           lastSaveError: null,
         }));
       } catch (err) {
-        set({ saveStatus: "error", lastSaveError: err instanceof Error ? err.message : "Save failed." });
+        set({ historyBusy: false, saveStatus: "error", lastSaveError: err instanceof Error ? err.message : "Save failed." });
         throw err;
       }
     },
