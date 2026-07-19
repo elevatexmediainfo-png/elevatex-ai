@@ -82,3 +82,21 @@ export async function checkVideoActionAccess(userId: string, actionKey: string):
 
   return { credits: action.credits };
 }
+
+// Same 2.5x margin / ₹6.66-per-credit-floor convention already used for
+// every fixed-price video action's own manual pricing comment (veo_lite,
+// veo_standard, film_scene — see VIDEO_ACTION_CREDIT_COSTS' doc comments),
+// generalized into a reusable formula for actions whose real cost varies
+// per-run instead of being a known fixed amount (e.g. AI Auto-Editor, whose
+// total vendor spend depends on video length/providers used). USD_TO_INR_RATE
+// is the one already-admin-configurable input; the margin and floor are the
+// same fixed constants the fixed-price actions above already bake in
+// manually — kept here as one reusable, named calculation instead of a
+// third hand-copied one.
+const VIDEO_ACTION_MARGIN_MULTIPLIER = 2.5;
+const VIDEO_ACTION_CREDIT_FLOOR_INR = 6.66;
+
+export function convertUsdToCredits(costUsd: number, usdToInrRate: number): number {
+  if (costUsd <= 0) return 0;
+  return Math.ceil((costUsd * usdToInrRate * VIDEO_ACTION_MARGIN_MULTIPLIER) / VIDEO_ACTION_CREDIT_FLOOR_INR);
+}

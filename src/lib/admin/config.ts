@@ -1,0 +1,995 @@
+import { z } from "zod";
+
+import { prisma } from "@/lib/prisma";
+import { getOrSetCache, invalidateCache } from "@/lib/cache/cache";
+import { LLM_PROVIDER_IDS } from "@/lib/providers/llm";
+import { IMAGE_PROVIDER_IDS } from "@/lib/providers/image";
+import { VOICE_PROVIDER_IDS } from "@/lib/providers/voice";
+import { VIDEO_PROVIDER_IDS } from "@/lib/providers/video";
+
+// ============================================================================
+// Admin-editable system configuration. Every key here is a row in
+// SystemConfig (DB), not an env var — changing one is a write from the admin
+// panel (/admin/*), takes effect within CONFIG_CACHE_TTL_MS, and needs no
+// redeploy. This is the single place "configurable without changing code"
+// actually means something concrete: provider selection, pricing rules,
+// credit rules, and download rules all read through here.
+// ============================================================================
+
+// Priority-ordered provider lists for the 4 Generation Engine categories
+// (src/lib/generation/). The engine tries index 0 first; on exhausted
+// retries (GENERATION_RETRY_MAX_ATTEMPTS) or a health-cooldown skip, it
+// fails over to the next id in the array. A single-element array behaves
+// exactly like the old single-select PROVIDER_LLM-style config it replaces.
+export const CONFIG_REGISTRY = {
+  PROVIDER_LLM_PRIORITY: {
+    // Enum values sourced from LLM_PROVIDER_IDS (lib/providers/llm/index.ts)
+    // — the same constant the factory's switch statement is keyed on, so a
+    // new adapter only ever needs updating in one place.
+    schema: z.array(z.enum(LLM_PROVIDER_IDS)).min(1),
+    default: ["mock"] as const,
+    label: "LLM Provider priority",
+    description:
+      "Generates video scripts from the prompt engine's output. Tried in order; falls over to the next on failure.",
+    category: "providers",
+  },
+  PROVIDER_IMAGE_PRIORITY: {
+    schema: z.array(z.enum(IMAGE_PROVIDER_IDS)).min(1),
+    default: ["mock"] as const,
+    label: "Image Generation Provider priority",
+    description: "Generates video thumbnails. Tried in order; falls over to the next on failure.",
+    category: "providers",
+  },
+  PROVIDER_VOICE_PRIORITY: {
+    schema: z.array(z.enum(VOICE_PROVIDER_IDS)).min(1),
+    default: ["mock"] as const,
+    label: "Voice Generation Provider priority",
+    description:
+      "Generates voiceover audio for templates with includeVoiceover enabled. Tried in order; falls over to the next on failure.",
+    category: "providers",
+  },
+  PROVIDER_VIDEO_PRIORITY: {
+    schema: z.array(z.enum(VIDEO_PROVIDER_IDS)).min(1),
+    default: ["mock"] as const,
+    label: "Video Generation Provider priority",
+    description: "Renders the master video asset. Tried in order; falls over to the next on failure.",
+    category: "providers",
+  },
+  PROVIDER_STORAGE: {
+    schema: z.enum(["mock", "s3"]),
+    default: "mock" as const,
+    label: "Storage Provider",
+    description: "Hosts rendered assets and mints signed download URLs.",
+    category: "providers",
+  },
+  PROVIDER_PAYMENT: {
+    schema: z.enum(["mock", "razorpay"]),
+    default: "mock" as const,
+    label: "Payment Provider",
+    description: "Processes credit package purchases and subscriptions.",
+    category: "providers",
+  },
+  // Milestone 13 — global allow-list, not per-plan/per-package (a deliberate
+  // scope cut; per-plan overrides could reuse this same z.record() pattern
+  // later with zero architecture change if ever needed). Default preserves
+  // today's behavior exactly: Razorpay's hosted checkout shows every method
+  // it supports when nothing restricts it.
+  PAYMENT_METHODS_ENABLED: {
+    schema: z.array(z.enum(["card", "upi", "netbanking", "wallet", "emi"])).min(1),
+    default: ["card", "upi", "netbanking", "wallet", "emi"] as const,
+    label: "Enabled payment methods",
+    description: "Which payment methods Razorpay Checkout offers at checkout.",
+    category: "payment_settings",
+  },
+
+  GENERATION_RETRY_MAX_ATTEMPTS: {
+    schema: z.number().int().min(1).max(5),
+    default: 2,
+    label: "Max attempts per provider",
+    description: "How many times the Generation Engine retries a single provider before failing over to the next one.",
+    category: "generation_policy",
+  },
+  GENERATION_RETRY_BACKOFF_MS: {
+    schema: z.number().int().min(0).max(10_000),
+    default: 500,
+    label: "Retry backoff (ms)",
+    description: "Base delay between retries against the same provider; multiplied by the attempt number.",
+    category: "generation_policy",
+  },
+  GENERATION_TIMEOUT_MS_LLM: {
+    schema: z.number().int().min(1000).max(600_000),
+    default: 20_000,
+    label: "LLM timeout (ms)",
+    description: "How long the engine waits for a script-generation call before treating it as failed.",
+    category: "generation_policy",
+  },
+  GENERATION_TIMEOUT_MS_IMAGE: {
+    schema: z.number().int().min(1000).max(600_000),
+    default: 30_000,
+    label: "Image timeout (ms)",
+    description: "How long the engine waits for an image-generation call before treating it as failed.",
+    category: "generation_policy",
+  },
+  GENERATION_TIMEOUT_MS_VOICE: {
+    schema: z.number().int().min(1000).max(600_000),
+    default: 30_000,
+    label: "Voice timeout (ms)",
+    description: "How long the engine waits for a voiceover-generation call before treating it as failed.",
+    category: "generation_policy",
+  },
+  GENERATION_TIMEOUT_MS_VIDEO: {
+    schema: z.number().int().min(1000).max(600_000),
+    default: 180_000,
+    label: "Video timeout (ms)",
+    description: "How long the engine waits for a video-render call before treating it as failed.",
+    category: "generation_policy",
+  },
+  GENERATION_TIMEOUT_MS_TRANSCRIPTION: {
+    schema: z.number().int().min(1000).max(600_000),
+    default: 300_000,
+    label: "Transcription timeout (ms)",
+    description: "How long the engine waits for a speech-to-text call before treating it as failed — long videos take a while.",
+    category: "generation_policy",
+  },
+  GENERATION_TIMEOUT_MS_VIDEO_UNDERSTANDING: {
+    schema: z.number().int().min(1000).max(600_000),
+    default: 300_000,
+    label: "Video understanding timeout (ms)",
+    description: "How long the engine waits for a Gemini video-understanding call (file upload + processing + analysis) before treating it as failed. Phase 12 Module 3.",
+    category: "generation_policy",
+  },
+  GENERATION_TIMEOUT_MS_REASONING: {
+    schema: z.number().int().min(1000).max(600_000),
+    default: 60_000,
+    label: "Reasoning (timeline planning) timeout (ms)",
+    description: "How long the engine waits for a single GPT-5.x captions/zoom planning call before treating it as failed — text-only, no large upload, so a much shorter ceiling than transcription/video understanding. Phase 12 Module 4.",
+    category: "generation_policy",
+  },
+  GENERATION_HEALTH_FAILURE_THRESHOLD: {
+    schema: z.number().int().min(1).max(20),
+    default: 3,
+    label: "Health failure threshold",
+    description: "Consecutive failures (after retries) before a provider is marked DOWN and skipped.",
+    category: "generation_policy",
+  },
+  GENERATION_HEALTH_COOLDOWN_MS: {
+    schema: z.number().int().min(1000).max(3_600_000),
+    default: 300_000,
+    label: "Health cooldown (ms)",
+    description: "How long a DOWN provider is skipped before the engine gives it one more chance.",
+    category: "generation_policy",
+  },
+  GENERATION_COST_RATES: {
+    schema: z.record(
+      z.string(),
+      z.object({
+        unit: z.enum(["PER_CALL", "PER_1K_TOKENS", "PER_1K_CHARS", "PER_SECOND", "PER_IMAGE"]),
+        rate: z.number().min(0),
+      })
+    ),
+    default: {
+      mock: { unit: "PER_CALL", rate: 0 },
+      openai: { unit: "PER_1K_TOKENS", rate: 0.15 },
+      gemini: { unit: "PER_1K_TOKENS", rate: 0.075 },
+      self_hosted: { unit: "PER_CALL", rate: 0 },
+      openai_images: { unit: "PER_IMAGE", rate: 0.04 },
+      flux: { unit: "PER_IMAGE", rate: 0.03 },
+      ideogram: { unit: "PER_IMAGE", rate: 0.08 },
+      elevenlabs: { unit: "PER_1K_CHARS", rate: 0.18 },
+      replicate: { unit: "PER_SECOND", rate: 0.05 },
+      veo: { unit: "PER_SECOND", rate: 0.35 },
+      kling: { unit: "PER_SECOND", rate: 0.25 },
+      hailuo: { unit: "PER_SECOND", rate: 0.2 },
+      runway: { unit: "PER_SECOND", rate: 0.3 },
+      openai_whisper: { unit: "PER_SECOND", rate: 0.0001 },
+      // Phase 12 Module 10 — filled in for the AI Auto-Editor cost preview.
+      // These two providers (TRANSCRIPTION's "assemblyai", REASONING's
+      // "gpt5") predate this table and were never added, so every
+      // transcription/reasoning call has been silently costing $0 in every
+      // cost-tracking view since they shipped — not because no cost
+      // occurred, but because computeCost() has nothing to look up for an
+      // unmapped provider id. Rates below are estimates in the same
+      // per-vendor ballpark as their nearest neighbor above (assemblyai
+      // vs. openai_whisper for transcription; gpt5 vs. openai for
+      // premium-tier reasoning) — admin-adjustable like every other row,
+      // not a claim of exact vendor-invoice precision.
+      assemblyai: { unit: "PER_SECOND", rate: 0.00025 },
+      gpt5: { unit: "PER_1K_TOKENS", rate: 0.2 },
+    } as const,
+    label: "Generation cost rates (USD)",
+    description:
+      "Per-provider vendor cost used for cost tracking/analytics — not user-facing pricing. Keyed by provider id.",
+    category: "generation_policy",
+  },
+
+  // Milestone 11 — Talking Head pipeline. Independent of subscription plan
+  // type per the user's explicit choice: a single global switch, not a
+  // plan-tier check, gates the asset selector's fallback to AI video
+  // generation (the most expensive tier of the Part 5/11 waterfall).
+  TALKING_HEAD_AI_VIDEO_GENERATION_ENABLED: {
+    schema: z.boolean(),
+    default: false,
+    label: "Enable AI video generation for Talking Head editor",
+    description:
+      "Premium gate for the Talking Head pipeline's asset selector — when off, scenes that would otherwise fall back to AI video generation use a stock/image substitute instead.",
+    category: "generation_policy",
+  },
+
+  // Phase 7 — GPT Creative Director main pipeline wiring.
+  // When enabled, the enhance-prompt route runs the GPT-powered Creative
+  // Director (one extra LLM call) and passes its GPTCampaignDirection into
+  // buildPromptSpecification() so the Phase 13 translator uses the Phase 5.5
+  // optimized narrative (buildNarrativePrompt) as the final provider prompt.
+  // Off by default — turn on after validating output quality in the Prompt Lab.
+  GPT_CREATIVE_DIRECTOR_ENABLED: {
+    schema: z.boolean(),
+    default: false,
+    label: "GPT Creative Director",
+    description:
+      "When enabled, the GPT Creative Director runs on every image generation request and its optimised narrative (Phase 5.5 buildNarrativePrompt, ~840 tokens) replaces the section-based Phase 13 provider prompt. Adds one LLM call per request. Validate quality in /admin/prompt-lab before enabling.",
+    category: "generation_policy",
+  },
+
+  // Phase 10.4F — Single Pipeline Architecture.
+  // When this flag is on, ONLY the modern AI OS path runs (Phases 7–13):
+  //   - No legacy LLM calls (Creative Brief + Universal Prompt) are made.
+  //   - The Phase 13 translated prompt is used as the final enhancedPrompt.
+  // When this flag is off, ONLY the legacy path runs (2 LLM calls, Expander,
+  // Adapter): Phases 11–13 are skipped entirely.
+  // Before Phase 10.4F both paths always ran in parallel and the flag only
+  // selected which result to use — that design wasted one full LLM round-trip
+  // on every request. Enable this flag ONLY after validating Phase 13 output
+  // quality in /admin/prompt-lab.
+  PROVIDER_PROMPT_ENABLED: {
+    schema: z.boolean(),
+    default: false,
+    label: "Phase 13 Provider Prompt (AI-OS pipeline)",
+    description:
+      "Switches to the modern single-pipeline path: Phases 7–13 run exclusively, no legacy LLM calls. When off, only the legacy path runs (Creative Brief + Universal Prompt LLMs). Enable after validating Phase 13 output quality in /admin/prompt-lab.",
+    category: "generation_policy",
+  },
+
+  // Phase 10.6F — Translator Bypass Experiment (temporary, for A/B measurement
+  // only). Only takes effect when PROVIDER_PROMPT_ENABLED is also true — it
+  // gates the one step immediately before the provider API call, nothing
+  // upstream. Default true preserves today's behaviour exactly (Provider
+  // Translator runs, same as before this flag existed) on every environment
+  // that hasn't explicitly touched this config. When set false, the route
+  // uses prompt-builder-minimal's buildMinimalPrompt() instead — a
+  // non-editorial formatter over the same OptimizedPromptSpecification, with
+  // no section labels, reordering, quality sentence, or negative-prompt list
+  // added. Intended to be reverted to true (or removed) once the comparison
+  // this flag exists for is complete.
+  ENABLE_PROVIDER_TRANSLATOR: {
+    schema: z.boolean(),
+    default: true,
+    label: "Provider Prompt Translator (Phase 13)",
+    description:
+      "When on (default), the Phase 13 Provider Translator formats the final prompt as today. When off, a minimal, non-rewriting formatter is used instead — for the Phase 10.6F translator-bypass comparison only. Has no effect unless the Phase 13 Provider Prompt pipeline itself is also enabled.",
+    category: "generation_policy",
+  },
+
+  // Milestone 15 — Universal Creative Workflow's automatic brand-logo
+  // compositing (lib/image/composite-logo.ts). Admin-tunable defaults
+  // rather than a hardcoded corner/size — same posture as every other
+  // generation-policy knob in this category.
+  CREATIVE_LOGO_POSITION: {
+    schema: z.enum(["bottom-right", "bottom-left", "top-right", "top-left", "bottom-center"]),
+    default: "bottom-right" as const,
+    label: "Brand logo placement",
+    description: "Default corner a generated creative's uploaded brand logo is composited onto.",
+    category: "generation_policy",
+  },
+  CREATIVE_LOGO_SCALE_PERCENT: {
+    schema: z.number().min(5).max(25),
+    default: 14,
+    label: "Brand logo size (% of canvas width)",
+    description: "How large the composited brand logo is, as a percentage of the generated image's width.",
+    category: "generation_policy",
+  },
+
+  WATERMARK_TEXT: {
+    schema: z.string().min(1).max(40),
+    default: "Elevatex AI",
+    label: "Preview watermark text",
+    description: "Burned into every preview stream (free, unlimited tier).",
+    category: "download_rules",
+  },
+  PREVIEW_QUALITY: {
+    schema: z.enum(["480p", "720p"]),
+    default: "720p" as const,
+    label: "Preview quality",
+    description: "Resolution cap for the free, watermarked, streaming-only preview.",
+    category: "download_rules",
+  },
+  FINAL_QUALITY: {
+    schema: z.enum(["1080p", "4K"]),
+    default: "1080p" as const,
+    label: "Final download quality",
+    description: "Resolution for the paid, watermark-free, downloadable master.",
+    category: "download_rules",
+  },
+  DOWNLOAD_RATE_LIMIT_PER_DAY: {
+    schema: z.number().int().min(1).max(10000),
+    default: 50,
+    label: "Max downloads per user per day",
+    description: "Applies regardless of entitlement method (credit/subscription/purchase).",
+    category: "download_rules",
+  },
+
+  RENDER_QUEUE_CONCURRENCY: {
+    schema: z.number().int().min(1).max(20),
+    default: 3,
+    label: "Render queue concurrency",
+    description: "Max scene/merge render jobs the worker processes in parallel at once.",
+    category: "render_policy",
+  },
+  RENDER_MAX_ATTEMPTS: {
+    schema: z.number().int().min(1).max(10),
+    default: 3,
+    label: "Max render attempts per scene/merge job",
+    description: "How many times a failed scene render or merge job retries before being marked FAILED.",
+    category: "render_policy",
+  },
+  DEFAULT_NEGATIVE_PROMPT: {
+    schema: z.string().max(500),
+    default: "blurry, low quality, distorted, extra limbs, watermark, text artifacts",
+    label: "Default negative prompt",
+    description: "Applied to every new scene's image/video generation unless overridden. Some providers ignore it.",
+    category: "render_policy",
+  },
+  DEFAULT_BACKGROUND_MUSIC_URL: {
+    schema: z.string().max(500),
+    default: "",
+    label: "Default background music URL",
+    description: "Static track applied to every new scene. A static asset reference, not AI-generated. Empty = none.",
+    category: "render_policy",
+  },
+
+  // Milestone 8 — Scene Editor's voice/background-music pickers read these
+  // lists; both are plain content libraries (not pricing/business rules), so
+  // a `json` array is the right shape rather than a per-entry config key.
+  AVAILABLE_VOICES: {
+    schema: z.array(
+      z.object({
+        id: z.string().min(1),
+        label: z.string().min(1),
+        gender: z.enum(["MALE", "FEMALE", "NEUTRAL"]),
+      })
+    ),
+    default: [
+      { id: "default", label: "Provider default", gender: "NEUTRAL" },
+      { id: "warm_female", label: "Warm — Female", gender: "FEMALE" },
+      { id: "confident_male", label: "Confident — Male", gender: "MALE" },
+    ] as const,
+    label: "Available voices",
+    description:
+      "Voice options offered in the Scene Editor's voice picker. `id` is threaded into VoiceGenerateRequest.voiceId — real adapters (e.g. ElevenLabs) map it to an actual vendor voice id; Mock ignores it.",
+    category: "studio_content",
+  },
+  BACKGROUND_MUSIC_LIBRARY: {
+    schema: z.array(
+      z.object({
+        id: z.string().min(1),
+        label: z.string().min(1),
+        url: z.string().min(1),
+      })
+    ),
+    default: [] as const,
+    label: "Background music library",
+    description:
+      "Tracks offered in the Scene Editor's background-music picker — static asset URLs, not AI-generated.",
+    category: "studio_content",
+  },
+  // Milestone 9 — Media Library's "Stock assets" tab and the Video Editor's
+  // Sticker layer both read this same curated list (filtered by `kind`).
+  STOCK_ASSET_LIBRARY: {
+    schema: z.array(
+      z.object({
+        id: z.string().min(1),
+        label: z.string().min(1),
+        kind: z.enum(["IMAGE", "VIDEO", "STICKER"]),
+        url: z.string().min(1),
+      })
+    ),
+    default: [] as const,
+    label: "Stock asset library",
+    description: "Stock images/videos/stickers offered in the Media Library and Sticker layer — static URLs, not AI-generated.",
+    category: "studio_content",
+  },
+  // Video Editor's Text Editor font picker.
+  AVAILABLE_FONTS: {
+    schema: z.array(
+      z.object({
+        id: z.string().min(1),
+        label: z.string().min(1),
+        family: z.string().min(1),
+      })
+    ),
+    default: [
+      { id: "inter", label: "Inter", family: "Inter, sans-serif" },
+      { id: "poppins", label: "Poppins", family: "Poppins, sans-serif" },
+      { id: "playfair", label: "Playfair Display", family: "'Playfair Display', serif" },
+    ] as const,
+    label: "Available fonts",
+    description: "Fonts offered in the Video Editor's Text Editor font picker.",
+    category: "studio_content",
+  },
+  // Video Editor's Text Editor "Templates" — curated style presets, not a
+  // user-authoring UI (matches the AVAILABLE_VOICES/BACKGROUND_MUSIC_LIBRARY
+  // pattern: an admin-curated content list, not business/pricing config).
+  TEXT_STYLE_PRESETS: {
+    schema: z.array(
+      z.object({
+        id: z.string().min(1),
+        label: z.string().min(1),
+        style: z.record(z.string(), z.any()),
+      })
+    ),
+    default: [
+      {
+        id: "bold_white",
+        label: "Bold White",
+        style: { fontFamily: "inter", fontSize: 48, color: "#FFFFFF", strokeColor: "#000000", strokeWidth: 2, animation: "POP" },
+      },
+      {
+        id: "subtle_caption",
+        label: "Subtle Caption",
+        style: { fontFamily: "inter", fontSize: 28, color: "#FFFFFF", shadowColor: "#000000", shadowBlur: 4, animation: "FADE_IN" },
+      },
+    ] as const,
+    label: "Text style templates",
+    description: "Pre-built text style templates (font/color/stroke/shadow/animation) offered in the Text Editor.",
+    category: "studio_content",
+  },
+  // Caption Editor's "Style presets".
+  CAPTION_STYLE_PRESETS: {
+    schema: z.array(
+      z.object({
+        id: z.string().min(1),
+        label: z.string().min(1),
+        style: z.record(z.string(), z.any()),
+      })
+    ),
+    default: [
+      {
+        id: "karaoke_yellow",
+        label: "Karaoke Yellow",
+        style: { fontFamily: "inter", fontSize: 32, color: "#FFFFFF", highlightColor: "#FFD60A" },
+      },
+      {
+        id: "minimal_white",
+        label: "Minimal White",
+        style: { fontFamily: "inter", fontSize: 28, color: "#FFFFFF" },
+      },
+    ] as const,
+    label: "Caption style presets",
+    description: "Pre-built caption styles offered in the Caption Editor.",
+    category: "studio_content",
+  },
+  // Dashboard redesign — the "Inspiration" section (hooks/winning ads/
+  // layouts/best-performing creatives) has no real performance-tracking
+  // data anywhere in the system, so unlike Trending (which uses real usage
+  // counts), this is admin-curated content, same pattern as
+  // BACKGROUND_MUSIC_LIBRARY/STOCK_ASSET_LIBRARY above. `href` is optional
+  // and typically deep-links into a create flow with a pre-filled idea.
+  INSPIRATION_LIBRARY: {
+    schema: z.array(
+      z.object({
+        id: z.string().min(1),
+        label: z.string().min(1),
+        description: z.string().optional(),
+        imageUrl: z.string().min(1),
+        category: z.enum(["HOOK", "WINNING_AD", "LAYOUT", "CREATIVE", "TRENDING_COLOR", "TOP_TYPOGRAPHY"]),
+        href: z.string().optional(),
+      })
+    ),
+    default: [] as const,
+    label: "Inspiration library",
+    description:
+      "Curated hooks, winning ads, layouts, creatives, trending colors, and typography shown in the Dashboard's Inspiration section.",
+    category: "dashboard_content",
+  },
+
+  SIGNUP_BONUS_CREDITS: {
+    schema: z.number().int().min(0).max(1000),
+    default: 5,
+    label: "Signup bonus credits",
+    description: "Granted once per new account via the Credit Engine (type SIGNUP_BONUS).",
+    category: "credit_rules",
+  },
+  CREDIT_CONSUMPTION_ORDER: {
+    schema: z.enum(["EXPIRING_FIRST", "FREE_FIRST", "PURCHASED_FIRST"]),
+    default: "EXPIRING_FIRST" as const,
+    label: "Credit consumption order",
+    description:
+      "Which credit lots the Credit Engine draws down first when a download is paid for with credits.",
+    category: "credit_rules",
+  },
+  PROMOTIONAL_CREDIT_EXPIRY_DAYS: {
+    schema: z.number().int().min(1).max(3650),
+    default: 30,
+    label: "Promotional credit expiry (days)",
+    description: "Default lifetime of credits granted with type PROMOTIONAL.",
+    category: "credit_rules",
+  },
+  REFERRAL_CREDIT_EXPIRY_DAYS: {
+    schema: z.number().int().min(1).max(3650),
+    default: 90,
+    label: "Referral credit expiry (days)",
+    description: "Default lifetime of credits granted with type REFERRAL.",
+    category: "credit_rules",
+  },
+  // Milestone 11 Part 12 — Talking Head pipeline. Upload/transcription/
+  // context analysis/visual planning are free (the confirmed boundary);
+  // these are the only credit-bearing actions, charged atomically at the
+  // moment each one actually runs — never upfront, and never for a scene
+  // that ends up reusing an existing/stock/brand asset instead.
+  TALKING_HEAD_CREDIT_COSTS: {
+    schema: z.object({
+      aiImageCredits: z.number().min(0),
+      aiVideoCreditsPerSecond: z.number().min(0),
+      exportCredits: z.number().min(0),
+    }),
+    default: { aiImageCredits: 1, aiVideoCreditsPerSecond: 2, exportCredits: 2 } as const,
+    label: "Talking Head credit costs",
+    description:
+      "Credits charged for the Talking Head pipeline's actual AI generation (per AI overlay image / per second of AI overlay video) and for exporting the final video. Reusing an existing/brand/uploaded/stock asset is always free.",
+    category: "credit_rules",
+  },
+  // AI Video Phase 1 — one row per gated video action, extensible for Phase
+  // 2/3/4 (Veo Lite/Fast/Pro, Kling, Seedance, UGC Ad Mode) without a schema
+  // migration, same "admin-editable record, no fixed key set" pattern
+  // GENERATION_COST_RATES already uses. Each action's credits/minimumTier
+  // are priced against real vendor cost with margin — see the AI Video
+  // architecture plan for the worked math. minimumTier is checked by
+  // lib/credits/video-actions.ts's checkVideoActionAccess() against the
+  // user's active PricingPlan.tierLevel before generation starts.
+  VIDEO_ACTION_CREDIT_COSTS: {
+    schema: z.record(
+      z.string(),
+      z.object({
+        credits: z.number().int().min(0),
+        minimumTier: z.enum(["BASIC", "PRO", "PREMIUM"]),
+      })
+    ),
+    default: {
+      animated_poster: { credits: 2, minimumTier: "BASIC" },
+      // AI Video Phase 2 — 8s Veo 3.1 LITE clip (veo.provider.ts's
+      // DEFAULT_MODEL, restored as the default 2026-07-11 after a real cost
+      // comparison against standard Veo — see veo_standard below), confirmed
+      // real cost ~₹53 (1080p, $0.08/sec incl. audio) x 2.5 margin against
+      // the ₹6.66/credit floor: 53 x 2.5 / 6.66 ≈ 20. Lite is the cheap
+      // tier by design, fitting the ₹300-500 target user budget — this is
+      // the one every Basic-tier user actually gets charged.
+      veo_lite: { credits: 20, minimumTier: "BASIC" },
+      // Standard Veo 3.1 (5-8x Lite's real per-second cost, confirmed live
+      // 2026-07-11 — the founder's own Google Cloud prepaid balance drained
+      // fast running verification calls against it) — a Premium-only option
+      // by deliberate decision, NOT the default, because at Lite's ₹300-500
+      // target budget a multi-scene ad on standard Veo loses money. Same
+      // 2.5x margin math: ~₹266 real cost x 2.5 / 6.66 ≈ 100. No caller
+      // requests this model yet (DEFAULT_MODEL is Lite; standard is only
+      // reachable via an explicit provider model override) — this entry
+      // exists so the pricing is ready the day a Premium quality-selector
+      // actually calls it, not a currently-reachable action.
+      veo_standard: { credits: 100, minimumTier: "PREMIUM" },
+      // AI Video Phase 3 — a Pro+ gate on the multi-scene feature ITSELF,
+      // checked once before the scene loop starts. Deliberately 0 credits:
+      // real charging is 4x veo_lite's own 20-credit charge-after-success,
+      // one per scene as it succeeds — this entry only stops a Basic-tier
+      // user from reaching the premium feature by calling veo_lite in a
+      // loop themselves. See lib/creative/veo-multiscene-video.ts.
+      veo_multiscene_ad: { credits: 0, minimumTier: "PRO" },
+      // AI Film — a structural placeholder, not real pricing. Premium-tier
+      // gate matches the roadmap doc's own framing ("₹1,000-3,000+, Film
+      // tier"). Shared by 3 real but comparatively cheap LLM/image calls —
+      // storyboard generation, AI character variations, and character
+      // sheets (film/[id]/storyboard, .../characters/[characterId]/
+      // {variations,sheet} routes) — real per-call cost isn't known until a
+      // real method/pricing pass is chosen for these specifically. Update
+      // this once that pricing pass happens; do NOT reuse this key for
+      // per-scene video generation (see film_scene below — split out
+      // 2026-07-19 specifically because sharing one key here would have
+      // made a cheap text/image call cost the same as a real $4.20 video
+      // render the moment film_scene's real cost was priced).
+      film: { credits: 0, minimumTier: "PREMIUM" },
+      // AI Film — per-scene VIDEO render, split out from the generic `film`
+      // key above (2026-07-19) specifically so pricing this doesn't also
+      // silently reprice storyboard/variations/sheet generation, which
+      // share `film` and are real but much cheaper LLM/image calls, not
+      // real Veo renders. Real cost confirmed live: 5/5 successful
+      // scene_render calls on a real Film project all cost exactly $4.20
+      // (12s clip, veo-3.1-lite-generate-preview) — DB-verified via
+      // GenerationLog, not assumed. Same 2.5x margin / ₹6.66-per-credit-
+      // floor math as veo_lite/veo_standard above: $4.20 x ₹83/USD =
+      // ₹348.60; x 2.5 = ₹871.50; / 6.66 ≈ 130.86 → 131.
+      film_scene: { credits: 131, minimumTier: "PREMIUM" },
+      // Phase 12 AI Auto-Editor (2026-07-19) — real multi-vendor spend
+      // (transcription + video understanding + reasoning + b-roll
+      // generation) with zero credit gating: the job pipeline computes and
+      // shows the user real per-run USD cost (AICostSummary) but never
+      // charged for it. Unlike the fixed-price actions above, real total
+      // cost genuinely varies per job (video length, which providers ran),
+      // so `credits` here is NOT the real charge — it's only a precheck
+      // floor (an obviously-empty balance is rejected before the job even
+      // queues, i.e. before any vendor call fires), grounded in real
+      // observed job costs (21 real completed jobs sampled: totalUsd
+      // $0.48-$0.71, none exercised video-understanding/broll-generation
+      // yet). The REAL charge is computed dynamically after the job
+      // completes, from its own actual cost.totalUsd, via
+      // convertUsdToCredits() (lib/credits/video-actions.ts) — same 2.5x/
+      // ₹6.66 formula, applied to a real number instead of a fixed guess.
+      // minimumTier deliberately left at BASIC (the least restrictive real
+      // tier) rather than inventing a new tier requirement that was never
+      // part of this feature's design — this exists to gate credits, not
+      // to newly paywall the feature by subscription tier.
+      ai_auto_edit: { credits: 10, minimumTier: "BASIC" },
+    } as const,
+    label: "Video action credit costs",
+    description:
+      "Credits charged per AI video action (Animated Poster, and future Veo/Kling/Seedance/UGC actions), plus the minimum subscription tier required to access each one. Priced with margin against real vendor cost — see the AI Video plan.",
+    category: "credit_rules",
+  },
+
+  // Milestone 12 — generalizes the OTP route's existing per-phone/per-IP
+  // rate-limit pattern (src/app/api/auth/otp/send) to every other
+  // user-triggered, potentially-costly action. lib/security/rate-limit.ts
+  // reads this; keyed by a short action name rather than a route path so
+  // one entry can cover several routes that share a limit (e.g. all AI
+  // Marketing Assistant actions).
+  RATE_LIMITS: {
+    schema: z.record(
+      z.string(),
+      z.object({
+        limit: z.number().int().min(1),
+        windowSeconds: z.number().int().min(1),
+      })
+    ),
+    default: {
+      video_create: { limit: 20, windowSeconds: 3600 },
+      creative_create: { limit: 20, windowSeconds: 3600 },
+      asset_upload: { limit: 40, windowSeconds: 3600 },
+      editor_asset_upload: { limit: 40, windowSeconds: 3600 },
+      ai_assistant: { limit: 60, windowSeconds: 3600 },
+      export_create: { limit: 20, windowSeconds: 3600 },
+      contact_form: { limit: 5, windowSeconds: 3600 },
+      // FR-AU-011/FR-AU-012's exact pre-existing OTP thresholds, preserved
+      // as-is — this migration only moves the counting mechanism into the
+      // shared helper, it doesn't change the limits.
+      otp_send_phone: { limit: 3, windowSeconds: 3600 },
+      otp_send_ip: { limit: 20, windowSeconds: 3600 },
+    } as const,
+    label: "Rate limits",
+    description:
+      "Per-user request limits for costly or abusable actions, keyed by action name. Applies on top of (not instead of) credit charges.",
+    category: "security",
+  },
+
+  // Milestone 12 — sequential GST-ready invoice numbering + the business
+  // details printed on every generated invoice. Deliberately optional: an
+  // invoice still generates with empty fields shown as "Not provided"
+  // rather than blocking the payment flow on an admin filling this in.
+  BUSINESS_TAX_DETAILS: {
+    schema: z.object({
+      legalName: z.string().max(200),
+      gstin: z.string().max(20),
+      address: z.string().max(500),
+      stateCode: z.string().max(10),
+    }),
+    default: { legalName: "", gstin: "", address: "", stateCode: "" } as const,
+    label: "Business tax details",
+    description: "Printed on every generated invoice. Leave blank fields empty if not yet registered — invoices render gracefully either way.",
+    category: "billing",
+  },
+  GST_RATE_PERCENT: {
+    schema: z.number().min(0).max(50),
+    default: 18,
+    label: "GST rate (%)",
+    description: "Applied to every generated invoice's subtotal. India's standard digital-services GST rate is 18% — change if your registration differs.",
+    category: "billing",
+  },
+
+  // Milestone 13 — Founder Dashboard's "Estimated Profit"/"Editor Cost
+  // Saved"/"Time Saved" cards combine INR revenue with USD AI vendor cost and
+  // make a founder-defined assumption about outsourcing cost — both are
+  // explicitly approximate (documented as such in the dashboard UI), but the
+  // assumption itself must be admin-editable rather than hardcoded so the
+  // founder can correct it without a code change.
+  USD_TO_INR_RATE: {
+    schema: z.number().positive(),
+    default: 83,
+    label: "USD → INR conversion rate",
+    description: "Used only to combine AI vendor cost (billed in USD) with INR revenue on the Founder Dashboard's profit estimate. Update if the real rate has moved meaningfully.",
+    category: "billing",
+  },
+  EDITOR_COST_SAVED_PER_VIDEO_INR: {
+    schema: z.number().min(0),
+    default: 500,
+    label: "Estimated editor cost saved per video (INR)",
+    description: "Founder Dashboard heuristic: what a freelance editor/agency would have charged per video, used to estimate 'cost saved' by generating it with AI instead. An assumption, not measured spend.",
+    category: "billing",
+  },
+  TIME_SAVED_PER_VIDEO_MINUTES: {
+    schema: z.number().min(0),
+    default: 45,
+    label: "Estimated time saved per video (minutes)",
+    description: "Founder Dashboard heuristic: how long manual editing would have taken per video, used to estimate total time saved. An assumption, not measured.",
+    category: "billing",
+  },
+  SUBSCRIPTION_GRACE_PERIOD_DAYS: {
+    schema: z.number().int().min(0),
+    default: 3,
+    label: "Subscription grace period (days)",
+    description: "How many days a subscription stays PAST_DUE (still usable) after a renewal charge fails, before it's expired by the renewal sweep.",
+    category: "billing",
+  },
+  SUBSCRIPTION_RENEWAL_RETRY_ATTEMPTS: {
+    schema: z.number().int().min(0),
+    default: 3,
+    label: "Subscription renewal retry attempts",
+    description: "How many times the renewal sweep retries a failed charge (one attempt per sweep run) before expiring the subscription, within the grace period.",
+    category: "billing",
+  },
+
+  // Milestone 13 — Founder Command Center thresholds. Each defaults to 0
+  // ("disabled, never alert") rather than a guessed number — a fabricated
+  // default threshold would either nag immediately on a fresh install or
+  // silently never fire; an explicit founder-set value is the only honest
+  // option here.
+  DAILY_API_COST_ALERT_USD: {
+    schema: z.number().min(0),
+    default: 0,
+    label: "Daily API cost alert threshold (USD)",
+    description: "Command Center flags 'High API Cost' once today's AI vendor spend crosses this. 0 disables the alert.",
+    category: "ops_alerts",
+  },
+  STORAGE_BUDGET_GB: {
+    schema: z.number().min(0),
+    default: 0,
+    label: "Storage budget (GB)",
+    description: "Command Center flags 'Storage Almost Full' once known asset storage crosses 90% of this. 0 disables the alert (no real bucket-quota API exists to check against automatically).",
+    category: "ops_alerts",
+  },
+  LOW_CREDIT_BALANCE_ALERT_THRESHOLD: {
+    schema: z.number().int().min(0),
+    default: 0,
+    label: "Low credit balance alert threshold",
+    description: "Command Center flags 'Credits Running Low' for any user whose credit balance falls below this. 0 disables the alert.",
+    category: "ops_alerts",
+  },
+
+  // Milestone 12 — referral bonus amounts, granted via the existing
+  // grantCredits() with type REFERRAL (an enum value that existed since the
+  // Credit Engine's first milestone but had no trigger point until now).
+  REFERRAL_BONUS_CREDITS: {
+    schema: z.object({
+      referrerCredits: z.number().min(0),
+      refereeCredits: z.number().min(0),
+    }),
+    default: { referrerCredits: 5, refereeCredits: 5 } as const,
+    label: "Referral bonus credits",
+    description: "Credits granted to the referrer and the new signee when a referral code is applied at signup.",
+    category: "credit_rules",
+  },
+
+  // Milestone 24 — Cloud Video Editor (non-AI) policy knobs. Business-rule
+  // limits, not hardcoded — everything else about this module (track kinds,
+  // aspect ratios) is a fixed creative/structural enum, same precedent as
+  // TEXT_ANIMATIONS above.
+  EDITOR_MAX_TRACKS_PER_PROJECT: {
+    schema: z.number().int().min(1).max(100),
+    default: 20,
+    label: "Max tracks per editor project",
+    description: "Upper bound on how many tracks (of any kind combined) a single Cloud Video Editor project may have.",
+    category: "video_editor_policy",
+  },
+  EDITOR_MAX_UPLOAD_SIZE_BYTES: {
+    schema: z.number().int().min(1),
+    default: 2 * 1024 * 1024 * 1024,
+    label: "Max editor upload size (bytes)",
+    description: "Largest single media file a user may upload into the Cloud Video Editor's Media Library.",
+    category: "video_editor_policy",
+  },
+  EDITOR_ALLOWED_UPLOAD_MIME_TYPES: {
+    schema: z.object({
+      VIDEO: z.array(z.string()).min(1),
+      AUDIO: z.array(z.string()).min(1),
+      IMAGE: z.array(z.string()).min(1),
+      FONT: z.array(z.string()).min(1),
+    }),
+    default: {
+      VIDEO: ["video/mp4", "video/quicktime", "video/webm"],
+      AUDIO: ["audio/mpeg", "audio/wav", "audio/mp4", "audio/ogg"],
+      IMAGE: ["image/jpeg", "image/png", "image/webp", "image/gif"],
+      // Module 7 — custom brand font uploads.
+      FONT: ["font/woff2", "font/woff", "font/ttf", "font/otf", "application/font-woff2", "application/x-font-ttf"],
+    } as const,
+    label: "Allowed editor upload MIME types",
+    description: "Per-kind allow-list of MIME types accepted by the Cloud Video Editor's asset upload.",
+    category: "video_editor_policy",
+  },
+  EDITOR_AUTOSAVE_INTERVAL_MS: {
+    schema: z.number().int().min(1000).max(120000),
+    default: 10000,
+    label: "Editor autosave interval (ms)",
+    description: "Wired in Module 5 (History): every Command already persists to the database immediately, so this drives a lightweight periodic 'still synced' heartbeat rather than a data re-save — the actual restorable snapshots use EDITOR_VERSION_SNAPSHOT_INTERVAL_MS below.",
+    category: "video_editor_policy",
+  },
+  EDITOR_VERSION_SNAPSHOT_INTERVAL_MS: {
+    schema: z.number().int().min(30000).max(1800000),
+    default: 300000,
+    label: "Editor version snapshot interval (ms)",
+    description: "How often the Cloud Video Editor takes an automatic, restorable full-project version snapshot for an open project, at minimum — a much coarser cadence than the autosave heartbeat since each snapshot stores the whole tracks/clips/markers state. Wired in Module 5 (History).",
+    category: "video_editor_policy",
+  },
+  EDITOR_VERSION_SNAPSHOT_COMMAND_INTERVAL: {
+    schema: z.number().int().min(1).max(200),
+    default: 20,
+    label: "Editor version snapshot command interval",
+    description: "A version snapshot is also taken after this many undo-stack entries since the last snapshot, whichever comes first against the time-based interval above — so a burst of heavy editing gets a restore point without waiting out the full time interval. Wired in Module 5 (History).",
+    category: "video_editor_policy",
+  },
+  EDITOR_SNAP_THRESHOLD_PX: {
+    schema: z.number().int().min(0).max(50),
+    default: 8,
+    label: "Editor timeline snap threshold (px)",
+    description: "How close (in pixels, at the current zoom) a dragged clip edge must be to another clip/playhead/marker before it magnetically snaps. Wired starting Module 2.",
+    category: "video_editor_policy",
+  },
+  EDITOR_EXPORT_QUEUE_CONCURRENCY: {
+    schema: z.number().int().min(1).max(8),
+    default: 1,
+    label: "Editor export queue concurrency",
+    description: "Max Cloud Video Editor exports rendered in parallel — each spawns its own headless Chromium + FFmpeg process, a much heavier per-job cost than the AI-generation render queue's RENDER_QUEUE_CONCURRENCY, so this defaults low. Wired in Module 10.",
+    category: "video_editor_policy",
+  },
+  EDITOR_EXPORT_MAX_DURATION_MS: {
+    schema: z.number().int().min(1000),
+    default: 30 * 60 * 1000,
+    label: "Editor export max project duration (ms)",
+    description: "Upper bound on a project's total duration eligible for export — a frame-by-frame headless-browser render's cost scales with duration × fps × resolution, so this is a real throughput guardrail, not an arbitrary limit. Wired in Module 10.",
+    category: "video_editor_policy",
+  },
+  EDITOR_NORMALIZE_QUEUE_CONCURRENCY: {
+    schema: z.number().int().min(1).max(8),
+    default: 1,
+    label: "Editor asset normalize queue concurrency",
+    description: "Max video uploads transcoded in parallel (H.264/AAC/60fps baseline, only when the source needs it) — FFmpeg-heavy local compute, same reasoning as EDITOR_EXPORT_QUEUE_CONCURRENCY, so it defaults low and gets its own budget rather than sharing the export queue's.",
+    category: "video_editor_policy",
+  },
+  AI_EDIT_QUEUE_CONCURRENCY: {
+    schema: z.number().int().min(1).max(8),
+    default: 1,
+    label: "AI Auto-Editor job queue concurrency",
+    description: "Max AiEditJob rows (transcription + scene-removal planning) processed in parallel — network-bound API calls (transcription vendor), same reasoning as RENDER_QUEUE_CONCURRENCY, not the export queue's heavier local-compute one. Wired in Phase 12 Module 2.",
+    category: "video_editor_policy",
+  },
+  AI_EDIT_SILENCE_THRESHOLD_MS: {
+    schema: z.number().int().min(100).max(10_000),
+    default: 800,
+    label: "AI Auto-Editor silence-removal threshold (ms)",
+    description: "A pause between words at or above this length is proposed as a \"silence\" scene-removal window. Deliberately admin-tunable separately from the transcript SEGMENTATION module's own 700ms paragraph-break threshold (a different purpose — cutting silence from the final video, not marking a paragraph boundary). Wired in Phase 12 Module 2.",
+    category: "video_editor_policy",
+  },
+  AI_EDIT_REASONING_REPAIR_MAX_ATTEMPTS: {
+    schema: z.number().int().min(0).max(3),
+    default: 1,
+    label: "AI Auto-Editor timeline-planning repair attempts",
+    description: "How many times the REASONING (captions/zoom planning) call re-prompts the model with its own validation error after a malformed JSON response, before giving up and surfacing a planning failure. 0 disables repair (fail on the first bad response). Distinct from the generic GENERATION_RETRY_MAX_ATTEMPTS, which retries a failed NETWORK call — this retries a successful call that returned the WRONG SHAPE. Wired in Phase 12 Module 4.",
+    category: "video_editor_policy",
+  },
+  AI_EDIT_BROLL_STOCK_ONLY: {
+    schema: z.boolean(),
+    default: true,
+    label: "AI Auto-Editor: stock-only b-roll (no generation)",
+    description: "Founder policy (2026-07-18) — while true, AI Auto-Edit b-roll resolution never spends real generation credits: the resolver always searches stock (Pexels/Pixabay/Openverse/Coverr/Unsplash, whichever are enabled) first regardless of GPT's own stock-vs-generate judgment, and only falls back to a real generateImage()/renderVideo() call as an absolute last resort when literally zero stock providers return a usable result for that slot. The value at job-creation time is captured onto the job itself (AiEditJob.brollStockOnly) so a job's behavior stays consistent even if this default is flipped later — turn it back off here (no prompt-engineering pass needed) once generation is wanted again.",
+    category: "video_editor_policy",
+  },
+} as const;
+
+export type ConfigKey = keyof typeof CONFIG_REGISTRY;
+export type ConfigValue<K extends ConfigKey> = z.infer<(typeof CONFIG_REGISTRY)[K]["schema"]>;
+
+// Milestone 12 — this used to be a bespoke in-process Map with a comment
+// speculating "swap for Redis with pub/sub invalidation" at multi-instance
+// scale. That speculation turned out to be more than necessary: Redis IS
+// the shared store, so a plain DEL on write already propagates to every
+// instance's next read — no pub/sub layer needed. lib/cache/cache.ts is that
+// shared primitive (Redis when REDIS_URL is set, the exact same in-process
+// Map behavior as before otherwise), reused here and by the rate limiter.
+const CONFIG_CACHE_TTL_SECONDS = 30;
+const cacheKeyFor = (key: string) => `config:${key}`;
+
+export async function getConfig<K extends ConfigKey>(key: K): Promise<ConfigValue<K>> {
+  return getOrSetCache(cacheKeyFor(key), CONFIG_CACHE_TTL_SECONDS, async () => {
+    const def = CONFIG_REGISTRY[key];
+    const row = await prisma.systemConfig.findUnique({ where: { key } });
+
+    if (row) {
+      const parsed = def.schema.safeParse(row.value);
+      return (parsed.success ? parsed.data : def.default) as ConfigValue<K>;
+    }
+    return def.default as ConfigValue<K>;
+  });
+}
+
+export async function setConfig<K extends ConfigKey>(
+  key: K,
+  value: ConfigValue<K>,
+  updatedBy?: string
+): Promise<void> {
+  const def = CONFIG_REGISTRY[key];
+  const parsed = def.schema.parse(value); // throws on invalid admin input
+
+  await prisma.systemConfig.upsert({
+    where: { key },
+    create: { key, value: parsed, updatedBy },
+    update: { value: parsed, updatedBy },
+  });
+
+  await invalidateCache(cacheKeyFor(key));
+}
+
+export type ConfigInputType = "enum" | "number" | "boolean" | "string" | "string_list" | "json";
+
+// Introspected so the admin panel can render a generic Select/Input per key
+// without a second, hand-maintained copy of each field's input type/options
+// — the Zod schema in CONFIG_REGISTRY stays the single source of truth.
+// "string_list" (an array of enum values, e.g. PROVIDER_LLM_PRIORITY) is
+// edited as a comma-separated list, validated against `options` on save.
+// "json" (e.g. GENERATION_COST_RATES, a record type with no fixed key set)
+// falls back to a raw-JSON textarea, validated by the field's own Zod
+// schema on save — same safety guarantee as every other field, just a less
+// specialized widget.
+function describeInputType(schema: z.ZodTypeAny): { inputType: ConfigInputType; options?: string[] } {
+  if (schema instanceof z.ZodEnum) {
+    return { inputType: "enum", options: Object.values(schema.enum) as string[] };
+  }
+  if (schema instanceof z.ZodNumber) {
+    return { inputType: "number" };
+  }
+  if (schema instanceof z.ZodBoolean) {
+    return { inputType: "boolean" };
+  }
+  if (schema instanceof z.ZodArray && schema.element instanceof z.ZodEnum) {
+    return { inputType: "string_list", options: Object.values(schema.element.enum) as string[] };
+  }
+  if (schema instanceof z.ZodRecord || schema instanceof z.ZodObject || schema instanceof z.ZodArray) {
+    return { inputType: "json" };
+  }
+  return { inputType: "string" };
+}
+
+export async function getAllConfig(): Promise<
+  Record<
+    string,
+    {
+      value: unknown;
+      label: string;
+      description: string;
+      category: string;
+      inputType: ConfigInputType;
+      options?: string[];
+    }
+  >
+> {
+  const keys = Object.keys(CONFIG_REGISTRY) as ConfigKey[];
+  const entries = await Promise.all(
+    keys.map(async (key) => {
+      const def = CONFIG_REGISTRY[key];
+      const value = await getConfig(key);
+      return [
+        key,
+        {
+          value,
+          label: def.label,
+          description: def.description,
+          category: def.category,
+          ...describeInputType(def.schema),
+        },
+      ] as const;
+    })
+  );
+  return Object.fromEntries(entries);
+}
