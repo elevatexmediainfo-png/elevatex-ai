@@ -83,6 +83,13 @@ RUN test -f ./node_modules/playwright-core/browsers.json || \
 # --with-deps additionally apt-get-installs the shared libraries (fonts,
 # libnss3, libatk, etc.) Chromium needs to actually launch — this is the
 # step that requires a Debian base (see top-of-file note).
+RUN ls -la ./node_modules/.bin
+RUN ls -la ./node_modules/playwright
+RUN ls -la ./node_modules/playwright-core
+RUN node -p "require.resolve('playwright/package.json')"
+RUN node -e "console.log(require('./node_modules/playwright/package.json'))"
+RUN which npx && which node && node --version && npm --version
+RUN ./node_modules/.bin/playwright --version
 RUN npx playwright install --with-deps chromium \
   && test -f ./node_modules/playwright-core/browsers.json \
   && chown -R nextjs:nodejs ./node_modules/playwright-core
