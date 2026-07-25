@@ -1,7 +1,16 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chromium, type Browser, type Page } from "playwright";
+// Type-only import — erased at compile time, so merely importing this
+// module (and everything that imports it: export-queue-worker.ts,
+// instrumentation.ts's startup sequence) never touches playwright's actual
+// runtime code. `chromium` itself is loaded lazily inside renderExportJob,
+// the one place that actually launches a browser — see the dynamic import
+// there for why (2026-07-25 production boot crash: a missing Chromium
+// install took down the entire server because this used to be a static
+// top-level `import { chromium } from "playwright"`, evaluated the moment
+// anything imported this file, not just when an export job actually ran).
+import type { Browser, Page } from "playwright";
 
 import { prisma } from "@/lib/prisma";
 import { getStorageProvider } from "@/lib/providers/storage";
@@ -160,6 +169,13 @@ export async function renderExportJob(exportId: string): Promise<void> {
     const { widthPx, heightPx } = resolveExportDimensions(exportRow.resolution, project.widthPx, project.heightPx);
     const totalFrames = computeTotalFrames(project.durationMs, exportRow.fps);
 
+    // Lazy, on-demand load — the only place in this module that touches
+    // playwright's actual runtime code. If Chromium isn't installed in this
+    // deployment, the failure happens HERE, inside this function's own
+    // try/catch below, which already fails this one export via failExport()
+    // with a real message — it can no longer take down the whole server the
+    // way a module-load-time failure did.
+    const { chromium } = await import("playwright");
     browser = await chromium.launch({ headless: true });
     let page = await openRenderPage(browser, exportRow.projectId, exportId, widthPx, heightPx);
 

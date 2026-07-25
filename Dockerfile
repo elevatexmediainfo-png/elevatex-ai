@@ -64,6 +64,16 @@ COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 COPY --from=builder /app/node_modules/playwright ./node_modules/playwright
 COPY --from=builder /app/node_modules/playwright-core ./node_modules/playwright-core
 
+# Build-time tripwire (2026-07-25) — a previous deploy shipped without this
+# file present at runtime despite this exact COPY line existing, which
+# turned out to be a broken assumption about which build path Railway was
+# actually running, not this Dockerfile itself. Fail the BUILD loudly here
+# instead of finding out at container boot: if this file is genuinely
+# missing right after the COPY above, every later step (install, chown) is
+# working with a broken source anyway.
+RUN test -f ./node_modules/playwright-core/browsers.json || \
+  (echo "FATAL: node_modules/playwright-core/browsers.json missing immediately after COPY — the builder stage's node_modules is incomplete, or this Dockerfile isn't the one actually being built. Aborting build." && exit 1)
+
 # Installs Chromium (only — not the other Playwright browsers this app never
 # uses, to keep the image reasonably sized) directly into THIS final image.
 # Must run here, not in the builder stage: builder's filesystem is discarded
@@ -73,6 +83,7 @@ COPY --from=builder /app/node_modules/playwright-core ./node_modules/playwright-
 # libnss3, libatk, etc.) Chromium needs to actually launch — this is the
 # step that requires a Debian base (see top-of-file note).
 RUN npx playwright install --with-deps chromium \
+  && test -f ./node_modules/playwright-core/browsers.json \
   && chown -R nextjs:nodejs ./node_modules/playwright-core
 
 USER nextjs
