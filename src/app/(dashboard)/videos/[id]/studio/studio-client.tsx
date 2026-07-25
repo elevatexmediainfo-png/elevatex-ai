@@ -22,6 +22,7 @@ import { useUndoRedo } from "./use-undo-redo";
 import { SceneEditor, type SceneView } from "./scene-editor";
 import { AssetLibrary } from "./asset-library";
 import { VersionHistory } from "./version-history";
+import { useVideoProviders, VideoProviderSelect } from "@/components/video/video-provider-select";
 
 export interface VoiceOption {
   id: string;
@@ -82,6 +83,8 @@ export function StudioClient({
   const [scenes, setScenes] = React.useState(initialScenes);
   const [tab, setTab] = React.useState("script");
   const [rendering, setRendering] = React.useState(false);
+  const { providers: videoProviders, selected: preferredProviderId, setSelected: setPreferredProviderId } =
+    useVideoProviders(initialProject.perSceneCredits);
 
   const [script, setScript] = React.useState(initialProject.generatedScript ?? "");
   const [tone, setTone] = React.useState<(typeof SCRIPT_TONES)[number]>("FRIENDLY");
@@ -201,7 +204,11 @@ export function StudioClient({
     }
     setRendering(true);
     try {
-      const res = await fetch(`/api/videos/${project.id}/render`, { method: "POST" });
+      const res = await fetch(`/api/videos/${project.id}/render`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ preferredProviderId }),
+      });
       const json = await res.json();
       if (!json.success) {
         toast.error(json.error?.message ?? "Couldn't start rendering.");
@@ -226,17 +233,20 @@ export function StudioClient({
             {scenes.length * project.perSceneCredits === 1 ? "" : "s"} to render ({project.perSceneCredits}/scene)
           </p>
         </div>
-        <Button
-          type="button"
-          variant="primary"
-          size="lg"
-          disabled={rendering || scenes.length === 0}
-          onClick={handleRender}
-        >
-          {rendering && <Loader2 className="size-4 animate-spin" />}
-          <Sparkles className="size-4" />
-          Render video
-        </Button>
+        <div className="flex flex-wrap items-end gap-3">
+          <VideoProviderSelect providers={videoProviders} value={preferredProviderId} onChange={setPreferredProviderId} />
+          <Button
+            type="button"
+            variant="primary"
+            size="lg"
+            disabled={rendering || scenes.length === 0}
+            onClick={handleRender}
+          >
+            {rendering && <Loader2 className="size-4 animate-spin" />}
+            <Sparkles className="size-4" />
+            Render video
+          </Button>
+        </div>
       </div>
 
       <Tabs value={tab} onValueChange={setTab} className="mt-8">

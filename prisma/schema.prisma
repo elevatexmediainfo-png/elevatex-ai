@@ -1,0 +1,3246 @@
+// Elevatex AI — Prisma schema
+// Milestone 2: Authentication, onboarding, and credits.
+// Milestone 3 adds: video projects, templates, the render-job queue, and the
+// credit transaction ledger. PRD Section 16 defines a larger multi-schema
+// model (billing, brand kits, team accounts, etc.) — those land in later
+// milestones.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================================
+// Auth.js (NextAuth v5) — canonical Prisma adapter shape, extended with our
+// own fields directly on User (phone, accountStatus) rather than a separate
+// auth.users / users.profiles split, to keep this milestone's schema lean.
+// ============================================================================
+
+enum AccountStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+
+  // FR-AU-010 — Indian mobile number, +91 implied, stored in E.164 (+91XXXXXXXXXX).
+  phone         String?   @unique
+  phoneVerified DateTime?
+
+  accountStatus AccountStatus @default(ACTIVE)
+  role          UserRole      @default(USER)
+
+  // Milestone 12 — Referral System. A code is generated lazily on first
+  // request (lib/referrals/engine.ts), not at signup, so existing users
+  // backfill for free. referredById is set once, at signup, when a new
+  // user applies someone else's code — both sides are credited via the
+  // existing grantCredits() (type REFERRAL, an enum value that existed
+  // since the Credit Engine's first milestone but had no trigger until now).
+  referralCode String? @unique
+  referredById String?
+  referredBy   User?   @relation("Referrals", fields: [referredById], references: [id], onDelete: SetNull)
+  referrals    User[]  @relation("Referrals")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  profile       Profile?
+  creditAccount CreditAccount?
+
+  videoProjects      VideoProject[]
+  creativeProjects   CreativeProject[]
+  marketingTemplateGenerations MarketingTemplateGeneration[]
+  creditTransactions CreditTransaction[]
+  creditLots         CreditLot[]
+  subscriptions      Subscription[]
+  downloads          Download[]
+  paymentIntents     PaymentIntent[]
+  assets             Asset[]
+  promptRecords      PromptRecord[]
+  promptTemplates    PromptTemplate[]
+  collaboratorOn     ProjectCollaborator[]
+  brandKit           BrandKit?
+
+  couponRedemptions CouponRedemption[]
+  invoices          Invoice[]
+  notifications     Notification[]
+  benchmarks        PromptBenchmark[]
+
+  // Milestone 24 — Cloud Video Editor (non-AI). A wholly separate project
+  // system from videoProjects/creativeProjects above: no Scene/AI coupling,
+  // own Track/Clip/Asset models (Editor-prefixed to avoid colliding with the
+  // Milestone 9 editor's Track/Clip/Asset).
+  editorFolders        EditorFolder[]
+  editorProjects       EditorProject[]
+  editorAssets         EditorAsset[]
+  editorExports        EditorExport[]
+  editorExportPresets  EditorExportPreset[]
+  // Phase 12 Module 1 — AI Auto-Editor job progress (schema only this
+  // module; no live job-runner yet, see AiEditJob's own doc comment).
+  aiEditJobs           AiEditJob[]
+  // Module 11 — Creative Studio Sidebar's favorites/collections layer.
+  editorAssetFavorites EditorAssetFavorite[]
+  editorCollections    EditorCollection[]
+
+  // Admin Reference Library Part A — audit-only ("who uploaded this"), never
+  // the ownership relation: onDelete SetNull below keeps curated references
+  // alive even if this admin's account is later removed.
+  industryReferencesUploaded IndustryReference[]
+
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ============================================================================
+// Elevatex AI domain models
+// ============================================================================
+
+// PRD Section 4.2 — the 10 initial verticals.
+enum BusinessVertical {
+  RESTAURANT
+  CAFE_BAKERY
+  SALON_SPA
+  DENTAL_DIAGNOSTIC
+  REAL_ESTATE
+  RETAIL
+  GYM_FITNESS
+  HOSPITAL
+  COACHING_EDTECH
+  HOTEL
+  // Milestone 14 — Dashboard's "Trending Templates" row needs a real Finance
+  // tile; added here rather than fabricating filter data.
+  FINANCE
+  OTHER
+}
+
+enum AppLanguage {
+  EN
+  HI
+}
+
+enum ContentLanguage {
+  EN
+  HI
+  HINGLISH
+}
+
+// PRD Section 16.2 (users.profiles) — business context collected at onboarding.
+model Profile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  businessName     String?
+  businessVertical BusinessVertical?
+  city             String?
+  uiLanguage       AppLanguage       @default(EN)
+  contentLanguage  ContentLanguage   @default(EN)
+
+  onboardingCompletedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("profiles")
+}
+
+// PRD Section 8.4 / FR-CR — balance is a cached projection of CreditTransaction
+// (lib/credits/service.ts is the only writer). Defaults to 0, NOT the signup
+// bonus amount — the bonus is granted via creditCredits() so it always has a
+// matching ledger row. Never create a CreditAccount with a nonzero balance
+// outside that service, or balance/ledger will silently drift.
+model CreditAccount {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  balance Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("credit_accounts")
+}
+
+// PRD Section 16.1 (auth.otp_requests) / FR-AU-010–016 — phone OTP login.
+model OtpRequest {
+  id        String  @id @default(cuid())
+  phone     String
+  otpHash   String
+  // Captured for the per-IP rate limit in /api/auth/otp/send — without it,
+  // the per-phone limit alone doesn't stop one IP from rotating through many
+  // numbers.
+  ipAddress String?
+
+  attempts   Int       @default(0)
+  consumedAt DateTime?
+  expiresAt  DateTime
+
+  createdAt DateTime @default(now())
+
+  @@index([phone, createdAt])
+  @@index([ipAddress, createdAt])
+  @@map("otp_requests")
+}
+
+// ============================================================================
+// Milestone 3 — AI video generation, templates, credit ledger, render queue.
+// ============================================================================
+
+enum VideoPlatform {
+  INSTAGRAM_REEL
+  INSTAGRAM_POST
+  FACEBOOK
+  YOUTUBE_SHORTS
+  WHATSAPP_STATUS
+  GOOGLE_BUSINESS
+}
+
+enum AspectRatio {
+  RATIO_9_16
+  RATIO_1_1
+  RATIO_16_9
+}
+
+// PRD Section 10 (user flows) — the campaign intents a video can serve.
+enum VideoObjective {
+  PROMOTION
+  NEW_LAUNCH
+  FESTIVAL_GREETING
+  TESTIMONIAL
+  ANNOUNCEMENT
+  OFFER_DISCOUNT
+  BRAND_AWARENESS
+}
+
+enum VideoProjectStatus {
+  DRAFT // brief captured, script not yet generated
+  SCRIPT_READY // AI script generated, awaiting user confirmation
+  QUEUED // render job enqueued — rendering itself is free and unlimited
+  RENDERING // worker has claimed the render job
+  PAUSED // user-paused mid-render; not-yet-claimed scene jobs are parked
+  COMPLETED // preview ready to stream; download is a separate, gated action
+  FAILED
+  CANCELLED
+}
+
+enum RenderJobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  PAUSED // parked by the user; excluded from claimNextJob() until resumed
+  CANCELLED
+}
+
+// Milestone 4 monetization redesign — credits are now spent only at download
+// time (see lib/downloads/download-service.ts), never at render time, so
+// VIDEO_GENERATION is gone in favour of DOWNLOAD. Types map 1:1 to
+// CreditLotType for grants (SIGNUP_BONUS/PURCHASE/SUBSCRIPTION_GRANT/
+// PROMOTIONAL/REFERRAL); DOWNLOAD/REFUND/EXPIRY/ADMIN_ADJUSTMENT are
+// consumption/correction-side entries with no matching lot type.
+enum CreditTransactionType {
+  SIGNUP_BONUS
+  PURCHASE
+  SUBSCRIPTION_GRANT
+  PROMOTIONAL
+  REFERRAL
+  DOWNLOAD
+  REFUND
+  EXPIRY
+  ADMIN_ADJUSTMENT
+  // Milestone 11 — Talking Head pipeline. Upload/transcribe/analyze/plan stay
+  // free; AI_GENERATION covers actual AI image/video/voice generation,
+  // EXPORT covers exporting — both charged atomically alongside the work
+  // that earns the charge, never as one upfront lump sum.
+  AI_GENERATION
+  EXPORT
+}
+
+// PRD Section 13 (template library) — one row per vertical/platform/format
+// combination. `promptTemplate` feeds the prompt engine (lib/ai/prompt-engine.ts).
+model Template {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+
+  vertical    BusinessVertical
+  platform    VideoPlatform
+  aspectRatio AspectRatio
+
+  durationSeconds  Int     @default(30)
+  thumbnailUrl     String?
+  creditCost       Int     @default(1)
+  // When true, the render pipeline calls the Voice Generation Provider for a
+  // voiceover track before/alongside the video itself. Off by default — no
+  // admin UI to toggle this yet, it's set at seed time.
+  includeVoiceover Boolean @default(false)
+
+  // AI Video reconciliation Step 1 — when true, scene creation
+  // (lib/scenes/engine.ts) calls the LLM scene-split planner (independent
+  // visual beats + text overlays, reused as-is from
+  // lib/creative/scene-split.ts) instead of the default deterministic
+  // [HOOK]/[BODY]/[CTA]-marker splitter. For short ad-style templates where
+  // each scene needs a genuinely different visual moment, not a narrated
+  // paragraph. Off by default — no admin UI yet, set at seed time, same
+  // convention as includeVoiceover above.
+  useSceneSplit Boolean @default(false)
+
+  promptTemplate String @db.Text
+
+  isActive Boolean @default(true)
+
+  // Milestone 14 — admin-togglable "Featured" flag (Admin Panel's "Featured
+  // templates" requirement) and an optional objective tag so the Dashboard's
+  // "Trending Templates" row can filter by a real occasion theme (e.g.
+  // Festival -> FESTIVAL_GREETING) instead of fabricating filter data —
+  // VideoObjective already exists for this exact purpose on VideoProject.
+  isFeatured       Boolean         @default(false)
+  defaultObjective VideoObjective?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  videoProjects VideoProject[]
+
+  @@index([vertical, platform])
+  @@map("templates")
+}
+
+enum MarketingTemplateOutputType {
+  IMAGE
+  VIDEO
+}
+
+// Admin-managed prompt+reference templates (2026-07-24) — distinct from the
+// Template model above, which is structurally tied to GENERATED's
+// script-ad wizard (vertical/platform/duration/voiceover/scene-split, and
+// promptTemplate is an LLM script-writing SEED, never substituted
+// directly). This model's promptTemplate is a literal string with named
+// {{placeholders}} (lib/marketing-templates/placeholders.ts), substituted
+// directly and sent as-is to a real image/video generation provider
+// alongside referenceMediaAsset (the admin's own curated style/reference)
+// and the user's own uploaded logo (MarketingTemplateGeneration.logoAsset)
+// — a fundamentally different, simpler mechanism than either Template or
+// CreativeProject's "Universal Creative Workflow" (AI-enhanced/rewritten
+// prompts, no named placeholders) — see PROJECT_STATUS.md's 2026-07-24
+// investigation entry for the full reasoning against reusing either.
+model MarketingTemplate {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+  category    String?
+
+  outputType  MarketingTemplateOutputType
+  aspectRatio AspectRatio
+
+  // The admin's own curated reference image/video for this template's
+  // style — reused as a generation-conditioning input for EVERY user who
+  // generates from this template (not the user's own uploaded logo below,
+  // which is per-generation). Nullable — a template with no reference
+  // media set is not "ready" (see the isReady computation in
+  // lib/marketing-templates/queries.ts).
+  referenceMediaAssetId String?
+  referenceMediaAsset   Asset?  @relation("MarketingTemplateReferenceAsset", fields: [referenceMediaAssetId], references: [id], onDelete: SetNull)
+
+  // Literal prompt text with named {{placeholder}} tokens, substituted
+  // directly (never wrapped/prefixed/LLM-rewritten) before being sent to
+  // the generation provider — see lib/marketing-templates/placeholders.ts.
+  promptTemplate String @default("") @db.Text
+
+  // Reorders the existing priority-filtered provider list for this
+  // template's outputType category (IMAGE or VIDEO) — same
+  // CreativeTool.defaultProviderId convention: never a hard requirement,
+  // failover to another enabled provider is unaffected if unset/unhealthy.
+  preferredProviderId String?
+
+  creditCost Int @default(1)
+
+  isActive   Boolean @default(true)
+  isFeatured Boolean @default(false)
+  sortOrder  Int     @default(0)
+
+  generations MarketingTemplateGeneration[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([outputType, isActive, sortOrder])
+  @@map("marketing_templates")
+}
+
+// One row per real, user-triggered generation from a MarketingTemplate —
+// mirrors CreativeProject's own resultAssetId/status/errorMessage shape,
+// but the result lands as a real EditorAsset (not a generic Asset) per the
+// explicit "everything lands in the real editor" requirement, and
+// filledFields is the real placeholder->value map the user actually typed
+// (kept for a real generation history, not just the final substituted
+// prompt string).
+model MarketingTemplateGeneration {
+  id         String            @id @default(cuid())
+  userId     String
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  templateId String
+  template   MarketingTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  filledFields Json
+
+  logoAssetId String?
+  logoAsset   Asset?  @relation("MarketingTemplateGenerationLogoAsset", fields: [logoAssetId], references: [id], onDelete: SetNull)
+
+  status       CreativeProjectStatus @default(DRAFT)
+  creditCost   Int                   @default(0)
+  errorMessage String?
+
+  resultEditorAssetId String?
+  resultEditorAsset   EditorAsset? @relation(fields: [resultEditorAssetId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("marketing_template_generations")
+}
+
+// PRD Section 10 Flow 2 (Create Video) / SCR-007–010 — a single video request,
+// from brief through generated script to final rendered asset.
+model VideoProject {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  templateId String?
+  template   Template? @relation(fields: [templateId], references: [id])
+
+  // Milestone 11 — GENERATED (default) is the original brief->script->scenes
+  // flow, unchanged. TALKING_HEAD_UPLOAD starts from an uploaded video
+  // instead (sourceAsset) and skips template/brief/generatedScript entirely.
+  // This single enum is the seam future editors (Shorts/Podcast/Webinar/
+  // Course/Interview) plug into — a new value + a new scene-planning
+  // function, nothing else in the pipeline changes.
+  sourceType    VideoProjectSourceType @default(GENERATED)
+  sourceAssetId String?
+  sourceAsset   Asset?                 @relation("ProjectSourceAsset", fields: [sourceAssetId], references: [id], onDelete: SetNull)
+
+  title           String
+  objective       VideoObjective
+  platform        VideoPlatform
+  aspectRatio     AspectRatio
+  contentLanguage ContentLanguage @default(EN)
+
+  // User-supplied brief (product/offer/key message/CTA) — kept as Json so the
+  // prompt engine can evolve its input fields without a migration per field.
+  // Milestone 11: nullable — a TALKING_HEAD_UPLOAD project has no brief, its
+  // "brief" is the uploaded video itself (sourceAsset) plus its transcript.
+  brief Json?
+
+  generatedScript String? @db.Text
+
+  status     VideoProjectStatus @default(DRAFT)
+  // Spent only at download time (Download Service), never at render time —
+  // rendering is free and unlimited per the Milestone 4 monetization rules.
+  creditCost Int                @default(1)
+
+  // User-facing video-provider selector (2026-07-24) — set once at Render
+  // time (POST /api/videos/[id]/render), read later by the async render
+  // queue worker (processSceneRenderJob) since scene rendering happens
+  // after this request returns, not synchronously. Null = no explicit
+  // choice, use the normal priority-order default. Not validated against
+  // the live enabled-provider list here (the picker only ever offers real
+  // enabled ids) — an id that's since been disabled just falls through to
+  // the normal failover order harmlessly.
+  preferredVideoProviderId String?
+
+  // Streamable, watermarked, lower-quality (480p/720p) — free, unlimited,
+  // download disabled. What the video detail page always plays inline.
+  previewVideoUrl     String?
+  previewThumbnailUrl String?
+
+  // The clean, full-HD, no-watermark master. Never handed to the client
+  // directly — Download Service mints a short-lived signed URL from this via
+  // the Storage Provider once a download is entitled (subscription/credit/
+  // one-time purchase). Renamed from outputVideoUrl/thumbnailUrl: those names
+  // implied "the" output, but there are now two quality tiers.
+  masterVideoUrl     String?
+  masterThumbnailUrl String?
+  voiceoverUrl       String? // optional — only set when template.includeVoiceover
+
+  durationSeconds Int?
+  errorMessage    String?
+
+  // Milestone 7 — atomic race-guard so concurrently-completing scenes can't
+  // both enqueue a duplicate merge RenderJob. Flipped true by the first
+  // tryFinalizeProject() call that finds every scene COMPLETED (see
+  // lib/render/pipeline.ts); reset to false whenever a re-render of failed
+  // scenes is triggered so a fresh merge can be queued later.
+  mergeQueued Boolean @default(false)
+
+  // Milestone 8 — user-chosen scene for the project thumbnail (Scene Editor's
+  // "thumbnail selection"). Plain string, not a relation, so deleting a scene
+  // never needs special-case cleanup here — the merge step falls back to the
+  // first scene whenever this points at a scene that's missing or not
+  // COMPLETED yet.
+  thumbnailSceneId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  scenes             Scene[]
+  renderJobs         RenderJob[]
+  creditTransactions CreditTransaction[]
+  downloads          Download[]
+  generationLogs     GenerationLog[]
+  versions           ProjectVersion[]
+  collaborators      ProjectCollaborator[]
+  assets             Asset[]
+  promptRecords      PromptRecord[]
+  tracks             Track[]
+  clips              Clip[]
+  captionBlocks      CaptionBlock[]
+  exports            Export[]
+  transcript         Transcript?
+  filmCharacters     FilmCharacter[]
+
+  @@index([userId, status])
+  @@index([userId, createdAt])
+  @@map("video_projects")
+}
+
+enum VideoProjectSourceType {
+  GENERATED
+  TALKING_HEAD_UPLOAD
+  // AI Film (reconciliation build, 2026-07-11) — a VideoProject with
+  // sourceType FILM has FilmCharacter rows instead of going straight to
+  // scene creation; storyboard scenes are ordinary Scene rows (reusing the
+  // exact render/merge/credit pipeline every other VideoProject already
+  // uses, not a parallel system), with an added Scene.filmCharacterId link.
+  // Per-scene generation itself is deliberately NOT wired to a real
+  // strategy yet — Phase 3b's chained character-consistency test hasn't
+  // reached a clean verdict, so which conditioning method to use is still
+  // an open question this model only holds data for, not an answer to.
+  FILM
+}
+
+enum FilmCharacterStatus {
+  PENDING // just created, no variations generated yet
+  // Real bug fix (2026-07-24) — an atomic claim state for the variations
+  // route's concurrency guard (same "mark RENDERING before dispatching"
+  // pattern as Scene.status), closing a real double-click double-charge
+  // gap. Transient: never a resting state for longer than one real request.
+  GENERATING_VARIATIONS
+  VARIATIONS_READY // AI variations generated, awaiting the user's pick
+  FACE_UPLOADED // user uploaded side+front photos instead of picking a variation
+  SELECTED // a variation or the face upload has been chosen as final
+  SHEET_READY // character sheet generated for the selected option
+}
+
+model FilmCharacter {
+  id             String       @id @default(cuid())
+  videoProjectId String
+  videoProject   VideoProject @relation(fields: [videoProjectId], references: [id], onDelete: Cascade)
+
+  slotIndex Int // 0-based position among the project's character count
+  name      String? // a short cast label ("The Vendor", "Young Apprentice") — set by the cast breakdown step, not user-entered
+
+  // The cast breakdown's per-character description (age/gender/role/visual
+  // details) — the whole reason it exists: without it, every character's
+  // variation prompt fell back to the film's shared idea, so all N
+  // characters rendered as the same person/type (founder-reported bug,
+  // 2026-07-12). Populated once, lazily, by generateFilmCastBreakdown() the
+  // first time ANY character in the project generates variations — null
+  // until then.
+  castDescription String? @db.Text
+
+  // Up to 2 AI-generated variation image Asset ids — populated by the
+  // variation-generation route (built, real, not yet triggered).
+  variationAssetIds Json?
+
+  // Exactly one of these becomes set once the user picks — either an AI
+  // variation or their own uploaded face photos become "the" character.
+  selectedVariationAssetId String?
+  faceUploadSideAssetId    String?
+  faceUploadFrontAssetId   String?
+
+  characterSheet Json? // GPT/Gemini-generated character sheet, once built
+
+  status FilmCharacterStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  scenes Scene[]
+
+  @@unique([videoProjectId, slotIndex])
+  @@map("film_characters")
+}
+
+// ============================================================================
+// Milestone 7 — Production Video Generation Pipeline. A VideoProject is
+// decomposed into Scenes (see lib/scenes/engine.ts); each scene renders
+// independently through the same RenderJob queue below (sceneId set), and a
+// final merge RenderJob (sceneId null) combines them once every scene is
+// COMPLETED. See src/lib/render/pipeline.ts for the processing logic.
+// ============================================================================
+
+enum SceneStatus {
+  DRAFT // Milestone 8 — editable in the Studio's Scene Editor, not yet queued for render
+  PENDING
+  RENDERING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum SceneTransition {
+  CUT
+  FADE
+  DISSOLVE
+  SLIDE
+}
+
+// One row per scene within a VideoProject. Artifacts are stored as Storage
+// Provider keys (not public URLs), mirroring VideoProject.masterVideoUrl —
+// each scene's image/video/voice/subtitle is uploaded separately under
+// scenes/{id}/... (requirement: "store every render artifact separately").
+model Scene {
+  id             String       @id @default(cuid())
+  videoProjectId String
+  videoProject   VideoProject @relation(fields: [videoProjectId], references: [id], onDelete: Cascade)
+
+  order Int // 0-based position within the project; merge concatenates in this order
+
+  prompt         String  @db.Text
+  negativePrompt String? @db.Text
+  // Milestone 8 (Prompt Studio) — fine-tuned per-artifact prompts, editable
+  // independently of `prompt`. Null means "use `prompt`" (the M7 behaviour,
+  // preserved as the default for scenes that were never edited in the Studio).
+  imagePrompt    String? @db.Text
+  videoPrompt    String? @db.Text
+  // FILM real voice-over (2026-07-25) — the storyboard's own planned
+  // dialogue line (film-storyboard.ts's spokenLine) was generated but
+  // never persisted anywhere, so generateFilmSceneVideo() had nothing to
+  // pass to the real ElevenLabs call. GENERATED-only until now (voiceKey
+  // below); FILM never populated either field. Null for a b-roll/
+  // no-character scene with nothing to say.
+  spokenLine     String? @db.Text
+
+  durationSeconds Int
+
+  imageKey     String?
+  // FILM storyboard preview (2026-07-24) — a real, cheap image generated at
+  // storyboard-review time (before the user commits to expensive video
+  // generation), reusing the scene's own visualPrompt + character
+  // reference. Deliberately a separate field from imageKey: imageKey is
+  // set during REAL video generation (GENERATED's per-scene overlay image);
+  // this is a pre-commit preview that exists before any video render has
+  // happened, and is never overwritten by one. Null until generated, and
+  // null forever for GENERATED-flow scenes (this feature is FILM-only).
+  previewImageKey String?
+  videoKey     String?
+  voiceKey     String?
+  subtitleKey  String?
+  subtitleText String? @db.Text // the rendered VTT's source text — independently editable since Milestone 8
+  // Milestone 8 (Scene Editor voice selection) — an id from the admin-configured
+  // AVAILABLE_VOICES list, threaded into VoiceGenerateRequest.voiceId. Null means
+  // "use the provider's per-language default" (the M7 behaviour).
+  voiceId      String?
+
+  backgroundMusicUrl String? // static asset reference, admin-configured default/library — not AI-generated
+
+  // Milestone 11 — set only for scenes produced by the AI Visual Planner
+  // (Talking Head pipeline); null for every GENERATED-flow scene, unchanged
+  // behavior there. Drives the Intelligent Asset Selector's waterfall.
+  visualType SceneVisualType?
+
+  // AI Film only — which character (if any) this storyboard scene
+  // features, so per-scene generation knows whose reference image to
+  // condition on once a consistency method is actually chosen. Null for
+  // every non-FILM scene, unchanged behavior there.
+  filmCharacterId String?
+  filmCharacter   FilmCharacter? @relation(fields: [filmCharacterId], references: [id], onDelete: SetNull)
+
+  transition  SceneTransition @default(CUT)
+  status      SceneStatus     @default(DRAFT)
+  attempts    Int             @default(0)
+  maxAttempts Int             @default(3)
+
+  errorMessage String?
+
+  // Real progress feedback (2026-07-25) — a real ~10-minute scene render
+  // (2 failed video-provider attempts + one timed-out retry, live-confirmed
+  // during the investigation this field exists to fix) looked identical to
+  // a hang: nothing updated between "RENDERING" and the final result. Set
+  // by the Generation Engine's onProgress callback (lib/generation/engine.ts)
+  // at each real attempt boundary during a scene's render — never during
+  // updatedAt-only writes, so it can't itself look stale — and cleared once
+  // the scene reaches a terminal status. Shape: { providerId, attempt,
+  // maxAttempts, phase: "attempt_start"|"attempt_failed"|"provider_exhausted",
+  // error?, updatedAt }. Read by scenes/[sceneId]/progress/route.ts for the
+  // frontend to poll while a generate/regenerate call is in flight.
+  renderProgress Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  renderJobs         RenderJob[]
+  generationLogs     GenerationLog[]
+  assets             Asset[]
+  promptRecords      PromptRecord[]
+  clips              Clip[]
+  captionBlock       CaptionBlock?
+  transcriptSegments TranscriptSegment[]
+
+  @@unique([videoProjectId, order])
+  @@index([videoProjectId, status])
+  @@map("scenes")
+}
+
+// Milestone 11 Part 4 — AI Visual Planner's per-scene decision. One value
+// per Scene; the Intelligent Asset Selector (Part 5) reads this to decide
+// what kind of asset a scene needs before it ever picks/generates one.
+enum SceneVisualType {
+  FACE_ONLY
+  B_ROLL
+  IMAGE
+  LOGO
+  SCREENSHOT
+  WEBSITE
+  GRAPH
+  CHART
+  ICON
+  ANIMATION
+  TEXT_OVERLAY
+}
+
+// Milestone 11 Part 2 — one transcript per Talking Head project (cascade-
+// deleted with it, same 1:1-via-unique-FK pattern as CaptionBlock.sceneId).
+// Every transcript must be reusable (requirement) — this table, not a
+// transient in-memory result, is that reusability: AI Context Understanding,
+// the Visual Planner, and any future re-analysis all read from here.
+model Transcript {
+  id             String       @id @default(cuid())
+  videoProjectId String       @unique
+  videoProject   VideoProject @relation(fields: [videoProjectId], references: [id], onDelete: Cascade)
+  sourceAssetId  String
+
+  language        String?
+  durationSeconds Float?
+  // 2026-07-13 — the app has now been burned three times by a transcript
+  // that silently came from MockTranscriptionProvider being indistinguishable
+  // from a real one once it reached the review screen. runGeneration()
+  // (lib/generation/engine.ts) already generically attaches which provider
+  // actually won the failover chain onto every category's result (the same
+  // mechanism VideoRenderResultWithProvider relies on) — this just persists
+  // that instead of discarding it, so the UI can finally show a real warning
+  // instead of a user having to notice the placeholder text themselves.
+  // Nullable: existing rows predate this column.
+  providerId String?
+
+  segments TranscriptSegment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("transcripts")
+}
+
+// One row per sentence, in order. wordTimings is read-only input to the
+// silence-detection/paragraph-segmentation heuristics (lib/transcription/
+// segmentation.ts) — kept as JSON rather than a child table since, unlike
+// CaptionWord, individual words here are never edited one at a time.
+model TranscriptSegment {
+  id           String     @id @default(cuid())
+  transcriptId String
+  transcript   Transcript @relation(fields: [transcriptId], references: [id], onDelete: Cascade)
+
+  order          Int
+  startMs        Int
+  endMs          Int
+  text           String @db.Text
+  paragraphIndex Int    @default(0)
+  wordTimings    Json // [{ word, startMs, endMs }]
+
+  // Milestone 11 Part 3 — AI Context Understanding's extracted entities/tags
+  // (companies, products, numbers, dates, locations, marketing concepts,
+  // statistics, CTA, hooks, emotions). Null until analyzed.
+  analysis Json?
+
+  // Set once the Visual Planner (Part 4) groups this segment into a Scene.
+  sceneId String?
+  scene   Scene?  @relation(fields: [sceneId], references: [id], onDelete: SetNull)
+
+  @@unique([transcriptId, order])
+  @@index([sceneId])
+  @@map("transcript_segments")
+}
+
+// PRD Section 18 (rendering pipeline) — a DB-backed queue. `processNextJob()`
+// claims a row with an atomic conditional UPDATE (see lib/queue/queue.ts),
+// which is safe for a single worker instance. Swap-in point for a real
+// broker (Redis/BullMQ, SQS) is documented there.
+model RenderJob {
+  id             String @id @default(cuid())
+  videoProjectId String
+
+  videoProject VideoProject @relation(fields: [videoProjectId], references: [id], onDelete: Cascade)
+
+  // Null for a merge job (combines every scene once all are COMPLETED); set
+  // for a scene-render job. Both flow through the SAME claim/complete/fail
+  // functions in lib/queue/queue.ts — distinguished only by this field, so
+  // job-claiming/retry mechanics are never duplicated between the two kinds.
+  sceneId String?
+  scene   Scene?  @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+
+  status      RenderJobStatus @default(PENDING)
+  attempts    Int             @default(0)
+  maxAttempts Int             @default(3)
+
+  payload      Json
+  result       Json?
+  errorMessage String?
+
+  scheduledAt DateTime  @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  export Export?
+
+  @@index([status, scheduledAt])
+  @@index([sceneId])
+  @@map("render_jobs")
+}
+
+// PRD Section 8.4 / FR-CR — append-only ledger. `amount` is signed (negative
+// for debits); `balanceAfter` snapshots CreditAccount.balance post-transaction
+// so history reads don't need to replay the ledger.
+model CreditTransaction {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  videoProjectId String?
+  videoProject   VideoProject? @relation(fields: [videoProjectId], references: [id])
+
+  // Milestone 14 — mirrors videoProjectId exactly, for charges against the
+  // new standalone content-type projects.
+  creativeProjectId String?
+  creativeProject   CreativeProject? @relation(fields: [creativeProjectId], references: [id])
+
+  type         CreditTransactionType
+  amount       Int
+  balanceAfter Int
+  description  String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("credit_transactions")
+}
+
+// ============================================================================
+// Milestone 4 — provider abstraction config, credit engine, and monetization
+// (pay-per-download + subscriptions). See:
+//   src/lib/providers/        — vendor-agnostic provider interfaces + adapters
+//   src/lib/admin/config.ts   — reads/writes SystemConfig below
+//   src/lib/credits/engine.ts — CreditLot-based credit engine
+//   src/lib/downloads/        — Download Service (the only place credits are spent)
+// ============================================================================
+
+// Admin-editable key/value store — provider selection (e.g. "PROVIDER_LLM" ->
+// "mock" | "openai") and misc system rules (watermark text, preview quality,
+// download rate limits, credit-consumption priority) all live here. Changing
+// any of it is a database write from the admin panel, never a code change or
+// redeploy. See src/lib/admin/config.ts for the typed keys and cache.
+model SystemConfig {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+  updatedBy String? // admin User.id, best-effort audit trail
+
+  @@map("system_config")
+}
+
+// PRD-equivalent FR-CR (credit engine) — credits are tracked as discrete lots
+// rather than a single counter so different sources can have different
+// expiry and consumption-priority rules (e.g. promotional credits expiring
+// before purchased ones). CreditAccount.balance stays as a fast cached sum;
+// lots are the source of truth lib/credits/engine.ts reconciles it against.
+enum CreditLotType {
+  SIGNUP_BONUS
+  PURCHASED
+  SUBSCRIPTION
+  PROMOTIONAL
+  REFERRAL
+  ADMIN_ADJUSTMENT
+}
+
+model CreditLot {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type      CreditLotType
+  amount    Int // original grant
+  remaining Int // decremented as this lot is drawn down
+  expiresAt DateTime? // null = never expires
+  sourceRef String? // payment/subscription/referral id, for audit
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, expiresAt])
+  @@index([userId, type])
+  @@map("credit_lots")
+}
+
+enum BillingModel {
+  PAY_PER_DOWNLOAD
+  SUBSCRIPTION
+}
+
+// AI Video Phase 1 — subscription tier ranking for gated video actions
+// (cheap models in Basic, premium models in Pro/Premium). Ranked in
+// declaration order by lib/credits/video-actions.ts's PRICING_TIER_RANK,
+// not by any implicit enum ordering Prisma/Postgres provides.
+enum PricingTierLevel {
+  BASIC
+  PRO
+  PREMIUM
+}
+
+// Milestone 13 — was a free-text String? ("MONTHLY" was the only value ever
+// written). Promoted to a real enum so lib/billing/interval.ts can branch on
+// it for actual renewal-date math, instead of every plan silently renewing
+// monthly regardless of what an admin picked.
+enum BillingInterval {
+  MONTHLY
+  QUARTERLY
+  HALF_YEARLY
+  YEARLY
+}
+
+// Admin-managed via /admin/pricing — both one-time credit packages and
+// recurring subscription plans are rows here/in CreditPackage, never
+// hardcoded. priceInPaise (not rupees) avoids float rounding on currency.
+model PricingPlan {
+  id                   String            @id @default(cuid())
+  name                 String
+  slug                 String            @unique
+  billingModel         BillingModel
+  priceInPaise         Int
+  // null for one-time/pay-per-download plans; required for SUBSCRIPTION plans.
+  billingInterval      BillingInterval?
+  // Milestone 13 — days of free access before the first real charge. 0 (the
+  // default) preserves today's behavior exactly: no trial, first period is
+  // billed immediately.
+  trialDays            Int               @default(0)
+  monthlyCredits       Int               @default(0)
+  maxDownloadsPerMonth Int? // null = unlimited
+  // AI Video Phase 1 — which gated actions/models this plan can access
+  // (Basic/Pro/Premium, see lib/credits/video-actions.ts's PRICING_TIER_RANK).
+  // Null for the PAY_PER_DOWNLOAD plan (and any other non-tiered plan) —
+  // deliberately not defaulted to BASIC, so a plan only unlocks gated
+  // actions when an admin explicitly assigns it a tier.
+  tierLevel            PricingTierLevel?
+  // The Payment Provider's own plan id, once an admin has synced this plan
+  // to the vendor's dashboard (Razorpay subscriptions are created against a
+  // pre-existing provider-side plan, not an ad-hoc price). Null until
+  // synced; PROVIDER_PAYMENT=mock never needs it.
+  providerPlanRef      String?
+  isActive             Boolean           @default(true)
+  sortOrder            Int               @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subscriptions Subscription[]
+
+  @@map("pricing_plans")
+}
+
+model CreditPackage {
+  id           String  @id @default(cuid())
+  name         String
+  creditAmount Int
+  priceInPaise Int
+  isActive     Boolean @default(true)
+  sortOrder    Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("credit_packages")
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELLED
+  EXPIRED
+  PAST_DUE
+}
+
+model Subscription {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  planId String
+  plan   PricingPlan @relation(fields: [planId], references: [id])
+
+  status             SubscriptionStatus @default(ACTIVE)
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  cancelAtPeriodEnd  Boolean            @default(false)
+  // Milestone 13 — true only for the plan's first period when
+  // PricingPlan.trialDays > 0. renewSubscription() reads this to know the
+  // upcoming renewal is "trial -> first paid period" (charge now) rather
+  // than "paid -> paid" (charge per the normal interval); cleared on that
+  // first real renewal.
+  isTrialPeriod      Boolean            @default(false)
+  providerRef        String? // Payment Provider's subscription id
+
+  // Milestone 13 — runSubscriptionRenewalSweep() (lib/billing/subscription-
+  // renewal.ts) counts sweep passes spent waiting for a vendor renewal
+  // notification while PAST_DUE. Not an active re-charge we trigger (the
+  // PaymentProvider interface has no "charge subscription now" method —
+  // recurring charges and their own retry schedule are vendor-side); this
+  // just caps how many sweep passes we wait before expiring. Reset to 0 on
+  // every successful renewSubscription() call.
+  renewalAttempts Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+  @@map("subscriptions")
+}
+
+// One row per successful download grant. Re-downloading the same video never
+// re-charges: Download Service checks for an existing row on (userId,
+// videoProjectId) before consulting subscription/credits/purchase at all.
+enum DownloadMethod {
+  CREDIT
+  SUBSCRIPTION
+  ONE_TIME_PURCHASE
+  ADMIN_GRANT
+}
+
+model Download {
+  id             String       @id @default(cuid())
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  videoProjectId String
+  videoProject   VideoProject @relation(fields: [videoProjectId], references: [id], onDelete: Cascade)
+
+  method          DownloadMethod
+  creditsSpent    Int            @default(0)
+  amountPaidPaise Int? // set for ONE_TIME_PURCHASE
+  providerRef     String? // payment provider transaction ref, if paid
+
+  downloadUrl String // signed URL minted by the Storage Provider
+  expiresAt   DateTime? // signed URL expiry
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([videoProjectId])
+  @@map("downloads")
+}
+
+// Tracks a checkout from "order created" through provider webhook
+// confirmation, so the webhook handler knows what to fulfil (which credit
+// package / plan / video) without trusting client-supplied data.
+enum PaymentIntentKind {
+  CREDIT_PACKAGE
+  SUBSCRIPTION
+  ONE_TIME_DOWNLOAD
+}
+
+enum PaymentIntentStatus {
+  PENDING
+  PAID
+  FAILED
+  CANCELLED
+}
+
+model PaymentIntent {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind        PaymentIntentKind
+  referenceId String // CreditPackage.id | PricingPlan.id | VideoProject.id, depending on kind
+  amountPaise Int
+  status      PaymentIntentStatus @default(PENDING)
+
+  providerOrderId   String? // e.g. Razorpay order id
+  providerPaymentId String? // e.g. Razorpay payment id, once paid
+
+  invoice  Invoice? // Milestone 12 — auto-created on successful fulfillment
+  refunds  Refund[] // Milestone 13
+  disputes Dispute[] // Milestone 13
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([providerOrderId])
+  @@map("payment_intents")
+}
+
+// Milestone 13 — every inbound payment-provider webhook gets one row,
+// always, even on signature-verification failure. Before this model existed,
+// a thrown error mid-processing just 5xx'd back to the vendor with zero
+// record kept on our side, and there was nothing to point a "retry" action
+// at. fulfillPaymentIntent()/renewSubscription() stay idempotent (status
+// checks), so retrying is safe to re-run against the stored payload.
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+}
+
+model WebhookEvent {
+  id             String             @id @default(cuid())
+  provider       String // e.g. "razorpay"
+  eventType      String // normalized WebhookEvent.type, e.g. "payment.captured"
+  payload        Json
+  signatureValid Boolean
+  status         WebhookEventStatus @default(RECEIVED)
+  errorMessage   String?            @db.Text
+
+  relatedPaymentIntentId String?
+  relatedSubscriptionId  String?
+
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([status, receivedAt])
+  @@index([relatedPaymentIntentId])
+  @@map("webhook_events")
+}
+
+// Milestone 13 — no refund() call existed anywhere; PaymentProvider gains a
+// refund() method (mock + Razorpay) and every refund attempt is recorded
+// here regardless of outcome, mirroring PaymentIntent's own status pattern.
+enum RefundStatus {
+  PENDING
+  PROCESSED
+  FAILED
+}
+
+model Refund {
+  id              String        @id @default(cuid())
+  paymentIntentId String
+  paymentIntent   PaymentIntent @relation(fields: [paymentIntentId], references: [id], onDelete: Cascade)
+
+  amountPaise      Int
+  reason           String?      @db.Text
+  status           RefundStatus @default(PENDING)
+  providerRefundId String?
+  initiatedBy      String // admin User.id
+
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([paymentIntentId])
+  @@map("refunds")
+}
+
+// Milestone 13 — schema-only, "future-ready" per the brief's own framing.
+// Disputes are vendor-webhook-driven (a chargeback filed with the customer's
+// bank), not admin-initiated like a refund, so there's no provider-interface
+// method yet — this table exists so a future webhook event type has
+// somewhere to land without another migration.
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  WON
+  LOST
+}
+
+model Dispute {
+  id                String        @id @default(cuid())
+  paymentIntentId   String
+  paymentIntent     PaymentIntent @relation(fields: [paymentIntentId], references: [id], onDelete: Cascade)
+  providerDisputeId String?
+  reasonCode        String?
+  amountPaise       Int
+  status            DisputeStatus @default(OPEN)
+
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+
+  @@index([paymentIntentId])
+  @@map("disputes")
+}
+
+// ============================================================================
+// Milestone 6 — Generation Engine: provider health monitoring, cost tracking,
+// and usage analytics across the 4 generation categories (LLM/Image/Voice/
+// Video). See src/lib/generation/ for the engine that reads/writes these.
+// ============================================================================
+
+enum GenerationCategory {
+  LLM
+  IMAGE
+  VOICE
+  VIDEO
+  // Milestone 11 — Talking Head pipeline's speech-to-text step. Generic
+  // engine support (failover/retry/health/cost) needs no new code beyond
+  // this value plus one new GENERATION_TIMEOUT_MS_TRANSCRIPTION config key.
+  TRANSCRIPTION
+  // Phase 12 Module 3 — Gemini video-understanding calls, routed through
+  // runGeneration() the same as every other category (failover/retry/
+  // health/cost tracking for free), needing only this value plus
+  // GENERATION_TIMEOUT_MS_VIDEO_UNDERSTANDING.
+  VIDEO_UNDERSTANDING
+  // Phase 12 Module 4 — GPT-5.x timeline-planning calls (captions/zoom),
+  // same generic engine wiring as VIDEO_UNDERSTANDING above.
+  REASONING
+}
+
+enum ProviderHealthStatus {
+  HEALTHY // serving traffic normally
+  DEGRADED // recent failures, but not yet past the admin-configured threshold
+  DOWN // past the failure threshold — skipped by the engine until `downUntil`
+}
+
+// One row per (category, providerId) — e.g. (LLM, "openai"). Updated after
+// every generation attempt by lib/generation/health.ts; read by the engine
+// before it builds a request's provider chain so a known-bad provider isn't
+// retried on every single request while it's down.
+model ProviderHealth {
+  id         String             @id @default(cuid())
+  category   GenerationCategory
+  providerId String
+
+  status              ProviderHealthStatus @default(HEALTHY)
+  consecutiveFailures Int                  @default(0)
+  lastSuccessAt       DateTime?
+  lastFailureAt       DateTime?
+  lastError           String?
+  // Circuit-breaker cooldown — null unless status is DOWN. The engine skips
+  // this provider (unless every provider in the chain is down, to avoid a
+  // total outage) until this passes, then gives it one more chance.
+  downUntil           DateTime?
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([category, providerId])
+  @@map("provider_health")
+}
+
+enum GenerationLogStatus {
+  SUCCESS
+  FAILURE
+}
+
+// One row per provider ATTEMPT, not per logical request — a request that
+// retries twice against openai then fails over to gemini produces three
+// rows. That's what lets usage analytics and cost tracking attribute spend
+// and failure counts to the vendor that actually ran, not just the category.
+model GenerationLog {
+  id         String             @id @default(cuid())
+  category   GenerationCategory
+  providerId String
+  // Logical operation name, e.g. "script" | "thumbnail" | "voiceover" |
+  // "preview_render" | "master_render" — distinct generation calls within
+  // the same category (lib/generation/{llm,image,voice,video}.ts).
+  operation  String
+
+  status       GenerationLogStatus
+  attempt      Int // 1-based attempt number against this specific provider
+  latencyMs    Int
+  costUsd      Float?
+  errorMessage String?
+
+  // Milestone 10 Part 8 — Cost Management. Vendor model id actually used
+  // (GenerationProvider.model) plus the GenerationUsage breakdown the engine
+  // already computes for cost estimation, persisted per-attempt so a
+  // Provider/Model/Project/User/Subscription cost dashboard can be built
+  // straight off this table without a second tracking mechanism.
+  model        String?
+  usageTokens  Int?
+  usageImages  Int?
+  usageSeconds Float?
+
+  videoProjectId String?
+  videoProject   VideoProject? @relation(fields: [videoProjectId], references: [id], onDelete: SetNull)
+  userId         String?
+  // Milestone 7 — set for scene-level generation calls (scene render/image/
+  // voiceover) so per-scene cost/latency can be attributed, not just per-project.
+  sceneId        String?
+  scene          Scene?        @relation(fields: [sceneId], references: [id], onDelete: SetNull)
+
+  // Milestone 14 — mirrors videoProjectId exactly. A CreativeProject.id
+  // cannot be passed through videoProjectId (it's a real VideoProject-only
+  // FK) — this is its own parallel column, not a dual-purposed one.
+  creativeProjectId String?
+  creativeProject   CreativeProject? @relation(fields: [creativeProjectId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([category, providerId, createdAt])
+  @@index([videoProjectId])
+  @@index([sceneId])
+  @@index([creativeProjectId])
+  @@map("generation_logs")
+}
+
+// ============================================================================
+// Milestone 8 — AI Content Studio: Script Studio, Prompt Studio, Scene Editor,
+// Asset Library, project versioning, and collaboration scaffolding. See
+// src/lib/{ai/script-studio,assets,prompts,projects}/ for the logic that
+// reads/writes these models. No generation call site changes here — every
+// model below is bookkeeping/UX around the existing Generation Engine and
+// Render Pipeline (Milestones 6-7), never a parallel generation path.
+// ============================================================================
+
+enum AssetKind {
+  IMAGE
+  VIDEO
+  VOICE
+  STICKER // Milestone 9 — Media Library / Sticker layer
+}
+
+// Milestone 9 (Media Library requirement: Upload / AI generated / Stock /
+// Brand assets) — same Asset table, distinguished by where it came from.
+// Existing pipeline call sites (lib/render/pipeline.ts) never pass this, so
+// they keep defaulting to AI_GENERATED unchanged.
+enum AssetSource {
+  AI_GENERATED
+  UPLOAD
+  STOCK
+  BRAND
+}
+
+// One row per generated/uploaded artifact a user can browse in the Asset
+// Library. Created additively alongside the existing Storage Provider upload
+// calls in lib/render/pipeline.ts (scene render + merge) — never a second
+// upload path for pipeline-generated assets; Milestone 9 adds a genuine
+// second *source* (user uploads via POST /api/assets/upload), not a second
+// storage mechanism — both still go through the same Storage Provider.
+// `storageKey` is a Storage Provider key (never a public URL), mirroring how
+// Scene/VideoProject already store keys — the library resolves a public URL
+// at read time.
+// Milestone 11 — defaults to READY so every pre-existing call site (which
+// only ever creates an Asset AFTER its bytes are already durably stored)
+// keeps working unchanged. Only the new presigned large-file upload flow
+// (POST /api/assets/upload-url) creates a PENDING_UPLOAD row up front.
+enum AssetStatus {
+  PENDING_UPLOAD
+  READY
+}
+
+// ============================================================================
+// Milestone 14 — standalone content types (AI Image / Social Media /
+// Marketing Creative) that don't need a VideoProject wrapper: one prompt in,
+// one image out, no render queue. Mirrors VideoProject's shape minus the
+// render/scene machinery it has no use for. Brand Assets deliberately has NO
+// project model — it writes straight into the existing per-user BrandKit row
+// (see BrandKit below), since it isn't a browsable "project."
+// ============================================================================
+enum CreativeProjectKind {
+  AI_IMAGE
+  SOCIAL_MEDIA
+  MARKETING_CREATIVE
+}
+
+enum CreativeProjectStatus {
+  DRAFT
+  COMPLETED
+  FAILED
+}
+
+model CreativeProject {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind   CreativeProjectKind
+  // Key into the TS preset catalogue (lib/validations/creative.ts), e.g.
+  // "instagram_post" — a plain string, not an enum, so adding a new preset
+  // never needs a migration.
+  preset String
+  title  String
+
+  prompt          String          @db.Text
+  negativePrompt  String?
+  aspectRatio     AspectRatio
+  contentLanguage ContentLanguage @default(EN)
+
+  status       CreativeProjectStatus @default(DRAFT)
+  creditCost   Int                   @default(0)
+  errorMessage String?
+
+  resultAssetId String?
+  resultAsset   Asset?  @relation("CreativeProjectResultAsset", fields: [resultAssetId], references: [id], onDelete: SetNull)
+
+  // Milestone 15 — Universal Creative Workflow's optional reference image
+  // (style analyzed via a vision LLM call into the enhanced prompt, see
+  // lib/creative/reference-analysis.ts) and optional brand logo (composited
+  // onto the final image post-generation via lib/image/composite-logo.ts).
+  // Both plain nullable FKs, same onDelete: SetNull posture as resultAssetId
+  // — deleting the source Asset never needs special-case cleanup here.
+  referenceAssetId String?
+  referenceAsset   Asset?  @relation("CreativeProjectReferenceAsset", fields: [referenceAssetId], references: [id], onDelete: SetNull)
+  logoAssetId      String?
+  logoAsset        Asset?  @relation("CreativeProjectLogoAsset", fields: [logoAssetId], references: [id], onDelete: SetNull)
+
+  // Exact pixel dimensions for the chosen platform preset (e.g. Instagram
+  // Portrait 1080x1350) — independent of `aspectRatio` above, which only
+  // selects the nearest of the 3 sizes the image provider can natively
+  // generate. Null means "use the generated image's native size as-is"
+  // (every pre-Milestone-15 project, and AI Image's non-platform presets).
+  targetWidth  Int?
+  targetHeight Int?
+
+  // Milestone 16 — the Universal JSON Prompt actually used to build `prompt`
+  // (lib/prompt-os/schema.ts), persisted as the structured source of truth
+  // independent of any later edits the user made to `prompt` itself in the
+  // Prompt Editor. Null for every project created before this milestone.
+  universalPrompt Json?
+
+  assets             Asset[]             @relation("CreativeProjectAssets")
+  creditTransactions CreditTransaction[]
+  generationLogs     GenerationLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, kind, createdAt])
+  @@map("creative_projects")
+}
+
+// Milestone 14 — the single source of truth for every Dashboard creation
+// card, quick action, and "coming soon" stub. Admin CRUD (enable/disable,
+// reorder, edit icon/gradient/credit-cost/prompt-template/default-provider)
+// needs zero code changes — adding a future module (AI Avatar, AI Music,
+// etc.) once its backend pipeline exists is just a new row here, not a
+// Dashboard redesign. creditCostEstimate is not a display-only number — it
+// IS the amount actually charged for that tool's generation call (one
+// source of truth, not a parallel config).
+enum CreativeToolCategory {
+  MAIN_CARD
+  QUICK_ACTION
+  COMING_SOON
+}
+
+enum CreativeToolPipeline {
+  VIDEO
+  IMAGE
+  SOCIAL_MEDIA
+  MARKETING_CREATIVE
+  TALKING_HEAD
+  BRAND_ASSET
+  EXTERNAL
+}
+
+model CreativeTool {
+  id          String  @id @default(cuid())
+  key         String  @unique
+  label       String
+  description String?
+  // Lucide icon name, resolved client-side via a lookup map — never raw SVG
+  // markup, so this stays a simple admin-editable string field.
+  icon        String
+
+  gradientFrom String?
+  gradientTo   String?
+
+  category CreativeToolCategory
+  pipeline CreativeToolPipeline
+
+  // Which sub-preset (lib/validations/creative.ts) or Video objective/platform
+  // this tool pre-fills when launched, if any.
+  presetKey     String?
+  // Explicit href for special-case routing (e.g. "/create?objective=PROMOTION")
+  // — used by tools that launch an existing pipeline's page rather than a
+  // dedicated route of their own.
+  routeOverride String?
+
+  creditCostEstimate Int @default(0)
+  estimatedSeconds   Int @default(0)
+
+  // Optional prefix injected before the user's own prompt at generation time.
+  promptTemplate    String? @db.Text
+  // Optional preferred provider id for this tool's category — actually
+  // consumed by generateImage()/generateScript() (reorders the existing
+  // priority-filtered provider list, never replaces it, so failover safety
+  // is unchanged if this provider is unhealthy or over budget).
+  defaultProviderId String?
+
+  enabled   Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([category, sortOrder])
+  @@map("creative_tools")
+}
+
+model Asset {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind       AssetKind
+  source     AssetSource @default(AI_GENERATED)
+  status     AssetStatus @default(READY)
+  storageKey String
+  label      String?
+
+  // Milestone 11 Part 1 — "generate metadata" for an uploaded talking-head
+  // video. Nullable/optional everywhere else; only populated for uploads
+  // that go through a metadata-probe step.
+  durationSeconds Float?
+  mimeType        String?
+  fileSizeBytes   Int?
+
+  videoProjectId String?
+  videoProject   VideoProject? @relation(fields: [videoProjectId], references: [id], onDelete: SetNull)
+  sceneId        String?
+  scene          Scene?        @relation(fields: [sceneId], references: [id], onDelete: SetNull)
+
+  // Milestone 14 — mirrors videoProjectId exactly, for the new standalone
+  // content-type projects (AI Image / Social Media / Marketing Creative).
+  creativeProjectId String?
+  creativeProject   CreativeProject? @relation("CreativeProjectAssets", fields: [creativeProjectId], references: [id], onDelete: SetNull)
+
+  clips                        Clip[]
+  sourceForProjects            VideoProject[]    @relation("ProjectSourceAsset")
+  resultForCreativeProjects    CreativeProject[] @relation("CreativeProjectResultAsset")
+  referenceForCreativeProjects CreativeProject[] @relation("CreativeProjectReferenceAsset")
+  logoForCreativeProjects      CreativeProject[] @relation("CreativeProjectLogoAsset")
+  analysis                     AssetAnalysis?
+  referenceForMarketingTemplates    MarketingTemplate[]           @relation("MarketingTemplateReferenceAsset")
+  logoForMarketingGenerations       MarketingTemplateGeneration[] @relation("MarketingTemplateGenerationLogoAsset")
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, kind, createdAt])
+  @@index([videoProjectId])
+  @@index([creativeProjectId])
+  @@map("assets")
+}
+
+// Milestone 16 — Design Intelligence Library. One row per analyzed
+// reference image (1:1 with Asset), produced by
+// lib/design-intelligence/analyze-asset.ts's analyzeAssetForLibrary(). The
+// 5 columns below are the high-value fields a reference picker actually
+// filters/searches on; everything else the spec asks for (lighting,
+// composition, typography, camera, lens, perspective, depth, texture,
+// hierarchy, white space, luxury/modern/minimalism level, headline/CTA/logo
+// position, marketing goal, target audience, color palette, objects, visual
+// language) lives in `details` — same "may keep growing, don't migrate per
+// field" reasoning already used for VideoProject.brief/ProviderConfig.extraConfig.
+// This table — not a sidecar JSON file in object storage — IS the Design
+// Intelligence Library: filterable/indexable, and never a second source of
+// truth to keep in sync with the Asset row it describes.
+model AssetAnalysis {
+  id      String @id @default(cuid())
+  assetId String @unique
+  asset   Asset  @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  industry String?
+  category String?
+  style    String?
+  mood     String?
+  platform String?
+
+  details Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("asset_analyses")
+}
+
+// Milestone 11 Part 9 — per-user (no Workspace/Team model exists yet; one
+// BrandKit per User is today's de-facto "workspace"). Read by the Visual
+// Planner/Asset Selector/Timeline auto-seed/merge step as a DEFAULT only —
+// never overrides an explicit per-project choice, same defaulting posture
+// Scene.backgroundMusicUrl already established.
+model BrandKit {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Plain string references, not FK relations — same "deleting the
+  // referent never needs special-case cleanup, resolved defensively at read
+  // time" choice already established for VideoProject.thumbnailSceneId.
+  logoAssetId       String?
+  introAnimationId  String? // id from the admin-configured TEXT_ANIMATIONS/presets, not an Asset
+  musicAssetId      String?
+  outroAssetId      String?
+  watermarkAssetId  String?
+  watermarkPosition String? @default("bottom_right")
+
+  primaryColor   String?
+  secondaryColor String?
+  fontFamily     String?
+
+  // Advertisement Poster mode, Step 1 — contact details injected
+  // automatically into poster prompts so the user never re-types them.
+  // businessName is intentionally NOT duplicated here: it already lives on
+  // Profile.businessName (set at onboarding), which api/videos/route.ts
+  // already reads and injects into script prompts the same way poster
+  // generation will read these fields.
+  contactPhone    String?
+  contactWhatsapp String?
+  addressLine     String?
+  websiteOrSocial String?
+
+  // Milestone 14 — AI-generated brand guidelines text (see
+  // lib/brand-kit/identity-engine.ts). Nullable; empty until generated once.
+  guidelinesText String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("brand_kits")
+}
+
+// Admin Reference Library, Part A — founder-curated "gold standard" sample
+// ads per industry. Deliberately NOT a flag on Asset/AssetAnalysis: those
+// are user-scoped (Asset.userId is required, onDelete: Cascade), which is
+// the wrong ownership model for shared platform content, and have no home
+// for admin-only concerns (a confirmed industry bucket, active/inactive
+// curation). `industry` here is the admin's deliberate, confirmed choice —
+// Part B trusts this field, never the AI's own guess, which stays inside
+// `analysis` (the raw AssetAnalysisResult JSON, unpromoted — nothing in
+// Part A needs to filter by style/mood, so there's no reason to mirror
+// AssetAnalysis's 5-column shape yet).
+enum ReferenceAnalysisStatus {
+  PENDING
+  READY
+  FAILED
+}
+
+model IndustryReference {
+  id       String           @id @default(cuid())
+  industry BusinessVertical
+
+  storageKey String
+  mimeType   String?
+  label      String? // optional admin-facing name, e.g. "Grand opening banner — warm palette"
+
+  analysisStatus ReferenceAnalysisStatus @default(PENDING)
+  analysis       Json? // full AssetAnalysisResult (design-intelligence/schema.ts) once analyzed
+
+  isActive Boolean @default(true)
+
+  uploadedByUserId String?
+  uploadedBy       User?   @relation(fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([industry, isActive])
+  @@map("industry_references")
+}
+
+// Per-INDUSTRY guidance note ("what good copy/layout looks like for
+// Restaurant"), not per-image — deliberately its own tiny model, one row
+// per BusinessVertical, so it's never duplicated across every sample in
+// that industry.
+model IndustryGuidanceNote {
+  id       String           @id @default(cuid())
+  industry BusinessVertical @unique
+  notes    String           @db.Text
+
+  updatedAt DateTime @updatedAt
+
+  @@map("industry_guidance_notes")
+}
+
+enum PromptKind {
+  SCRIPT
+  IMAGE
+  VIDEO
+  NEGATIVE
+}
+
+// Prompt Studio's "Prompt history" — logged whenever a user explicitly
+// authors a prompt (editing a scene's image/video/negative prompt, or
+// running a Script Studio operation), not on every internal generation
+// retry/attempt (that's GenerationLog's job, a different concern: vendor
+// attempts vs. user-authored prompt text).
+model PromptRecord {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind PromptKind
+  text String     @db.Text
+
+  videoProjectId String?
+  videoProject   VideoProject? @relation(fields: [videoProjectId], references: [id], onDelete: SetNull)
+  sceneId        String?
+  scene          Scene?        @relation(fields: [sceneId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, kind, createdAt])
+  @@map("prompt_records")
+}
+
+enum PromptTemplateCategory {
+  SCRIPT
+  IMAGE
+  VIDEO
+}
+
+// Prompt Studio's "Prompt templates" — user-saved reusable starting points.
+// Always user-owned in this milestone (no admin/global template authoring
+// UI yet — see PROJECT_STATUS.md's scope notes).
+model PromptTemplate {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  category           PromptTemplateCategory
+  title              String
+  promptText         String                 @db.Text
+  negativePromptText String?                @db.Text
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, category])
+  @@map("prompt_templates")
+}
+
+// Project-level snapshot for autosave/version-history/restore. A new row is
+// written only when the snapshot actually differs from the most recent one
+// for the project (lib/projects/versioning.ts dedupes), so routine
+// re-fetches or no-op saves don't grow this table pointlessly.
+model ProjectVersion {
+  id             String       @id @default(cuid())
+  videoProjectId String
+  videoProject   VideoProject @relation(fields: [videoProjectId], references: [id], onDelete: Cascade)
+
+  // { generatedScript, scenes: [{ id, order, prompt, imagePrompt, videoPrompt,
+  //   negativePrompt, durationSeconds, transition, voiceId, backgroundMusicUrl,
+  //   subtitleText }] } — see lib/projects/versioning.ts for the exact shape.
+  snapshot Json
+
+  createdBy String? // User.id, best-effort audit trail
+
+  createdAt DateTime @default(now())
+
+  @@index([videoProjectId, createdAt])
+  @@map("project_versions")
+}
+
+enum CollaboratorRole {
+  VIEWER
+  EDITOR
+  OWNER
+}
+
+// Schema scaffolding only (Milestone 8 requirement 9: "collaborative
+// architecture for future team support") — no invite UI, no realtime sync,
+// and ownership (VideoProject.userId) remains the only enforced authority
+// today. This table exists so a future milestone can build sharing on top
+// without a migration; see PROJECT_STATUS.md's scope notes.
+model ProjectCollaborator {
+  id             String       @id @default(cuid())
+  videoProjectId String
+  videoProject   VideoProject @relation(fields: [videoProjectId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  role CollaboratorRole @default(VIEWER)
+
+  // Milestone 9 — further collaboration *architecture* groundwork (still no
+  // realtime sync/UI, per the explicit scope decision): a coarse presence
+  // timestamp a future "who's editing this" indicator could read.
+  lastActiveAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@unique([videoProjectId, userId])
+  @@map("project_collaborators")
+}
+
+// ============================================================================
+// Milestone 9 — Professional Video Editor. A multi-track Timeline (Track +
+// Clip) sits ADDITIVELY on top of the existing Scene model — Scene stays
+// exactly what the Scene Engine and render pipeline already understand
+// (Milestones 7-8 untouched); Track/Clip is the editor's own layout layer,
+// referencing Scenes/Assets by id rather than duplicating their data. Caption
+// editing gets a genuine word-level model alongside (not replacing) the
+// existing Scene.subtitleText/subtitleKey VTT artifact. Export is a new,
+// on-demand, multi-resolution/codec output distinct from the automatic
+// preview/master produced by Milestone 7's merge step — both still flow
+// through the same RenderJob queue (background rendering reused, not
+// duplicated) and the same Generation Engine (a new `compose_timeline`
+// operation, not a parallel system). See src/lib/timeline/, src/lib/captions/,
+// src/lib/export/ for the logic that reads/writes these models.
+// ============================================================================
+
+enum TrackKind {
+  VIDEO
+  IMAGE
+  TEXT
+  CAPTION
+  STICKER
+  AUDIO
+  MUSIC
+}
+
+// One row per track (a horizontal lane in the multi-track Timeline UI).
+// `order` is the lane's vertical stacking position, independent of any
+// clip's time position.
+model Track {
+  id             String       @id @default(cuid())
+  videoProjectId String
+  videoProject   VideoProject @relation(fields: [videoProjectId], references: [id], onDelete: Cascade)
+
+  kind     TrackKind
+  order    Int
+  isMuted  Boolean   @default(false)
+  isHidden Boolean   @default(false)
+
+  clips Clip[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([videoProjectId, order])
+  @@index([videoProjectId])
+  @@map("tracks")
+}
+
+// One row per clip placed on a track. `sceneId`/`assetId` are both optional
+// and mutually-informative-not-exclusive: a VIDEO/AUDIO clip sourced from the
+// Scene Engine's pipeline sets `sceneId` (reads that scene's videoKey/
+// imageKey/voiceKey at render time); a clip built from a standalone Media
+// Library upload/stock pick sets `assetId` instead; a TEXT or STICKER clip
+// may set neither and carry everything in `content`. `trimStartMs` is the
+// offset into the *source* media where this clip's visible content begins,
+// so Resize/Split can shorten or divide a clip without ever needing to
+// re-render its underlying source.
+model Clip {
+  id             String       @id @default(cuid())
+  trackId        String
+  track          Track        @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  videoProjectId String
+  videoProject   VideoProject @relation(fields: [videoProjectId], references: [id], onDelete: Cascade)
+
+  sceneId String?
+  scene   Scene?  @relation(fields: [sceneId], references: [id], onDelete: SetNull)
+  assetId String?
+  asset   Asset?  @relation(fields: [assetId], references: [id], onDelete: SetNull)
+
+  startMs     Int
+  durationMs  Int
+  trimStartMs Int @default(0)
+
+  // Type-specific payload — TEXT: {text, fontFamily, fontSize, color,
+  // strokeColor, strokeWidth, shadowColor, shadowBlur, animation}; STICKER:
+  // {x, y, scale, rotation}; CAPTION: {captionBlockId}. Null for plain
+  // VIDEO/IMAGE/AUDIO/MUSIC clips, which need nothing beyond scene/asset +
+  // timing. See lib/timeline/clip-content.ts for the exact per-kind shapes.
+  content Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([trackId])
+  @@index([videoProjectId])
+  @@map("clips")
+}
+
+// One row per scene's word-level caption block — additive alongside (never
+// replacing) Scene.subtitleText/subtitleKey. Editing words here and saving
+// regenerates that scene's VTT artifact from the explicit word timings
+// (lib/scenes/subtitle.ts's buildWordLevelVtt), so the Caption Editor's edits
+// actually reach the rendered subtitle track, not just this table.
+model CaptionBlock {
+  id             String       @id @default(cuid())
+  sceneId        String       @unique
+  scene          Scene        @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  videoProjectId String
+  videoProject   VideoProject @relation(fields: [videoProjectId], references: [id], onDelete: Cascade)
+
+  // Selected style preset id (from the admin-configured CAPTION_STYLE_PRESETS
+  // list) plus any per-block overrides — never a second style-authoring UI.
+  style Json?
+
+  words CaptionWord[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([videoProjectId])
+  @@map("caption_blocks")
+}
+
+model CaptionWord {
+  id             String       @id @default(cuid())
+  captionBlockId String
+  captionBlock   CaptionBlock @relation(fields: [captionBlockId], references: [id], onDelete: Cascade)
+
+  order   Int
+  text    String
+  startMs Int
+  endMs   Int
+
+  // Milestone 11 Part 7 — Smart Captions word-highlight/animated/emoji
+  // support. Both nullable; null means "use the CaptionBlock-level style's
+  // default," same fallback posture every other per-item override already
+  // uses in this schema (e.g. Scene.imagePrompt falling back to Scene.prompt).
+  emphasis       String?
+  highlightColor String?
+
+  @@index([captionBlockId, order])
+  @@map("caption_words")
+}
+
+enum ExportResolution {
+  R720P
+  R1080P
+  R4K
+}
+
+enum ExportCodec {
+  H264
+  H265
+  VP9
+}
+
+enum ExportStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// One row per on-demand export request — distinct from VideoProject's
+// automatic preview/master (Milestone 7's merge step), since a project can
+// now be exported multiple times at different resolutions/codecs/watermark
+// choices without re-running the original render. Background rendering is
+// reused, not duplicated: `renderJobId` points at the SAME RenderJob queue
+// every scene/merge job already flows through (see lib/render/pipeline.ts's
+// new processExportJob()).
+model Export {
+  id             String       @id @default(cuid())
+  videoProjectId String
+  videoProject   VideoProject @relation(fields: [videoProjectId], references: [id], onDelete: Cascade)
+
+  resolution ExportResolution
+  codec      ExportCodec
+  watermark  Boolean
+
+  status       ExportStatus @default(PENDING)
+  outputKey    String?
+  errorMessage String?
+
+  renderJobId String?    @unique
+  renderJob   RenderJob? @relation(fields: [renderJobId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([videoProjectId, createdAt])
+  @@map("exports")
+}
+
+// ============================================================================
+// Milestone 10 — Production AI Integration, Provider Management & Zero-Code
+// Installation. Replaces the env-var-only credential model (Milestones 4/6)
+// with one encrypted, Admin-Panel-editable ProviderConfig row per
+// (category, providerId) — across ALL six categories (LLM/Image/Voice/Video
+// AND Storage/Payment, which previously read S3_*/RAZORPAY_* env vars the
+// same way). `PROVIDER_*_PRIORITY`/`PROVIDER_STORAGE`/`PROVIDER_PAYMENT`
+// SystemConfig keys (Milestone 4/6) are retired in favor of this table's own
+// `priority` field — ordering now lives in exactly one place, not two.
+// Existing env vars still work as a one-time migration fallback (see
+// lib/providers/credentials.ts) so nothing already deployed breaks.
+// ============================================================================
+
+enum ProviderCategory {
+  LLM
+  IMAGE
+  VOICE
+  VIDEO
+  STORAGE
+  PAYMENT
+  // Milestone 11 — speech-to-text for the Talking Head pipeline. Joins
+  // GenerationCategory too (below) so it gets failover/retry/health/cost
+  // tracking for free, exactly like LLM/Image/Voice/Video.
+  TRANSCRIPTION
+  // Milestone 12 — transactional email (render-complete notices, receipts,
+  // admin broadcasts). Deliberately NOT added to GenerationCategory: email
+  // is fire-and-forget notification, not a generation call with the same
+  // failover/retry/cost-tracking shape, and a missed email should never
+  // retry-storm or fail a render — see lib/notifications/email.ts.
+  EMAIL
+  // Milestone 26 — Admin Settings: live-API stock media search providers
+  // (Pexels, Pixabay, LottieFiles). One category covers all three even
+  // though Pexels/Pixabay each serve multiple content types (image+video)
+  // per API key — the adapter's search() takes a `type` param instead of
+  // needing a separate credential row per content type. DB-only, no
+  // failover/priority concept, same as TRANSCRIPTION/EMAIL.
+  STOCK_MEDIA
+  // Milestone 26 — icon search providers (IconScout, Icons8). Kept separate
+  // from STOCK_MEDIA since these are icon-specific APIs, not general stock
+  // media. DB-only, same as STOCK_MEDIA above.
+  ICON
+  // Phase 12 Module 1 (AI Auto-Editor) — "watches" the uploaded video +
+  // audio together (emphasis, emotion, gestures, visual context, all
+  // timestamped) as its OWN provider slot, distinct from VIDEO (that
+  // category is text/image-to-video GENERATION — replicate/veo/kling/etc,
+  // confirmed via the existing catalogue — a completely different
+  // capability from understanding an EXISTING video). DB-only, same as
+  // TRANSCRIPTION/STOCK_MEDIA/ICON above.
+  VIDEO_UNDERSTANDING
+  // Phase 12 Module 1 — combines the transcript + VIDEO_UNDERSTANDING's
+  // output into real editing decisions (scene-removal, timeline planning).
+  // Kept separate from LLM on purpose, same reasoning already established
+  // for IMAGE's gemini_images vs LLM's gemini (ai-providers.ts's own
+  // comment): a distinct provider slot with its own enable/model/priority/
+  // budget, even though the founder may point it at the same underlying
+  // API key as LLM — this lets a more expensive/capable reasoning model
+  // (e.g. GPT-5.x) be configured independently of whatever cheaper model
+  // LLM uses for script/text generation elsewhere in the app.
+  REASONING
+}
+
+// One row per (category, providerId) — e.g. (LLM, "openai"), (VIDEO, "veo"),
+// (STORAGE, "s3"). `apiKeyEncrypted`/`apiSecretEncrypted` are AES-256-GCM
+// ciphertext (lib/security/encryption.ts), never returned in plaintext by
+// any API response — only a masked preview. LLM/IMAGE/VOICE/VIDEO support
+// multiple `enabled` rows tried in `priority` order (failover, unchanged
+// behavior from the old priority-array mechanism); STORAGE/PAYMENT are
+// single-active-driver categories (no failover concept — see
+// lib/providers/storage/index.ts, lib/providers/payment/index.ts).
+model ProviderConfig {
+  id         String           @id @default(cuid())
+  category   ProviderCategory
+  providerId String
+
+  enabled Boolean @default(false)
+
+  apiKeyEncrypted    String?
+  apiSecretEncrypted String?
+
+  // A handful of vendors need a third secret (Razorpay's webhook signing
+  // secret) that doesn't fit the apiKey/apiSecret pair — kept encrypted the
+  // same way rather than smuggled into `extraConfig` below.
+  extraSecretEncrypted String?
+
+  model          String?
+  defaultQuality String?
+
+  // Non-secret, vendor-specific structured config that doesn't fit any
+  // universal column (S3/R2's bucket+region+endpoint+publicBaseUrl, for
+  // example). Keyed by field name; see lib/providers/credentials.ts for the
+  // exact keys each provider reads.
+  extraConfig Json?
+
+  // Lower runs first. Only meaningful for LLM/IMAGE/VOICE/VIDEO.
+  priority Int @default(0)
+
+  monthlyBudgetUsd   Float?
+  dailyBudgetUsd     Float?
+  rateLimitPerMinute Int?
+  timeoutMs          Int?
+  retryCount         Int?
+
+  // Part 9 — key rotation reminders. Purely informational; nothing enforces
+  // this automatically, it just surfaces a warning in the Admin Panel.
+  keyExpiresAt DateTime?
+
+  lastTestedAt   DateTime?
+  lastTestResult Boolean?
+  lastTestError  String?   @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([category, providerId])
+  @@map("provider_configs")
+}
+
+// Part 9 — "Audit every provider action." One row per admin action against
+// a ProviderConfig row (key updated, enabled/disabled, budget changed,
+// connection tested). Distinct from GenerationLog (vendor-call telemetry)
+// and ProjectVersion (per-project content snapshots) — this is specifically
+// an admin-action trail over provider *configuration*.
+model ProviderAuditLog {
+  id          String           @id @default(cuid())
+  category    ProviderCategory
+  providerId  String
+  action      String
+  performedBy String?
+  detail      Json?
+  createdAt   DateTime         @default(now())
+
+  @@index([category, providerId, createdAt])
+  @@map("provider_audit_logs")
+}
+
+// ============================================================================
+// Milestone 12 — Production Infrastructure, Launch Readiness & Founder
+// Acceptance Test. Every model below reuses an existing engine (Credit
+// Engine, Provider abstraction, the render pipeline's finalize call sites)
+// as its trigger point — none of these introduce a second orchestration
+// mechanism alongside what the first 11 milestones already built.
+// ============================================================================
+
+// DB-backed fallback for lib/security/rate-limit.ts when REDIS_URL isn't
+// configured — same shape and same "insert then count the window" approach
+// OtpRequest's per-phone/per-IP limiting already used, generalized to an
+// arbitrary `key` (e.g. "video_create:{userId}") instead of being phone-specific.
+model RateLimitHit {
+  id        String   @id @default(cuid())
+  key       String
+  createdAt DateTime @default(now())
+
+  @@index([key, createdAt])
+  @@map("rate_limit_hits")
+}
+
+// Captures uncaught API-route errors that GenerationLog doesn't already
+// cover (GenerationLog is provider-attempt telemetry, not general app
+// errors). Works standalone for the Error Dashboard and is Sentry-additive
+// when SENTRY_DSN is configured — never the only place an error is recorded.
+model ErrorLog {
+  id        String   @id @default(cuid())
+  requestId String?
+  route     String
+  message   String
+  stack     String?  @db.Text
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@map("error_logs")
+}
+
+// General-purpose audit trail, generalizing ProviderAuditLog's existing
+// (resource, action, performedBy, detail-names-not-values) shape beyond
+// just provider config changes — credit grants, coupon redemptions,
+// subscription cancellations, account suspension, broadcast sends.
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  resource  String
+  action    String
+  detail    Json?
+  createdAt DateTime @default(now())
+
+  @@index([resource, createdAt])
+  @@index([userId, createdAt])
+  @@map("audit_logs")
+}
+
+enum CouponDiscountType {
+  PERCENT
+  FIXED
+  CREDITS
+}
+
+model CouponCode {
+  id             String             @id @default(cuid())
+  code           String             @unique
+  discountType   CouponDiscountType
+  value          Float
+  maxRedemptions Int?
+  redeemedCount  Int                @default(0)
+  expiresAt      DateTime?
+  isActive       Boolean            @default(true)
+
+  redemptions CouponRedemption[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("coupon_codes")
+}
+
+model CouponRedemption {
+  id       String     @id @default(cuid())
+  userId   String
+  user     User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  couponId String
+  coupon   CouponCode @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  context  String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, couponId])
+  @@map("coupon_redemptions")
+}
+
+// GST-ready invoice, auto-created inside lib/billing/fulfillment.ts's
+// existing single settlement function on a successful payment — one new
+// call site, not a parallel settlement path. businessDetailsSnapshot
+// freezes BUSINESS_TAX_DETAILS at the moment of issue so a later admin edit
+// never silently rewrites a past invoice's printed details.
+model Invoice {
+  id              String        @id @default(cuid())
+  invoiceNumber   Int           @unique @default(autoincrement())
+  userId          String
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  paymentIntentId String        @unique
+  paymentIntent   PaymentIntent @relation(fields: [paymentIntentId], references: [id], onDelete: Cascade)
+
+  subtotalPaise           Int
+  taxRatePercent          Float
+  taxAmountPaise          Int
+  totalPaise              Int
+  businessDetailsSnapshot Json
+  pdfKey                  String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("invoices")
+}
+
+enum NotificationType {
+  RENDER_COMPLETE
+  EXPORT_COMPLETE
+  BROADCAST
+  SYSTEM
+}
+
+// Dual-channel (in-app row here + email-if-enabled via the same Email
+// provider) hooked into the existing render/export finalize call sites —
+// fire-and-forget, a notification failure never blocks or fails a render.
+model Notification {
+  id     String           @id @default(cuid())
+  userId String
+  user   User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type   NotificationType
+  title  String
+  body   String
+  link   String?
+  readAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, readAt, createdAt])
+  @@map("notifications")
+}
+
+// Public /contact form submissions — stored for the admin to review and
+// optionally emailed to the admin via the same Email provider.
+model ContactMessage {
+  id        String   @id @default(cuid())
+  name      String
+  email     String
+  message   String   @db.Text
+  createdAt DateTime @default(now())
+
+  @@map("contact_messages")
+}
+
+// ============================================================================
+// Phase 6 — Prompt Lab & Image Benchmark. Measures image quality scientifically
+// by running the same creative request through 4 prompt variants (Balanced,
+// Story-first, Composition-first, Marketing-first) and rating the results.
+// No changes to any upstream generation module — purely a measurement layer.
+// ============================================================================
+
+model PromptBenchmark {
+  id     String @id @default(cuid())
+  userId String
+
+  rawIdea      String  @db.Text
+  industry     String
+  gptMode      String // "gpt" | "fallback"
+  gptDirection Json? // GPTCampaignDirection — null when mode is "fallback"
+  winnerId     String? // PromptBenchmarkVariant.id of the chosen winner
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  variants PromptBenchmarkVariant[]
+
+  @@index([userId, createdAt])
+  @@map("prompt_benchmarks")
+}
+
+model PromptBenchmarkVariant {
+  id          String @id @default(cuid())
+  benchmarkId String
+
+  variantType  String // "balanced" | "story_first" | "composition_first" | "marketing_first"
+  variantLabel String // "A — Balanced", "B — Story-first", etc.
+
+  finalPrompt  String @db.Text
+  promptLength Int
+  tokenCount   Int
+
+  imageUrl     String?   @db.Text
+  executionMs  Int?
+  provider     String?
+  generatedAt  DateTime?
+  // "pending" | "generating" | "generated" | "failed"
+  status       String    @default("pending")
+  errorMessage String?   @db.Text
+
+  createdAt DateTime @default(now())
+
+  benchmark PromptBenchmark        @relation(fields: [benchmarkId], references: [id], onDelete: Cascade)
+  rating    PromptBenchmarkRating?
+
+  @@index([benchmarkId])
+  @@map("prompt_benchmark_variants")
+}
+
+model PromptBenchmarkRating {
+  id        String @id @default(cuid())
+  variantId String @unique
+
+  commercialAppeal       Int // 1–10
+  storytelling           Int
+  composition            Int
+  realism                Int
+  premiumFeel            Int
+  scrollStopping         Int
+  brandFit               Int
+  marketingEffectiveness Int
+  overallScore           Int
+  notes                  String? @db.Text
+
+  ratedAt DateTime @default(now())
+
+  variant PromptBenchmarkVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@map("prompt_benchmark_ratings")
+}
+
+// ============================================================================
+// Milestone 24 — Cloud Video Editor (non-AI). A professional, standalone
+// multi-track editor (CapCut/Premiere-style) with its own Project/Folder/
+// Asset/Track/Clip model — decoupled from Scene/AI entirely. Deliberately
+// parallel to (not a replacement for) the Milestone 9 Track/Clip/Asset
+// models above, which stay wired to the Scene Engine/AI pipeline. Every
+// model here is `Editor`-prefixed / table-mapped `editor_*` so there is zero
+// name collision with the existing editor's schema.
+// ============================================================================
+
+enum EditorAspectRatio {
+  RATIO_16_9
+  RATIO_9_16
+  RATIO_1_1
+  RATIO_4_5
+  CUSTOM
+}
+
+enum EditorAssetKind {
+  VIDEO
+  AUDIO
+  IMAGE
+  // Module 7 — custom brand fonts (woff2/woff/ttf), uploaded through the
+  // same presigned-URL flow as every other asset kind, tied into the
+  // Brand Kit sidebar's font slot.
+  FONT
+  // Milestone 26 — Lottie JSON animations (Admin Asset Library + the
+  // "animation"/"animated-icon" LibraryAssetCategory tags below). Static
+  // icons (SVG/PNG) stay kind: IMAGE — only Lottie files need a kind of
+  // their own, since nothing about SVG/PNG icon handling differs from a
+  // normal image at this level.
+  ANIMATION
+}
+
+// Milestone 26 — Admin Asset Library. USER (default, unchanged behavior)
+// is a private-to-one-uploader asset exactly as before; LIBRARY is
+// admin-curated content available to every user/project. Orthogonal to
+// EditorAssetKind (which still drives clip/track compatibility) — this is
+// purely a visibility/ownership axis.
+enum EditorAssetScope {
+  USER
+  LIBRARY
+}
+
+// Milestone 26 — Admin Asset Library's own filter/tag dimension, independent
+// of EditorAssetKind. Populated only for scope: LIBRARY rows. sfx/music are
+// both kind: AUDIO; static-icon/animated-icon are kind: IMAGE/ANIMATION
+// respectively — this is the finer-grained tag the library browser's
+// search/filter UI needs that `kind` alone can't express.
+enum LibraryAssetCategory {
+  VIDEO
+  IMAGE
+  AUDIO
+  SFX
+  MUSIC
+  ANIMATION
+  STATIC_ICON
+  ANIMATED_ICON
+  // Module 11 — Creative Studio Sidebar's library-only tabs (curated via
+  // the Admin Asset Library, never live-searched — see
+  // lib/providers/stock-media/ for the tabs that ARE live-searched).
+  // TEMPLATE is a single draggable asset (title card, intro clip), not a
+  // multi-clip preset system — that's a distinct, larger feature.
+  // TRANSITION/EFFECT/SHAPE/STICKER/LOGO are all pre-rendered IMAGE/
+  // ANIMATION assets, reusing the exact same OVERLAY-track + transform
+  // fields every other image clip already uses — no new clip/content type.
+  TEMPLATE
+  TRANSITION
+  EFFECT
+  SHAPE
+  STICKER
+  LOGO
+}
+
+// PENDING_UPLOAD until the browser's presigned PUT completes and
+// POST /api/editor/assets/[id]/confirm-upload flips it to READY — same
+// two-phase upload pattern the existing Asset/assetUploadUrlSchema uses.
+// Upload normalization (2026-07-19) — a VIDEO asset takes two more real
+// states between confirm-upload and READY: QUEUED_FOR_NORMALIZATION (set
+// by confirm-upload itself, once the integrity check passes) then
+// NORMALIZING (claimed by asset-normalize-worker.ts, same atomic
+// findFirst+updateMany claim shape as EditorExport's QUEUED->RENDERING —
+// two distinct values, not one, specifically so two concurrent worker
+// instances can never both claim and re-transcode the same row). Every
+// other asset kind (AUDIO/IMAGE/FONT) skips straight to READY exactly as
+// before — normalization only exists for the VIDEO codec/fps/bitrate
+// problem class it was built to fix.
+enum EditorAssetStatus {
+  PENDING_UPLOAD
+  QUEUED_FOR_NORMALIZATION
+  NORMALIZING
+  READY
+  FAILED
+}
+
+enum EditorTrackKind {
+  VIDEO
+  AUDIO
+  SUBTITLE
+  TEXT
+  OVERLAY
+  EFFECTS
+}
+
+// Module 8 — Voice/Music/SFX are NOT separate track kinds (every track
+// listed here is still `kind: AUDIO`); this is purely a UI-differentiation
+// tag (icon/color/label in the Timeline) set once at track-creation time.
+// Nullable and only meaningful on AUDIO-kind tracks — a track created via
+// any older/generic path just has no subtype and falls back to the plain
+// "Audio" presentation.
+enum EditorAudioSubtype {
+  VOICE
+  MUSIC
+  SFX
+}
+
+// Module 9 — data-driven transition types (see lib/video-editor/
+// transition-engine.ts's TRANSITION_TYPE_DEFS for label/description/valid-
+// directions per type) — a new type is added there and in
+// resolveTransitionBlend's switch, not by touching this enum's consumers.
+enum EditorTransitionType {
+  CROSSFADE
+  DISSOLVE
+  WIPE
+  SLIDE
+  ZOOM
+  FLASH
+}
+
+// One enum covers both WIPE/SLIDE's LEFT/RIGHT/UP/DOWN and ZOOM's IN/OUT —
+// simpler schema than two enums; which subset is valid for a given type is
+// a pure-layer concern (TRANSITION_TYPE_DEFS), not a DB constraint.
+enum EditorTransitionDirection {
+  LEFT
+  RIGHT
+  UP
+  DOWN
+  IN
+  OUT
+}
+
+// User-created folders for organizing EditorProjects — self-referencing for
+// nesting, same shallow-tree pattern as a typical file browser. No AI/Scene
+// concept anywhere in this subtree.
+model EditorFolder {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name String
+
+  parentId String?
+  parent   EditorFolder?  @relation("EditorFolderChildren", fields: [parentId], references: [id], onDelete: Cascade)
+  children EditorFolder[] @relation("EditorFolderChildren")
+
+  projects EditorProject[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, parentId])
+  @@map("editor_folders")
+}
+
+model EditorProject {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name String
+
+  folderId String?
+  folder   EditorFolder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
+
+  aspectRatio EditorAspectRatio @default(RATIO_16_9)
+  widthPx     Int               @default(1920)
+  heightPx    Int               @default(1080)
+
+  // Module 3 — frame-step math (1 frame = 1000/fps ms). No UI to change
+  // this yet; the default covers every project until one exists.
+  fps Int @default(30)
+
+  // Cached, recomputed whenever a clip is added/moved/trimmed/removed (max
+  // of every clip's own end-time on the project) — avoids every Project
+  // Browser card query having to aggregate across tracks/clips.
+  durationMs Int @default(0)
+
+  lastOpenedAt DateTime?
+
+  tracks      EditorTrack[]
+  clips       EditorClip[]
+  markers     EditorMarker[]
+  versions    EditorProjectVersion[]
+  transitions EditorTransition[]
+  exports     EditorExport[]
+  aiEditJobs  AiEditJob[]
+  // Fix (2026-07-12) — USER-scope uploads made into this project (see
+  // EditorAsset.projectId's own doc comment for why it's nullable).
+  assets      EditorAsset[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, folderId])
+  @@index([userId, updatedAt])
+  @@map("editor_projects")
+}
+
+// One row per uploaded media file. Deliberately separate from the existing
+// Asset model (Milestone 8) — that one is wired to VideoProject/Scene/
+// CreativeProject and defaults kind to AI_GENERATED; this one only ever
+// comes from a user upload via the presigned-URL flow, never AI.
+model EditorAsset {
+  id String @id @default(cuid())
+
+  // Milestone 26 — nullable + onDelete: SetNull (was required + Cascade).
+  // For a USER-scope row this is still effectively always set (its owner)
+  // exactly as before; for a LIBRARY-scope row it's the uploading admin,
+  // kept as attribution only — a shared library asset must not vanish or
+  // cascade-delete just because that admin's account is later removed.
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // Fix (2026-07-12) — a USER-scope upload belongs to exactly one project
+  // (the one its "Upload media" drop happened in); nullable because (a) a
+  // LIBRARY-scope row never has one and (b) every USER-scope row that
+  // existed before this column was added has no recoverable project
+  // affiliation — those rows are deliberately left null rather than
+  // guessed/backfilled, so they simply stop appearing in any project's
+  // Uploads tab going forward (see listEditorAssets' new projectId filter)
+  // instead of continuing to leak into every project as they did before
+  // this fix. Cascade: deleting a project deletes the uploads made into
+  // it — any OTHER project's clip that happens to reference one of those
+  // assets already degrades gracefully via EditorClip.asset's own
+  // onDelete: SetNull, the same as deleting any asset directly today.
+  projectId String?
+  project   EditorProject? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Milestone 26 — USER (default) is unchanged prior behavior; LIBRARY
+  // marks an admin-curated asset visible to every user/project. Every
+  // existing user-facing query (listEditorAssets/deleteEditorAsset) filters
+  // on scope: "USER" defensively so a LIBRARY row can never be returned or
+  // mutated through those paths just because userId happens to match.
+  scope EditorAssetScope @default(USER)
+
+  kind   EditorAssetKind
+  status EditorAssetStatus @default(PENDING_UPLOAD)
+
+  // Milestone 26 — Admin Asset Library's own category tag (video/image/
+  // audio/sfx/music/animation/static-icon/animated-icon). Null for USER-scope
+  // rows; always set for LIBRARY-scope rows.
+  libraryCategory LibraryAssetCategory?
+
+  storageKey       String
+  // Milestone 26 — server-generated preview (video: extracted+resized
+  // frame, image: resized original). Null for ANIMATION/ICON kinds (no
+  // single-frame preview without a renderer) and for pre-existing
+  // USER-scope rows uploaded before this milestone.
+  thumbnailKey     String?
+  // Fix (2026-07-13) — a real Timeline filmstrip needs multiple frames,
+  // not the single thumbnailKey frame above. A horizontal sprite sheet
+  // (fixed-size tiles, see lib/video-editor/filmstrip.ts's
+  // FILMSTRIP_TILE_WIDTH/HEIGHT constants — shared by the server generator
+  // and the client canvas renderer so neither has to guess the other's
+  // layout) rather than N separate storage objects: one file, one fetch,
+  // trivial to slice client-side via drawImage's source-rect once
+  // filmstripFrameCount is known. VIDEO-kind only; null for every other
+  // kind and for pre-existing rows generated before this field existed —
+  // ClipBlock falls back to the plain color block exactly like a missing
+  // thumbnailKey already does.
+  filmstripKey        String?
+  filmstripFrameCount Int?
+  originalFilename String
+  mimeType         String
+  fileSizeBytes    Int
+
+  // Populated client-side (the browser already decoded the file to preview
+  // it) at confirm-upload time — same pragmatic pattern Milestone 11's
+  // confirmAssetUploadSchema uses for durationSeconds, not a server-side
+  // ffprobe step.
+  durationSeconds Float?
+  widthPx         Int?
+  heightPx        Int?
+
+  // Module 8 — downsampled peak amplitudes (one float per bucket, 0..1),
+  // computed client-side via Web Audio's decodeAudioData at confirm-upload
+  // time (same "browser already decoded it, server just stores it"
+  // convention as durationSeconds above) for AUDIO-kind assets only —
+  // precomputed once here specifically so ClipBlock's waveform <canvas>
+  // never has to re-decode or re-fetch the source file to render.
+  waveformPeaks Json?
+
+  // Stock providers expansion (2026-07-18) — a materialized stock-search
+  // result's attribution requirement, persisted so it isn't lost past the
+  // search-result stage (see search-service.ts's materializeStockAsset
+  // and stock-media/types.ts's StockSearchResult.attributionRequired doc
+  // comment for why this distinction matters — Coverr/Unsplash/Openverse
+  // can carry a REAL license obligation, not just a courtesy credit).
+  // Null/false for every asset that isn't a materialized stock result
+  // (uploads, generated media, curated library) and for Pexels/Pixabay
+  // results (their own terms: attribution appreciated, never required).
+  attribution         String?
+  attributionRequired Boolean @default(false)
+
+  clips             EditorClip[]
+  // Module 11 — favorites/collections layer.
+  favoritedBy       EditorAssetFavorite[]
+  collectionEntries EditorCollectionAsset[]
+  marketingGenerations MarketingTemplateGeneration[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, kind, createdAt])
+  // Fix (2026-07-12) — the Uploads tab's own project-scoped query.
+  @@index([projectId, kind, createdAt])
+  // Milestone 26 — Admin Asset Library's list/search/filter query.
+  @@index([scope, libraryCategory, createdAt])
+  @@map("editor_assets")
+}
+
+// Module 11 — one row per (user, asset) a user has favorited. Never a
+// special case for a not-yet-cached stock-search result: the client always
+// materializes a stock result into a real EditorAsset (scope: USER) first
+// via the same path drag-to-timeline uses — see
+// lib/providers/stock-media/search-service.ts's materializeStockAsset() —
+// then favorites the resulting real asset id. No provenance columns here;
+// that lives on the materialized EditorAsset row itself.
+model EditorAssetFavorite {
+  id        String      @id @default(cuid())
+  userId    String
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assetId   String
+  asset     EditorAsset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  createdAt DateTime    @default(now())
+
+  @@unique([userId, assetId])
+  @@map("editor_asset_favorites")
+}
+
+// Module 11 — a user-created named group of assets (many-to-many via
+// EditorCollectionAsset below). Deliberately no "Recent" model alongside
+// this — Recent is derived from real EditorClip usage
+// (lib/video-editor/recent-assets.ts), not a separate tracked action.
+model EditorCollection {
+  id        String                  @id @default(cuid())
+  userId    String
+  user      User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  items     EditorCollectionAsset[]
+  createdAt DateTime                @default(now())
+  updatedAt DateTime                @updatedAt
+
+  @@index([userId, createdAt])
+  @@map("editor_collections")
+}
+
+model EditorCollectionAsset {
+  collectionId String
+  collection   EditorCollection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  assetId      String
+  asset        EditorAsset      @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  addedAt      DateTime         @default(now())
+
+  @@id([collectionId, assetId])
+  @@map("editor_collection_assets")
+}
+
+model EditorTrack {
+  id        String        @id @default(cuid())
+  projectId String
+  project   EditorProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  kind     EditorTrackKind
+  order    Int
+  isMuted  Boolean         @default(false)
+  isHidden Boolean         @default(false)
+
+  // Module 8 (Part C) — Voice/Music/SFX UI tag, see EditorAudioSubtype's
+  // doc comment. Null for VIDEO/SUBTITLE/TEXT/OVERLAY/EFFECTS tracks and
+  // for AUDIO tracks created before this existed.
+  audioSubtype EditorAudioSubtype?
+
+  // Module 8 (Part C) — standard DAW solo convention: while ANY track in
+  // the project has soloed=true, every track with soloed=false is silent
+  // in preview regardless of its own isMuted, and isMuted still applies on
+  // top of that for the soloed track(s) themselves. Generic across
+  // VIDEO/AUDIO track kinds, same as isMuted already is (a VIDEO track's
+  // embedded audio is muted/soloed exactly like an AUDIO track's).
+  soloed Boolean @default(false)
+
+  // Module 2 (Part A) — a locked track's clips can't be dragged/trimmed/
+  // split/deleted/etc., and nothing can be dropped onto it; selecting a
+  // clip to view its properties still works.
+  isLocked Boolean @default(false)
+  // Row height in the Timeline, per-track (previously a single hardcoded
+  // constant). Bounds enforced in updateEditorTrackSchema.
+  // Fix (2026-07-13) — bumped 52->64 for readability (timeline visual-
+  // weight pass); only affects newly-created tracks, existing rows keep
+  // their stored height (still user-resizable either way).
+  heightPx Int     @default(64)
+
+  // Audio Ducking (2026-07-15) — per-track opt-in, MUSIC/SFX-subtype AUDIO
+  // tracks only (enforced in the API layer, not the schema — same
+  // "subtype is a UI tag, not a separate DB-enforced track kind"
+  // convention audioSubtype's own doc comment already established).
+  // Computed dynamically from the target voice track(s)' actual clip
+  // timing at render time (lib/video-editor/audio.ts's
+  // computeDuckingMultiplier) — nothing here stores a baked curve, only
+  // the settings that feed that computation, so moving a voice clip never
+  // goes stale.
+  duckingEnabled  Boolean @default(false)
+  // Negative decibels — how much to reduce this track's volume while a
+  // target voice clip is active. Stored as dB (not a linear 0..1
+  // multiplier) since that's the unit every real DAW ducking control
+  // uses and what a slider labeled "Ducking amount" should show.
+  duckingAmountDb Float   @default(-12)
+  // Attack AND release share this one value (a symmetric fade in/out of
+  // the duck), matching the brief's singular "fade duration" framing —
+  // simpler than splitting into two fields when nothing asked for
+  // independently-tunable attack vs. release.
+  duckingFadeMs   Int     @default(300)
+  // Empty = auto: every track in the project tagged audioSubtype=VOICE at
+  // render time (dynamic, not a frozen snapshot — adding a new VOICE
+  // track later ducks against it too with zero settings changes).
+  // Non-empty = an explicit override list of specific track ids.
+  duckingVoiceTrackIds String[] @default([])
+
+  clips       EditorClip[]
+  transitions EditorTransition[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([projectId, order])
+  @@index([projectId])
+  @@map("editor_tracks")
+}
+
+// One row per clip placed on a track. assetId is nullable — a TEXT or
+// OVERLAY clip carries everything it needs in `content` and has no source
+// media (mirrors the existing Clip model's sceneId/assetId-both-optional
+// shape, minus the sceneId half entirely since this module has no Scene
+// concept). trimStartMs is the offset into the *source* media where this
+// clip's visible window begins, so trim/split never re-render anything.
+model EditorClip {
+  id        String        @id @default(cuid())
+  trackId   String
+  track     EditorTrack   @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  projectId String
+  project   EditorProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  assetId String?
+  asset   EditorAsset? @relation(fields: [assetId], references: [id], onDelete: SetNull)
+
+  startMs     Int
+  durationMs  Int
+  trimStartMs Int @default(0)
+
+  // Type-specific payload — TEXT: {text, fontFamily, fontSize, color, ...};
+  // OVERLAY: {x, y, scale, rotation} (that clip's own placement — see
+  // `transform` below for why Module 4 didn't extend this instead).
+  // AUDIO (and any VIDEO clip's embedded audio track): {volume, pan,
+  // fadeInMs, fadeOutMs, pitchSemitones, speed} — Module 8, see
+  // lib/video-editor/audio.ts's doc comment for why `volume` alone is
+  // `{value, keyframes}` (Module 4/6's shape) while the rest are plain
+  // values. Null for a plain VIDEO/AUDIO clip that needs nothing beyond
+  // asset + timing (every field has a default — see DEFAULT_AUDIO_PROPERTIES).
+  content Json?
+
+  // Module 4 — universal per-clip transform (crop/rotate/scale/opacity/
+  // position/flip), applies to every clip kind, not just TEXT/OVERLAY —
+  // deliberately a SEPARATE field from `content` rather than extending it:
+  // `content`'s x/y/scale/rotation/opacity (TEXT/OVERLAY only) are that
+  // clip's own placement-within-frame system (0..1 fractions), a different
+  // convention from `transform`'s percentage-offset-from-center. Keeping
+  // them separate means VIDEO/IMAGE clips (which had zero editing surface
+  // before this) get one, and TEXT/OVERLAY clips compose `transform` on
+  // top of their existing placement instead of the two systems colliding.
+  // Null means "use every property's default" (see
+  // lib/video-editor/transform.ts's DEFAULT_CLIP_TRANSFORM) — no backfill
+  // needed for existing clips. Each property is `{value, keyframes}`
+  // rather than a bare value so Module 6 (Motion Engine) can populate
+  // `keyframes` later with zero schema migration and zero properties-panel
+  // rewrite — keyframes is always null until Module 6 exists.
+  transform Json?
+
+  // Module 2 — Group/Ungroup. Clips sharing the same groupId (a plain
+  // cuid, not a relation — there's no separate "Group" row to own) move
+  // together in the Timeline; null means ungrouped. Deliberately no
+  // onDelete cascade concern here since it isn't a foreign key.
+  groupId String?
+
+  // Module 9 — at most one outgoing transition (this clip is the earlier
+  // "A" side, transitioning into whatever clip immediately follows it) and
+  // at most one incoming transition (this clip is the later "B" side) — see
+  // EditorTransition's doc comment for why a clip can have one of each
+  // simultaneously but never two of the same direction.
+  transitionOut EditorTransition? @relation("TransitionClipA")
+  transitionIn  EditorTransition? @relation("TransitionClipB")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([trackId])
+  @@index([projectId])
+  @@index([projectId, groupId])
+  @@map("editor_clips")
+}
+
+// Module 9 — a transition is its OWN entity (not a clip property), sitting
+// at the boundary between two ADJACENT clips on the SAME track. Adding one
+// ripple-shifts clipB (and every clip after it on this track) earlier by
+// `durationMs`, creating a real overlap window where both clips render
+// simultaneously — it does NOT trim either clip's trimStartMs/durationMs
+// (their source in/out points are untouched). This is the CapCut-style
+// "timeline shortens" model, not Premiere's handle-eating one — see
+// lib/video-editor/transition-engine.ts's file header and
+// PROJECT_STATUS.md's Module 9 entry for the full reasoning.
+model EditorTransition {
+  id        String        @id @default(cuid())
+  projectId String
+  project   EditorProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  trackId   String
+  track     EditorTrack   @relation(fields: [trackId], references: [id], onDelete: Cascade)
+
+  // The earlier (outgoing) and later (incoming) clip. Each clip can be the
+  // "A" side of at most one transition (its right edge) and the "B" side of
+  // at most one transition (its left edge) — the two unique constraints
+  // below enforce this, which is exactly what lets a middle clip in a
+  // sequence have one transition in and one out simultaneously.
+  clipAId String
+  clipA   EditorClip @relation("TransitionClipA", fields: [clipAId], references: [id], onDelete: Cascade)
+  clipBId String
+  clipB   EditorClip @relation("TransitionClipB", fields: [clipBId], references: [id], onDelete: Cascade)
+
+  type      EditorTransitionType
+  direction EditorTransitionDirection?
+
+  durationMs Int
+
+  // { type: "LINEAR"|"EASE_IN"|"EASE_OUT"|"EASE_IN_OUT" } or
+  // { type: "CUSTOM", x1, y1, x2, y2 } — see lib/video-editor/
+  // transition-engine.ts's TransitionEasing. Reuses transform.ts's
+  // solveCubicBezier for evaluation; deliberately NOT the two-sided
+  // KeyframeEasing shape (a transition is one segment, not a chain of
+  // keyframes).
+  easing Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([clipAId])
+  @@unique([clipBId])
+  @@index([projectId])
+  @@index([trackId])
+  @@map("editor_transitions")
+}
+
+// Module 2 — Timeline markers. A minimal slice (time position only, no
+// label/color yet) that exists specifically so magnetic snap has a real
+// third target type (clip edges, playhead, markers) to snap to — created
+// via the Timeline's "M" shortcut at the current playhead, removed by
+// clicking. A fuller Markers panel (labels, colors, list view) is future
+// work, not requested here.
+model EditorMarker {
+  id        String        @id @default(cuid())
+  projectId String
+  project   EditorProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  timeMs Int
+
+  createdAt DateTime @default(now())
+
+  @@index([projectId])
+  @@map("editor_markers")
+}
+
+// Module 5 — Version History. A full point-in-time snapshot of the
+// project's tracks/clips/markers, mirroring lib/projects/versioning.ts's
+// ProjectVersion pattern for the old AI editor (delete+recreate restore,
+// snapshot as one Json blob) rather than sharing that model outright — this
+// module has no Scene concept and clips already carry stable ids (the old
+// snapshot re-links tracks/clips by `order` specifically because ITS
+// restore discards ids; this one keeps original ids in the snapshot purely
+// for display/debugging, since restore still generates fresh rows either
+// way — see lib/video-editor/versions.ts). Created automatically
+// (lib/video-editor/versions.ts#maybeSnapshotProject, on a periodic timer
+// AND every N history-stack entries, whichever comes first — see that
+// file's header for the reasoning) and once more immediately before every
+// restore, so a restore is itself undo-able by restoring back to that
+// just-created "before" snapshot.
+model EditorProjectVersion {
+  id        String        @id @default(cuid())
+  projectId String
+  project   EditorProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // { tracks: [...], clips: [...], markers: [...] } — see
+  // lib/video-editor/versions.ts's ProjectSnapshot type for the exact shape.
+  snapshot Json
+
+  // Optional user-facing label ("Before restore", a future manual "Save
+  // version as..." name); null for a routine automatic/periodic snapshot.
+  label String?
+
+  createdAt DateTime @default(now())
+
+  @@index([projectId, createdAt])
+  @@map("editor_project_versions")
+}
+
+enum EditorExportFormat {
+  MP4
+  MOV
+  WEBM
+  GIF
+}
+
+enum EditorExportResolution {
+  R720P
+  R1080P
+  R2K
+  R4K
+}
+
+// GIF has no codec (see lib/video-editor/export-engine.ts's per-format
+// codec-validity table) — EditorExport.codec is nullable for that case.
+enum EditorExportCodec {
+  H264
+  H265
+  VP9
+}
+
+enum EditorExportStatus {
+  QUEUED
+  RENDERING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+// Module 10 — Export Engine. One row per export run, doubling as both the
+// job-queue row (status QUEUED is claimed atomically by the worker — the
+// same compare-and-swap pattern lib/queue/queue.ts's RenderJob already
+// uses, just scoped directly to this table since export is a single job
+// kind with no need for RenderJob's generic multi-kind payload dispatch)
+// AND the user-facing history record (settings used, live progress,
+// download link, a real error reason on failure). See
+// lib/video-editor/export-worker.ts for the render pipeline and
+// PROJECT_STATUS.md's Module 10 entry for why this is a headless-browser
+// frame-capture pipeline, not a second FFmpeg-filter-graph rendering engine.
+model EditorExport {
+  id        String        @id @default(cuid())
+  projectId String
+  project   EditorProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  format      EditorExportFormat
+  resolution  EditorExportResolution
+  fps         Int
+  // Null for GIF (no meaningful bitrate/codec).
+  bitrateKbps Int?
+  codec       EditorExportCodec?
+  // Export presets (2026-07-15) — burns the admin-configurable
+  // WATERMARK_TEXT (lib/admin/config.ts, already the source of truth the
+  // legacy Milestone 9 editor's own watermark feature reads — reused, not
+  // duplicated as a new config key) into the rendered output. Off by
+  // default. Render-only: never shown in the live interactive Preview
+  // Window, only in the headless export render (render-workspace.tsx),
+  // matching how the legacy editor's own watermark is master/preview-URL
+  // scoped rather than visible while editing.
+  watermark   Boolean            @default(false)
+
+  status         EditorExportStatus @default(QUEUED)
+  // 0..100, derived from framesRendered/totalFrames — cheap to recompute,
+  // stored anyway so a status-poll GET never has to divide in the route.
+  progress       Int                @default(0)
+  totalFrames    Int?
+  framesRendered Int                @default(0)
+
+  outputKey    String?
+  // Pixel dimensions actually rendered (resolved from `resolution` + the
+  // project's own aspect ratio at export time) and the rendered duration —
+  // stored so the history list can display them without re-deriving.
+  widthPx      Int?
+  heightPx     Int?
+  durationMs   Int?
+  errorMessage String?
+
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([projectId, createdAt])
+  @@index([userId])
+  @@index([status])
+  @@map("editor_exports")
+}
+
+// Phase 12 Module 1 (AI Auto-Editor) — job progress states matching the
+// founder's confirmed 13-step flow, up through "ready for review" (manual
+// review/export are steps 11-13, unchanged existing editor UI, not part of
+// this job's own lifecycle). QUEUED mirrors EditorExportStatus's own
+// initial state (Module 10) — same real Postgres poll-queue pattern
+// reused, not reinvented (see lib/video-editor/exports.ts's claimNextExport()
+// for the exact compare-and-swap shape this would use once a real worker
+// exists). FAILED/CANCELLED are the same two terminal non-success states
+// EditorExportStatus already has.
+enum AiEditJobStatus {
+  QUEUED
+  UPLOADING
+  TRANSCRIBING
+  ANALYZING_VIDEO
+  PLANNING_REMOVALS
+  PLANNING_TIMELINE
+  RESOLVING_ASSETS
+  BUILDING_TIMELINE
+  READY_FOR_REVIEW
+  FAILED
+  CANCELLED
+}
+
+// Phase 12 Module 1 — schema only. No claim/worker logic yet (see
+// AiEditJobStatus's own doc comment) — this exists so the NEXT module
+// (wiring one real API call) has somewhere real to persist progress,
+// without a second schema migration for it. `timelinePlan` stores the
+// resulting AITimelinePlan (lib/validations/ai-timeline.ts) once planning
+// completes — validated by that schema at read/write time, not by a DB
+// constraint (same "Json column, Zod-validated in the app layer" pattern
+// EditorClip.content/EditorProjectVersion.snapshot already use).
+model AiEditJob {
+  id        String        @id @default(cuid())
+  projectId String
+  project   EditorProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status   AiEditJobStatus @default(QUEUED)
+  // 0..100, coarse overall progress across every stage — same
+  // store-don't-derive-in-the-route reasoning as EditorExport.progress.
+  progress Int             @default(0)
+
+  // The VIDEO/AUDIO EditorAsset this job transcribes. A plain soft
+  // reference (no @relation), same convention EditorTrack.
+  // duckingVoiceTrackIds already uses for a cross-row id this schema
+  // doesn't need a formal FK/cascade for.
+  sourceAssetId String
+  // Phase 12 Module 4 — the intake step's optional style preset (free text,
+  // e.g. "punchy shorts" / "calm professional"), threaded through to the
+  // REASONING call so caption reveal-mode/style can be preset-influenced.
+  // Null means "no preference" — the reasoning adapter picks a sensible
+  // neutral default. Mirrors aiIntakeSchema.stylePreset's own shape
+  // exactly (lib/validations/ai-timeline.ts) so intake.stylePreset in the
+  // persisted timelinePlan is just this value echoed back, not re-derived.
+  stylePreset String?
+  // Founder request (2026-07-18) — user control over how aggressively
+  // b-roll windows get proposed, rather than leaving it entirely to GPT's
+  // judgment. Mirrors stylePreset's own shape: threaded through to the
+  // REASONING call's TASK 3 guidance (gpt5.provider.ts), echoed back into
+  // the persisted timelinePlan.intake for the same "record of what
+  // actually informed this plan" reason. Null means "no preference" — the
+  // reasoning adapter defaults to its existing calibration (0-3, propose
+  // zero when nothing fits), unchanged from before this field existed.
+  brollDensity String?
+  // Founder policy (2026-07-18) — while true, b-roll resolution never
+  // spends real generation credits: the resolver always tries stock
+  // (Pexels/Pixabay/Openverse/Coverr/Unsplash) first regardless of GPT's
+  // own source choice, falling back to generation only as an absolute
+  // last resort when literally no stock provider returns a usable result.
+  // Captured at job-creation time from AI_EDIT_BROLL_STOCK_ONLY (admin
+  // config, see config.ts's own doc comment) so a job's behavior stays
+  // fixed even if the admin default is flipped later, and so a policy
+  // reversal never needs a prompt-engineering pass — just flip the config.
+  brollStockOnly Boolean @default(true)
+  // B1/B-roll relevance follow-up (2026-07-23) — while brollStockOnly is
+  // true, the resolver still tries stock first, but if the best real
+  // match's relevance score (pickBestStockResult's own token-overlap
+  // score against the search query) falls below this, it falls back to
+  // real generation for just that one item instead of using a
+  // weak/irrelevant stock match. Captured at job-creation time from
+  // AI_EDIT_BROLL_RELEVANCE_FALLBACK_THRESHOLD (admin config, see
+  // config.ts's own doc comment), same "fixed per-job, no prompt-
+  // engineering pass needed to retune" reasoning as brollStockOnly above.
+  // Calibrated against 39 real production searchQuery values (2026-07-23
+  // investigation) — 0.5 cleanly separated the 2 genuinely bad matches
+  // found from the other 37 acceptable-to-good ones.
+  brollRelevanceFallbackThreshold Float @default(0.5)
+  // Phase 12 Module 8 — the intake step's optional reference script
+  // (pasted text, not a file — see aiIntakeSchema.script's own doc
+  // comment for why). Threaded into the REASONING call as extra context
+  // for correcting near-miss/misheard words in caption TEXT — the real
+  // transcript's own word timestamps remain the only source of timing,
+  // this never invents or overrides timing from the script. Null means
+  // no script was provided.
+  script String? @db.Text
+
+  // The raw TranscriptionResult (words/segments/language/durationSeconds)
+  // — kept as its own column, not folded into timelinePlan, so
+  // timelinePlan stays a clean AITimelinePlan matching its Zod schema
+  // exactly (validated at read/write time by the app layer, same
+  // convention EditorClip.content/EditorProjectVersion.snapshot already
+  // use) with no ad-hoc extra fields mixed in.
+  transcript   Json?
+  // Phase 12 Module 3 — Gemini's raw video-understanding output
+  // (emphasisMoments/emotionBeats/visualContext/gestures/flaggedSegments),
+  // kept as its own column for the exact same reason `transcript` is:
+  // `timelinePlan` stays a clean AITimelinePlan, and a later module
+  // (timeline planning) can consume the emphasis/emotion/visual-context
+  // data without a second Gemini call, without it ever having been
+  // folded into (and thus polluting) sceneRemoval's own shape. Null for
+  // AUDIO-only source assets (no visual content to analyze) and for jobs
+  // that predate this module.
+  videoAnalysis Json?
+  timelinePlan  Json?
+  errorMessage  String?
+  // Phase 12 Module 4 — set ONLY when the REASONING call (captions/zoom
+  // planning) fails validation even after one repair-prompt retry, or
+  // errors outright (no provider configured, vendor error, etc). This is
+  // deliberately SEPARATE from `errorMessage` (which means the WHOLE job
+  // failed, status FAILED): a planning failure here is non-fatal to the
+  // job — sceneRemoval from Modules 2-3 is already a complete, working
+  // feature on its own, so losing captions/zoom shouldn't take that down
+  // too. Null on success. The review UI surfaces this distinctly rather
+  // than silently showing zero captions/zoom with no explanation.
+  planningError String?
+
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([projectId, createdAt])
+  @@index([userId])
+  @@index([status])
+  @@map("ai_edit_jobs")
+}
+
+// Render Queue polish (2026-07-16) — a user-saved, reusable bundle of
+// export settings ("my TikTok settings"), distinct from
+// EXPORT_PLATFORM_PRESETS (lib/video-editor/export-engine.ts, a static,
+// non-persisted, built-in convenience table). Scoped to the USER, not one
+// project — export settings (format/resolution/fps/codec/bitrate/
+// watermark) are a personal preference a user reasonably expects to reuse
+// across every project they touch, not something tied to one timeline's
+// content. Deliberately NOT part of the Command-pattern undo stack — like
+// Assets/Folders/Projects themselves, this is a standalone CRUD resource,
+// not project/timeline state the undo/redo history operates over.
+model EditorExportPreset {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name String
+
+  format      EditorExportFormat
+  resolution  EditorExportResolution
+  fps         Int
+  bitrateKbps Int?
+  codec       EditorExportCodec?
+  watermark   Boolean            @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("editor_export_presets")
+}

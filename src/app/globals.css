@@ -1,0 +1,707 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ==========================================================================
+   ELEVATEX AI — DESIGN TOKENS
+   Source of truth: PRD Section 12 (Design System) — Sections 12.1–12.13.
+   Two theme layers:
+   1. Semantic tokens (background/foreground/primary/card/etc.) — driven by
+      CSS variables in :root / .dark so components automatically respond to
+      the `.dark` class.
+   2. Raw brand tokens (color-brand-navy, color-accent-orange, verticals,
+      platform colours, typography scale, radius, shadows) — static values
+      that do NOT change between themes, exposed directly as Tailwind
+      utilities (bg-brand-navy, text-heading-1, shadow-lg, rounded-xl, etc.)
+   ========================================================================== */
+
+@theme inline {
+  /* ---- Semantic (theme-responsive) tokens ---- */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* ---- Dashboard/Marketing theme-responsive tokens (Aurora Light pass,
+     2026-07-24) — these used to live as static, always-dark values in the
+     plain @theme block below. Moved here (the "inline" block, which keeps
+     var() indirection instead of baking in a literal at build time) so they
+     can flip between a real light and dark value via :root/.dark, same
+     mechanism the sitewide --color-background/--color-foreground already
+     use. --color-surface-0/-1/-2 deliberately did NOT move — the Video
+     Editor (still Phase 4, untouched) reads those same tokens directly and
+     must stay pinned to its current always-dark values regardless of the
+     app-wide theme toggle; --color-dash-bg/-surface-1/-surface-2 below are
+     NEW, Dashboard/Marketing-only names so the two surfaces can never
+     collide. --color-dash-ink is new too: a single base tone (near-black in
+     light, white in dark) that every former `text-white`/`border-white`/
+     `bg-white` alpha-stack utility in Dashboard components migrates onto
+     (e.g. `text-white/70` -> `text-dash-ink/70`) — one token flips the
+     entire opacity-tier hierarchy correctly in both themes instead of
+     hand-tuning dozens of one-off light values. */
+  --color-dash-bg: var(--dash-bg);
+  --color-dash-surface-1: var(--dash-surface-1);
+  --color-dash-surface-2: var(--dash-surface-2);
+  --color-dash-ink: var(--dash-ink);
+  --color-dash-accent-from: var(--dash-accent-from);
+  --color-dash-accent-to: var(--dash-accent-to);
+  --color-dash-accent-mid: var(--dash-accent-mid);
+  --color-dash-accent-glow: var(--dash-accent-glow);
+  --color-dash-accent-subtle: var(--dash-accent-subtle);
+  --color-dash-border: var(--dash-border);
+  --color-dash-border-hover: var(--dash-border-hover);
+  --color-dash-glass: var(--dash-glass);
+  --color-glass-card: var(--glass-card);
+  --color-glass-subtle: var(--glass-subtle);
+  --color-glass-soft: var(--glass-soft);
+  --color-glass-thumb: var(--glass-thumb);
+  --color-glass-panel: var(--glass-panel);
+  --color-edge-card: var(--edge-card);
+  --color-edge-subtle: var(--edge-subtle);
+  --color-edge-hover: var(--edge-hover);
+  --color-edge-input: var(--edge-input);
+  --shadow-dash-card: var(--dash-shadow-card);
+  --shadow-dash-glow: var(--dash-shadow-glow);
+  --shadow-dash-button: var(--dash-shadow-button);
+
+  /* ---- Fonts (Section 12.1) ---- */
+  --font-sans: var(--font-inter);
+  --font-devanagari: var(--font-noto-devanagari);
+  --font-heading: var(--font-inter);
+  --font-mono: var(--font-jetbrains-mono);
+}
+
+@theme {
+  /* ==========================================================================
+     12.2.1 — Brand & Semantic Colours (static, theme-independent)
+     ========================================================================== */
+  --color-brand-navy: #1a3c6e;
+  --color-brand-navy-dark: #122c52;
+  --color-brand-navy-light: #eef3fa;
+
+  --color-accent-orange: #f97316;
+  --color-accent-orange-dark: #ea6a0a;
+  --color-accent-orange-light: #fff3e8;
+
+  /* success/warning darkened from the original #16a34a/#d97706 — both
+     measured ~3.1-3.3:1 as text on white/their own *-light tint, under
+     WCAG AA's 4.5:1. error/info were already compliant and are unchanged. */
+  --color-success: #15803d;
+  --color-success-light: #f0fdf4;
+  --color-warning: #b45309;
+  --color-warning-light: #fffbeb;
+  --color-error: #dc2626;
+  --color-error-light: #fef2f2;
+  --color-info: #2563eb;
+  --color-info-light: #eff6ff;
+
+  --color-neutral-50: #f8fafc;
+  --color-neutral-100: #f1f5f9;
+  --color-neutral-200: #e2e8f0;
+  --color-neutral-300: #cbd5e1;
+  --color-neutral-400: #94a3b8;
+  --color-neutral-500: #64748b;
+  --color-neutral-700: #334155;
+  --color-neutral-900: #1e293b;
+
+  /* ---- Dark surfaces — Dashboard-only premium dark theme. Static tokens,
+     additive: nothing existing references these, so the rest of the
+     (still light-themed) application is unaffected. Also used throughout
+     the Cloud Video Editor (a second, unrelated dark-UI consumer).
+     Updated (PRD redesign): values match the PRD color spec exactly —
+     surface-0 (#0B0F19) is the main page bg, surface-1 (#111827) is the
+     sidebar/secondary surface, surface-2 (#161B26) is card bg.
+     Editor tokens are SEPARATE (--color-editor-*) and unaffected. ---- */
+  --color-surface-0: #0B0F19;
+  --color-surface-1: #111827;
+  --color-surface-2: #161B26;
+
+  /* Dashboard accent palette, glass/border tokens, and the Glass Design
+     System (bg-glass-card, border-edge-card, etc.) moved to the
+     theme-responsive @theme inline block above (2026-07-24, Aurora Light
+     pass) — see that block's comment for why. Semantic radius/duration
+     tokens below are unaffected (geometry/motion, not color — identical in
+     both themes). ---- */
+
+  /* Semantic radius aliases */
+  --radius-card: 1.25rem;   /* rounded-card  — 20px, primary card surface */
+  --radius-input: 1.125rem; /* rounded-input — 18px, textarea / select */
+  --radius-btn: 1rem;       /* rounded-btn   — 16px, action buttons */
+  --radius-icon: 0.75rem;   /* rounded-icon  — 12px, icon containers */
+
+  /* Named duration tokens (supplement Tailwind's numeric duration-* scale) */
+  --duration-fast: 150ms;   /* duration-fast — icon / link micro-interactions */
+  --duration-base: 220ms;   /* duration-base — card hover, panel open */
+  --duration-slow: 300ms;   /* duration-slow — image scale, content reveal */
+  --duration-data: 700ms;   /* duration-data — progress bars, metric animations */
+
+  /* Premium dashboard animation keyframes */
+  --animate-gradient-shift: gradient-shift 4s ease infinite;
+  --animate-glow-pulse: glow-pulse 3s ease-in-out infinite;
+  --animate-float: float 6s ease-in-out infinite;
+
+  @keyframes gradient-shift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+  }
+
+  @keyframes glow-pulse {
+    0%, 100% { opacity: 0.6; }
+    50% { opacity: 1; }
+  }
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-8px); }
+  }
+
+  /* ---- Cloud Video Editor chrome — hairlines/tinted fills used across
+     every editor panel (top bar, rail, panels, timeline). Centralizes what
+     used to be ad hoc border-white/10 / bg-white/5 / bg-white/10 utility
+     classes scattered file-to-file so the whole editor's contrast/density
+     can be retuned from one place instead of hunting one-off classes
+     (2026-07-12 CapCut-Desktop visual-fidelity pass).
+     Fix (2026-07-13) — premium design-token foundation, Phase 1 (tokens
+     only, no layout/logic changes). Moved off translucent-white overlays
+     (which blend with whatever sits behind them) onto a deliberately
+     layered set of SOLID dark surfaces — bg < panel < card, each one step
+     lighter, the same "depth via distinct flat tiers" convention CapCut/
+     premium dark-UI tools use instead of alpha stacking. editor-line/
+     editor-surface-1/editor-surface-2 keep their existing NAMES (40+ call
+     sites already reference them) — only their VALUES changed, so this
+     cascades automatically with zero component-file edits for anything
+     already using them. editor-bg/editor-panel/editor-accent/editor-danger
+     are new — Background and Panel didn't have a dedicated token before
+     (the editor's root shell borrowed the Dashboard's own --color-surface-0,
+     and every <aside>/toolbar sat directly on it with no fill of its own);
+     Accent and Danger are editor-scoped alternatives to the sitewide
+     --color-accent-orange/--color-error specifically so this swap can't
+     leak into the marketing site/dashboard/admin panel, which keep the
+     existing orange brand color untouched (confirmed with the founder
+     before this specific token was added — see PROJECT_STATUS.md). ---- */
+  --color-editor-bg: #0F1117;
+  --color-editor-panel: #14161c;
+  --color-editor-line: #272c36;
+  --color-editor-surface-1: #1b1e26;
+  --color-editor-surface-2: #20293a;
+  --color-editor-accent: #5b7cfa;
+  --color-editor-danger: #ff4d4f;
+  /* Card/tile hover border (2026-07-15, UI consistency pass) — was ad-hoc
+     hover:border-white/20 (and /15, /30 variants) repeated across 4 sidebar
+     files with no single source of truth and drifting values. A neutral,
+     not --color-editor-accent — accent is reserved exclusively for
+     selected/interactive state (same standing rule as the track-kind
+     palette above), and a hover affordance isn't that. Value matches the
+     most common of the prior ad-hoc numbers (/20) for parity, now just
+     applied consistently everywhere instead of 3 different alphas. */
+  --color-editor-border-hover: rgb(255 255 255 / 0.2);
+
+  /* ---- Cloud Video Editor typography — a small, deliberate 4-step scale
+     for this pass's premium surfaces (panel/section titles, primary body
+     text, captions) distinct from the sitewide --text-heading, --text-body,
+     and --text-caption token families (whose weights/line-heights are
+     tuned for the light marketing/dashboard theme, not this palette) —
+     editor-scoped names avoid colliding with and unintentionally reskinning
+     those. Sits alongside the editor's existing --text-micro/--text-nano
+     (11px/10px, unchanged) for the smallest meta text this scale doesn't
+     cover. ---- */
+  --text-editor-heading: 1.25rem; /* 20px */
+  --text-editor-heading--line-height: 1.5rem; /* 24px */
+  --text-editor-heading--font-weight: 600;
+  --text-editor-panel-title: 1rem; /* 16px */
+  --text-editor-panel-title--line-height: 1.375rem; /* 22px */
+  --text-editor-panel-title--font-weight: 600;
+  --text-editor-body: 0.875rem; /* 14px */
+  --text-editor-body--line-height: 1.25rem; /* 20px */
+  --text-editor-body--font-weight: 400;
+  --text-editor-caption: 0.75rem; /* 12px */
+  --text-editor-caption--line-height: 1rem; /* 16px */
+  --text-editor-caption--font-weight: 500;
+
+  /* ---- Cloud Video Editor spacing/radius/shadow — standardized card and
+     button geometry for this palette. Editor-scoped (not the shared radius
+     and shadow token families above) for the same reason typography is:
+     those are tuned for the light sitewide theme and shared by the light-
+     theme shadcn Button primitive — a new dark-tuned variant risks
+     regressing the marketing/dashboard UI for no benefit over editor files'
+     already-established per-call-site override convention (see the
+     2026-07-12 visual-fidelity pass's own note on this). ---- */
+  --radius-editor-card: 1.125rem; /* 18px */
+  --radius-editor-button: 0.875rem; /* 14px */
+  /* Dedicated clip-block radius (2026-07-15) — was reusing
+     --radius-editor-button (14px), the same token real buttons use,
+     giving Timeline clips the same pronounced rounded-pill look as a
+     button rather than the subtle, barely-rounded corner a CapCut
+     reference showed. Split out as its own token so future button-radius
+     tuning never accidentally drags clip corners along with it (or vice
+     versa) — a small fixed pixel value, not a CSS % (a literal percentage
+     would look proportionally wrong on the very short/very tall ends of
+     a track's own 28-200px resizable height range). */
+  --radius-editor-clip: 0.25rem; /* 4px */
+  /* Tailwind v4's height utilities read off the shared --spacing scale, not
+     a --height-* namespace — a NAMED spacing token (-> h-editor-button-
+     height, also usable for padding/width if ever needed) documents WHY
+     44px specifically, which a bare arbitrary h-11 (already numerically
+     equal to 44px in Tailwind's default scale) doesn't. */
+  --spacing-editor-button-height: 2.75rem; /* 44px */
+  --shadow-editor-card: 0 12px 30px rgb(0 0 0 / 0.4), 0 2px 8px rgb(0 0 0 / 0.3);
+
+  /* ---- Cloud Video Editor per-track-kind clip colors — pulled out of the
+     hardcoded TRACK_COLORS/AUDIO_SUBTYPE_COLOR Record in
+     timeline-panel.tsx so the palette is tunable from one place. Hue-per-
+     kind differentiation is intentional and preserved (video/audio/
+     subtitle/text/overlay/effects each keep a distinct color family).
+     Retuned (2026-07-14, premium-editor.jsx palette — folds in the
+     earlier-flagged Phase B item: SUBTITLE's old muted violet (#8b6bc9)
+     read as too close to --color-editor-accent's own blue-violet
+     (#5b7cfa), risking confusion with the "selected" state). The 5 kinds
+     the reference explicitly specifies (video/audio/text/subtitle/
+     overlay) use its exact values; effects/voice/music/sfx aren't in the
+     reference (only AUDIO's 3 real UI subtypes and EFFECTS are), so those
+     4 were hand-picked to stay pairwise distinct from the reference's 5
+     AND from the accent hue — verified by hue-wheel separation, not just
+     eyeballed. */
+  --color-track-video: #14a89c;
+  --color-track-audio: #d98a3d;
+  --color-track-subtitle: #4caf6d;
+  --color-track-text: #e2605a;
+  --color-track-overlay: #c25fc2;
+  --color-track-effects: #c9a93d;
+  --color-track-voice: #7fb33d;
+  --color-track-music: #6b8ca3;
+  --color-track-sfx: #c97a9e;
+
+  /* ---- 12.2.2 — Platform Brand Colours ---- */
+  --color-platform-instagram: #e1306c;
+  --color-platform-facebook: #1877f2;
+  --color-platform-youtube: #ff0000;
+  --color-platform-whatsapp: #25d366;
+  --color-platform-google: #4285f4;
+  --color-platform-linkedin: #0a66c2;
+
+  /* ---- Vertical accent colours (Section 12.12) ---- */
+  --color-vertical-restaurant: #f97316;
+  --color-vertical-salon: #ec4899;
+  --color-vertical-dental: #14b8a6;
+  --color-vertical-realestate: #1a3c6e;
+  --color-vertical-retail: #9333ea;
+  --color-vertical-gym: #16a34a;
+  --color-vertical-hospital: #dc2626;
+  --color-vertical-coaching: #d97706;
+  --color-vertical-hotel: #ca8a04;
+  --color-vertical-other: #94a3b8;
+
+  /* ==========================================================================
+     12.1 — Typography scale
+     Paired line-height / letter-spacing / font-weight ship with each size
+     so `text-display-1`, `text-heading-2`, etc. are complete utilities.
+     ========================================================================== */
+  --text-display-1: 2.5rem; /* 40px */
+  --text-display-1--line-height: 3rem; /* 48px */
+  --text-display-1--letter-spacing: -0.5px;
+  --text-display-1--font-weight: 800;
+
+  --text-display-2: 2rem; /* 32px */
+  --text-display-2--line-height: 2.5rem; /* 40px */
+  --text-display-2--letter-spacing: -0.4px;
+  --text-display-2--font-weight: 700;
+
+  --text-heading-1: 1.5rem; /* 24px */
+  --text-heading-1--line-height: 2rem; /* 32px */
+  --text-heading-1--letter-spacing: -0.3px;
+  --text-heading-1--font-weight: 700;
+
+  --text-heading-2: 1.25rem; /* 20px */
+  --text-heading-2--line-height: 1.75rem; /* 28px */
+  --text-heading-2--letter-spacing: -0.2px;
+  --text-heading-2--font-weight: 600;
+
+  --text-heading-3: 1.0625rem; /* 17px */
+  --text-heading-3--line-height: 1.5rem; /* 24px */
+  --text-heading-3--letter-spacing: -0.1px;
+  --text-heading-3--font-weight: 600;
+
+  --text-body-lg: 1rem; /* 16px */
+  --text-body-lg--line-height: 1.5rem; /* 24px */
+  --text-body-lg--font-weight: 400;
+
+  --text-body-md: 0.875rem; /* 14px */
+  --text-body-md--line-height: 1.25rem; /* 20px */
+  --text-body-md--font-weight: 400;
+
+  --text-body-sm: 0.8125rem; /* 13px */
+  --text-body-sm--line-height: 1.125rem; /* 18px */
+  --text-body-sm--font-weight: 400;
+
+  --text-caption: 0.75rem; /* 12px */
+  --text-caption--line-height: 1rem; /* 16px */
+  --text-caption--letter-spacing: 0.1px;
+  --text-caption--font-weight: 400;
+
+  --text-label-lg: 1rem; /* 16px */
+  --text-label-lg--line-height: 1.5rem; /* 24px */
+  --text-label-lg--letter-spacing: 0.1px;
+  --text-label-lg--font-weight: 600;
+
+  --text-label-md: 0.875rem; /* 14px */
+  --text-label-md--line-height: 1.25rem; /* 20px */
+  --text-label-md--letter-spacing: 0.1px;
+  --text-label-md--font-weight: 600;
+
+  --text-label-sm: 0.75rem; /* 12px */
+  --text-label-sm--line-height: 1rem; /* 16px */
+  --text-label-sm--letter-spacing: 0.2px;
+  --text-label-sm--font-weight: 600;
+
+  --text-mono: 0.875rem; /* 14px */
+  --text-mono--line-height: 1.25rem; /* 20px */
+  --text-mono--font-weight: 400;
+
+  /* ---- Cloud Video Editor micro-type — replaces ad hoc text-[11px]/
+     text-[10px] scattered across clip labels, track headers, asset-grid
+     meta text (2026-07-12 CapCut-Desktop visual-fidelity pass). ---- */
+  --text-micro: 0.6875rem; /* 11px */
+  --text-micro--line-height: 0.875rem; /* 14px */
+  --text-nano: 0.625rem; /* 10px */
+  --text-nano--line-height: 0.75rem; /* 12px */
+
+  /* ==========================================================================
+     12.5 — Border radius
+     ========================================================================== */
+  --radius: 0.75rem; /* 12px — alias used by shadcn primitives (= radius-lg) */
+  --radius-xs: 0.125rem; /* 2px */
+  --radius-sm: 0.25rem; /* 4px */
+  --radius-md: 0.5rem; /* 8px */
+  --radius-lg: 0.75rem; /* 12px */
+  --radius-xl: 1rem; /* 16px */
+  --radius-2xl: 1.25rem; /* 20px */
+  --radius-3xl: 1.5rem; /* 24px */
+  --radius-full: 9999px;
+
+  /* ==========================================================================
+     12.6 — Elevation & shadow system
+     ========================================================================== */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.07), 0 2px 4px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1), 0 4px 6px rgba(0, 0, 0, 0.05);
+  --shadow-xl: 0 20px 25px rgba(0, 0, 0, 0.1), 0 10px 10px rgba(0, 0, 0, 0.04);
+  --shadow-2xl: 0 25px 50px rgba(0, 0, 0, 0.25);
+  --shadow-inner: inset 0 2px 4px rgba(0, 0, 0, 0.06);
+
+  /* ==========================================================================
+     12.11 — Motion: easing curves as reusable tokens (durations use Tailwind's
+     default duration-* scale, which already covers 60ms–1000ms).
+     ========================================================================== */
+  --ease-micro: cubic-bezier(0.4, 0, 0.2, 1); /* easeInOut, 60-120ms */
+  --ease-ui: cubic-bezier(0, 0, 0.2, 1); /* easeOut, 150-200ms */
+  --ease-screen: cubic-bezier(0.4, 0, 0.2, 1); /* easeInOut, 250-350ms */
+  --ease-chart: cubic-bezier(0.33, 1, 0.68, 1); /* easeOutCubic, 600-900ms */
+
+  --animate-shimmer: shimmer 1.4s linear infinite;
+  --animate-pulse-dot: pulse-dot 1.2s ease-in-out infinite;
+
+  @keyframes shimmer {
+    0% {
+      background-position: -200% 0;
+    }
+    100% {
+      background-position: 200% 0;
+    }
+  }
+
+  @keyframes pulse-dot {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.4;
+    }
+  }
+}
+
+:root {
+  /* Semantic tokens — Light mode (Section 12.2.1 + 12.2.3) */
+  --background: #f8fafc; /* neutral-50 */
+  --foreground: #1e293b; /* neutral-900 */
+  --card: #ffffff;
+  --card-foreground: #1e293b;
+  --popover: #ffffff;
+  --popover-foreground: #1e293b;
+
+  --primary: #f97316; /* accent-orange — ButtonPrimary */
+  --primary-foreground: #ffffff;
+  --secondary: #1a3c6e; /* brand-navy — ButtonSecondary */
+  --secondary-foreground: #ffffff;
+
+  --muted: #f1f5f9; /* neutral-100 */
+  --muted-foreground: #64748b; /* neutral-500 */
+  --accent: #eef3fa; /* brand-navy-light */
+  --accent-foreground: #1a3c6e; /* brand-navy */
+
+  --destructive: #dc2626; /* error */
+  --destructive-foreground: #ffffff;
+
+  --border: #e2e8f0; /* neutral-200 */
+  --input: #cbd5e1; /* neutral-300 */
+  --ring: #1a3c6e; /* brand-navy — focus ring, Section 12.13 */
+
+  --chart-1: #f97316;
+  --chart-2: #1a3c6e;
+  --chart-3: #16a34a;
+  --chart-4: #2563eb;
+  --chart-5: #d97706;
+
+  --sidebar: #1a3c6e;
+  --sidebar-foreground: #ffffff;
+  --sidebar-primary: #f97316;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #122c52;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #122c52;
+  --sidebar-ring: #f97316;
+
+  /* ---- Aurora Light — Dashboard/Marketing tokens (2026-07-24) ----
+     Real, deliberate light values, not an inversion of the dark set below.
+     Three-tier surface: soft ivory page ground, pure-white raised cards,
+     a warm recessed tier for secondary panels. Signature violet->blue
+     accent hue is UNCHANGED from dark mode (brand recognition + matches
+     the 3D scene's own lighting) — only its glow/shadow alpha is toned
+     down, since a dark-mode glow alpha reads as almost nothing on white. */
+  --dash-bg: #FAF9F7;
+  --dash-surface-1: #FFFFFF;
+  --dash-surface-2: #F3F1ED;
+  --dash-ink: #16161F;
+  --dash-accent-from: #7C3AED;
+  --dash-accent-to: #2563EB;
+  --dash-accent-mid: #6D28D9;
+  --dash-accent-glow: rgba(124, 58, 237, 0.14);
+  --dash-accent-subtle: rgba(124, 58, 237, 0.06);
+  --dash-border: #E8E5DE;
+  --dash-border-hover: #D6D2C8;
+  --dash-glass: rgba(255, 255, 255, 0.72);
+  --glass-card: rgba(20, 20, 30, 0.03);
+  --glass-subtle: rgba(20, 20, 30, 0.02);
+  --glass-soft: rgba(20, 20, 30, 0.05);
+  --glass-thumb: rgba(20, 20, 30, 0.025);
+  --glass-panel: rgba(255, 255, 255, 0.86);
+  --edge-card: rgba(20, 20, 30, 0.08);
+  --edge-subtle: rgba(20, 20, 30, 0.05);
+  --edge-hover: rgba(20, 20, 30, 0.14);
+  --edge-input: rgba(20, 20, 30, 0.10);
+  /* Diffused elevation, not a glow — soft multi-layer black-alpha shadows
+     are how a raised surface reads as "raised and lit" on a light ground,
+     the light-surface equivalent of the dark theme's neon card glow. */
+  --dash-shadow-card: 0 1px 2px rgba(23, 23, 35, 0.04), 0 8px 24px rgba(23, 23, 35, 0.06);
+  --dash-shadow-glow: 0 0 0 1px rgba(124, 58, 237, 0.08), 0 8px 32px rgba(124, 58, 237, 0.14);
+  --dash-shadow-button: 0 4px 14px rgba(124, 58, 237, 0.28), 0 1px 3px rgba(37, 99, 235, 0.18);
+  /* Cursor-follow ambient glow (CursorLight, root layout, all routes) —
+     dark-mode alpha reads as almost nothing on a light ground, toned down
+     rather than reused as-is. */
+  --cursor-glow-1: rgba(124, 58, 237, 0.025);
+  --cursor-glow-2: rgba(37, 99, 235, 0.012);
+}
+
+.dark {
+  /* Semantic tokens — Dark mode mapping (Section 12.2.3) */
+  --background: #1e293b; /* neutral-50 -> neutral-900 */
+  --foreground: #f1f5f9; /* neutral-900 -> near-white */
+  --card: #1c2b40; /* white card -> dark surface */
+  --card-foreground: #f1f5f9;
+  --popover: #1c2b40;
+  --popover-foreground: #f1f5f9;
+
+  --primary: #f97316; /* accent-orange unchanged in dark mode */
+  --primary-foreground: #ffffff;
+  --secondary: #0f2340; /* brand-navy deepens in dark mode */
+  --secondary-foreground: #ffffff;
+
+  --muted: #273548; /* neutral-100 -> dark slate */
+  --muted-foreground: #94a3b8; /* same absolute value */
+  --accent: #1a2f4a; /* brand-navy-light -> deep navy tint */
+  --accent-foreground: #ffffff;
+
+  --destructive: #dc2626;
+  --destructive-foreground: #ffffff;
+
+  --border: #3e5068; /* neutral-300 -> subtler in dark mode */
+  --input: #3e5068;
+  --ring: #f97316;
+
+  --chart-1: #f97316;
+  --chart-2: #60a5fa;
+  --chart-3: #16a34a;
+  --chart-4: #93c5fd;
+  --chart-5: #d97706;
+
+  --sidebar: #0f2340;
+  --sidebar-foreground: #f1f5f9;
+  --sidebar-primary: #f97316;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #1a2f4a;
+  --sidebar-accent-foreground: #f1f5f9;
+  --sidebar-border: #1a2f4a;
+  --sidebar-ring: #f97316;
+
+  /* ---- Aurora Light — Dashboard/Marketing tokens, dark side ----
+     Exactly the prior static values (zero visual change from before this
+     pass) — the dashboard's existing "premium dark theme" is now simply
+     the .dark half of a real toggle instead of the only option. */
+  --dash-bg: #0B0F19;
+  --dash-surface-1: #111827;
+  --dash-surface-2: #161B26;
+  --dash-ink: #FFFFFF;
+  --dash-accent-from: #7C3AED;
+  --dash-accent-to: #2563EB;
+  --dash-accent-mid: #5B21B6;
+  --dash-accent-glow: rgba(124, 58, 237, 0.25);
+  --dash-accent-subtle: rgba(124, 58, 237, 0.10);
+  --dash-border: rgba(255, 255, 255, 0.06);
+  --dash-border-hover: rgba(255, 255, 255, 0.12);
+  --dash-glass: rgba(22, 27, 38, 0.70);
+  --glass-card: rgba(255, 255, 255, 0.04);
+  --glass-subtle: rgba(255, 255, 255, 0.02);
+  --glass-soft: rgba(255, 255, 255, 0.06);
+  --glass-thumb: rgba(255, 255, 255, 0.03);
+  --glass-panel: rgba(11, 15, 25, 0.80);
+  --edge-card: rgba(255, 255, 255, 0.10);
+  --edge-subtle: rgba(255, 255, 255, 0.06);
+  --edge-hover: rgba(255, 255, 255, 0.16);
+  --edge-input: rgba(255, 255, 255, 0.09);
+  --dash-shadow-card: 0 4px 24px rgba(0, 0, 0, 0.45), 0 1px 4px rgba(0, 0, 0, 0.3);
+  --dash-shadow-glow: 0 0 32px rgba(124, 58, 237, 0.20), 0 0 8px rgba(124, 58, 237, 0.10);
+  --dash-shadow-button: 0 4px 20px rgba(124, 58, 237, 0.35), 0 2px 8px rgba(37, 99, 235, 0.20);
+  --cursor-glow-1: rgba(124, 58, 237, 0.04);
+  --cursor-glow-2: rgba(37, 99, 235, 0.02);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+
+  html {
+    @apply font-sans;
+  }
+
+  /* 12.13 — Visible focus indicator (keyboard only, never on mouse click) */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  /* 12.1 — Devanagari rendering rules: never uppercase, minimum 1.5x line-height */
+  :lang(hi) {
+    font-family: var(--font-devanagari), var(--font-sans);
+    line-height: 1.6;
+  }
+  :lang(hi) .uppercase {
+    text-transform: none !important;
+  }
+}
+
+/* ==========================================================================
+   LIVING DASHBOARD — Immersive depth system
+   Depth stack: 3D world → cursor light → glass shell → floating cards → content
+   All transforms GPU-composited. No layout-triggering properties animated.
+   ========================================================================== */
+
+/* Cursor position (updated by CursorLight component at ~60fps via RAF) */
+:root {
+  --cursor-x: 50vw;
+  --cursor-y: 50vh;
+}
+
+/* Sidebar: gradient right-edge glow overlays the flat border-r */
+.lv-sidebar::after {
+  content: "";
+  position: absolute;
+  inset-y: 0;
+  right: 0;
+  width: 1px;
+  background: linear-gradient(
+    180deg,
+    transparent 0%,
+    rgba(124, 58, 237, 0.40) 35%,
+    rgba(37, 99, 235, 0.28) 65%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+
+/* Topbar: gradient bottom-edge glow overlays the flat border-b */
+.lv-topbar::after {
+  content: "";
+  position: absolute;
+  inset-x: 0;
+  bottom: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(124, 58, 237, 0.30) 30%,
+    rgba(37, 99, 235, 0.22) 70%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+
+/* 12.11 — Respect prefers-reduced-motion globally */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* 12.12 — Editor isolation
+   The Video Editor (/editor/*) is a professional workspace, not a dashboard.
+   EditorModeActivator (mounted in editor/layout.tsx) sets data-editor on <html>
+   synchronously before the first paint, making these rules take effect in the
+   same frame — zero flash. The WebGL frameloop is also paused via MutationObserver
+   in BackgroundScene, so there is no GPU waste even though the canvas is hidden. */
+html[data-editor] .lv-bg-engine {
+  display: none;
+}
+html[data-editor] .lv-cursor-light {
+  display: none;
+}

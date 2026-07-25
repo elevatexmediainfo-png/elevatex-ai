@@ -2,6 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { getStorageProvider } from "@/lib/providers/storage";
 import { resolveAbsoluteUrl } from "@/lib/providers/storage/absolute-url";
 import { transcribeAudio } from "@/lib/generation/transcription";
+import { MOCK_PROVIDER_ID } from "@/lib/generation/types";
 import { analyzeVideo } from "@/lib/generation/video-understanding";
 import { planTimeline } from "@/lib/generation/reasoning";
 import type { ReasoningPlanRequest } from "@/lib/providers/reasoning/types";
@@ -86,6 +87,12 @@ export interface CreateAiEditJobInput {
   // keeps a fixed, historical record of the policy that was active, per
   // AiEditJob.brollStockOnly's own doc comment.
   brollStockOnly?: boolean;
+  // Founder policy follow-up (2026-07-23) — per-job override of the admin
+  // default (AI_EDIT_BROLL_RELEVANCE_FALLBACK_THRESHOLD). Same "undefined
+  // means use the current admin config" / "resolved once at creation time"
+  // pattern as brollStockOnly above — see AiEditJob.brollRelevanceFallbackThreshold's
+  // own doc comment.
+  brollRelevanceFallbackThreshold?: number;
   // Phase 12 Module 8 — pasted reference text, "if provided." See
   // aiIntakeSchema.script's own doc comment for the full contract.
   script?: string;
@@ -108,6 +115,7 @@ export async function createAiEditJob(input: CreateAiEditJobInput) {
   await checkVideoActionAccess(input.userId, "ai_auto_edit");
 
   const brollStockOnly = input.brollStockOnly ?? (await getConfig("AI_EDIT_BROLL_STOCK_ONLY"));
+  const brollRelevanceFallbackThreshold = input.brollRelevanceFallbackThreshold ?? (await getConfig("AI_EDIT_BROLL_RELEVANCE_FALLBACK_THRESHOLD"));
 
   return prisma.aiEditJob.create({
     data: {
@@ -116,6 +124,7 @@ export async function createAiEditJob(input: CreateAiEditJobInput) {
       sourceAssetId: input.assetId,
       stylePreset: input.stylePreset,
       brollStockOnly,
+      brollRelevanceFallbackThreshold,
       brollDensity: input.brollDensity,
       script: input.script,
     },
@@ -141,8 +150,15 @@ export async function claimNextAiEditJob() {
   return prisma.aiEditJob.findUnique({ where: { id: candidate.id } });
 }
 
+// Real bug fix (2026-07-24, found live during the codebase health check) —
+// this used to be a plain, unconditional update, unlike failJob() right
+// below it (which already excludes CANCELLED). A user cancelling a job
+// that was already mid-flight would have their cancel silently
+// overwritten by the very next progress checkpoint this same in-flight
+// promise writes moments later — same "not in [CANCELLED]" guard as
+// failJob(), so a cancel actually sticks once it lands.
 async function setStatus(jobId: string, status: string, extra: Record<string, unknown> = {}) {
-  await prisma.aiEditJob.update({ where: { id: jobId }, data: { status: status as never, ...extra } });
+  await prisma.aiEditJob.updateMany({ where: { id: jobId, status: { notIn: ["CANCELLED"] } }, data: { status: status as never, ...extra } });
 }
 
 async function failJob(jobId: string, errorMessage: string): Promise<void> {
@@ -150,6 +166,32 @@ async function failJob(jobId: string, errorMessage: string): Promise<void> {
     where: { id: jobId, status: { notIn: ["CANCELLED"] } },
     data: { status: "FAILED", completedAt: new Date(), errorMessage },
   });
+}
+
+// Real bug fix (2026-07-24, found live during the codebase health check) —
+// this pipeline had no way to cancel a job at all, unlike Export's own
+// cancelExport() (exports.ts). Same "flag it, don't preempt in-flight
+// work" convention Export already accepts (its own doc comment): unlike
+// Export's frame loop, processAiEditJob() has no interruption points of
+// its own to check a live flag between steps, so a cancel of an ACTIVELY
+// RUNNING job stops it from ever reaching READY_FOR_REVIEW/consuming
+// credits (setStatus/the final transaction below both now guard against
+// CANCELLED) without literally killing the in-flight vendor calls — the
+// same trade-off already accepted for asset-normalize-worker.ts's timed-
+// out downloads. A QUEUED job is stopped outright (never claimed).
+export async function cancelAiEditJob(projectId: string, userId: string, jobId: string): Promise<void> {
+  const claimed = await prisma.aiEditJob.updateMany({
+    where: {
+      id: jobId,
+      projectId,
+      userId,
+      status: { notIn: ["READY_FOR_REVIEW", "FAILED", "CANCELLED"] },
+    },
+    data: { status: "CANCELLED", completedAt: new Date() },
+  });
+  if (claimed.count === 0) {
+    throw new InvalidStateError("Only a queued or in-progress job can be cancelled.");
+  }
 }
 
 // The actual pipeline this module builds: fetch the source asset -> real
@@ -161,6 +203,36 @@ async function failJob(jobId: string, errorMessage: string): Promise<void> {
 // the PLAN, never touches EditorTrack/EditorClip rows itself, so the
 // standing "every AI-driven edit goes through the Command pattern" rule
 // is never at risk of a parallel mutation path sneaking in here.
+// Real incident (2026-07-21) — a job's DB status read "READY" but
+// AssemblyAI's own upload step (which does OUR server's fetch(audioUrl),
+// not AssemblyAI's — see assemblyai.provider.ts's own header comment)
+// still got a 404 fetching the source file. asset-normalize-worker.ts
+// DOES await its storage.upload() before flipping the DB row to READY, so
+// this isn't a simple ordering bug in this codebase's own control flow —
+// but a defense-in-depth check here costs almost nothing and closes the
+// gap regardless of the exact underlying cause (a non-atomic in-place
+// overwrite, a slow disk flush, or anything else outside this function's
+// visibility). A short bounded retry, not an immediate hard fail, since a
+// transient "not quite there yet" is exactly the kind of thing a few
+// seconds of backoff resolves; if it's still unreachable after that, the
+// real error should surface honestly rather than retry forever.
+async function waitUntilFetchable(url: string, attempts = 5, initialDelayMs = 500): Promise<void> {
+  let delay = initialDelayMs;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, { method: "HEAD" });
+      if (res.ok) return;
+    } catch {
+      // Network hiccup — treated the same as a non-OK status, retry below.
+    }
+    if (i < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay *= 2;
+    }
+  }
+  throw new InvalidStateError(`Source asset's file isn't reachable yet at ${url} after ${attempts} attempts.`);
+}
+
 export async function processAiEditJob(jobId: string): Promise<void> {
   const job = await prisma.aiEditJob.findUnique({ where: { id: jobId } });
   if (!job) return;
@@ -186,7 +258,23 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     await setStatus(jobId, "TRANSCRIBING", { progress: 15 });
     const storage = await getStorageProvider();
     const mediaUrl = resolveAbsoluteUrl(storage.getPublicUrl(asset.storageKey));
+    await waitUntilFetchable(mediaUrl);
     const transcript = await transcribeAudio({ audioUrl: mediaUrl }, { userId: job.userId });
+
+    // 2026-07-20 fix — a real incident: the legacy Film flow already
+    // refuses to treat a MOCK_PROVIDER_ID result as real (isMockTranscript
+    // banner), but this pipeline had no equivalent check, so captions/
+    // scene-removal/reasoning could silently run on fake placeholder
+    // sentences whenever every real TRANSCRIPTION provider was
+    // disabled/unreachable, with the job still reporting COMPLETED. This
+    // is a hard fail, not a warning, because unlike the Film flow's
+    // scene-by-scene review screen, nothing downstream here re-checks the
+    // transcript before committing captions/removals to the timeline.
+    if (transcript.providerId === MOCK_PROVIDER_ID) {
+      throw new InvalidStateError(
+        "Transcription used the placeholder provider, not a real one — no TRANSCRIPTION provider (AssemblyAI/Whisper) is currently enabled and reachable. Check Admin → AI Providers, then try again."
+      );
+    }
 
     // Phase 12 Module 3 — Gemini "watching" the footage, ONLY for VIDEO
     // assets (an AUDIO-only upload has no visual content to analyze; Module
@@ -322,7 +410,12 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     let resolvedSfx: AISfx[] = [];
     if (brollProposals.length > 0 || stickers.length > 0 || sfx.length > 0 || music) {
       await setStatus(jobId, "RESOLVING_ASSETS", { progress: 75 });
-      const resolutionCtx = { userId: job.userId, aspectRatio: project.aspectRatio as AIIntake["aspectRatio"], stockOnly: job.brollStockOnly };
+      const resolutionCtx = {
+        userId: job.userId,
+        aspectRatio: project.aspectRatio as AIIntake["aspectRatio"],
+        stockOnly: job.brollStockOnly,
+        relevanceFallbackThreshold: job.brollRelevanceFallbackThreshold,
+      };
       const [resolvedAssets, resolvedBroll] = await Promise.all([
         resolveTimelinePlanAssets({ stickers, music, sfx }, resolutionCtx),
         brollProposals.length > 0 ? resolveBrollItems(brollProposals, resolutionCtx) : Promise.resolve([]),
@@ -395,6 +488,18 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     const creditsToCharge = convertUsdToCredits(cost.totalUsd, usdToInrRate);
 
     await prisma.$transaction(async (tx) => {
+      // Real bug fix (2026-07-24, found live during the codebase health
+      // check) — a job cancelled while this promise was still mid-flight
+      // (see cancelAiEditJob()) used to have NOTHING stopping this final
+      // step from blindly overwriting it back to READY_FOR_REVIEW and, far
+      // worse, actually charging real credits for a run the user already
+      // cancelled. Re-checked atomically, inside the SAME transaction as
+      // the charge, right before consumeCredits() runs — not a plain read
+      // beforehand, which would leave the identical race open one line
+      // earlier.
+      const current = await tx.aiEditJob.findUniqueOrThrow({ where: { id: jobId }, select: { status: true } });
+      if (current.status === "CANCELLED") return;
+
       if (creditsToCharge > 0) {
         await consumeCredits(
           {

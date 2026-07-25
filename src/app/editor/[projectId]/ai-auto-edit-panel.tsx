@@ -20,6 +20,7 @@ import {
   Sparkles,
   Square,
   Volume2,
+  X,
   ZoomIn,
 } from "lucide-react";
 
@@ -36,6 +37,7 @@ import {
   useAddTrackMutation,
   useAddTransitionMutation,
   useAiEditJobsQuery,
+  useCancelAiEditJobMutation,
   useCreateAiEditJobMutation,
   useDeleteClipMutation,
   useDuplicateClipMutation,
@@ -62,7 +64,7 @@ import { summarizePlanCounts } from "./ai-plan-summary";
 import { aiTimelinePlanSchema, AI_ZOOM_SOURCE_CLIP_PLACEHOLDER, type AISceneRemovalReason, type AITimelinePlan } from "@/lib/validations/ai-timeline";
 import { AI_STYLE_PRESETS } from "@/lib/validations/ai-style-presets";
 import { AI_BROLL_DENSITIES } from "@/lib/validations/video-editor";
-import type { AiEditJobStatus, AiEditJobView, EditorTrackKind, ProjectView } from "../types";
+import type { AiEditJobStatus, AiEditJobView, AssetView, EditorTrackKind, ProjectView } from "../types";
 
 // Phase 12 Module 8 — same "genuine PATCH, not a display-only toggle"
 // aspect-ratio quick-switch as preview-window.tsx's own ASPECT_SWITCH_OPTIONS
@@ -204,6 +206,20 @@ function AiPlanCostConfidenceSummary({ plan }: { plan: AITimelinePlan }) {
     </div>
   );
 }
+
+// Real gap (2026-07-21) — the source-asset picker below never had ANY
+// status awareness: a NORMALIZING/UPLOADING/FAILED asset was just as
+// selectable as a READY one, unlike the Uploads panel's own asset cards
+// (which already show a spinner/warning for the exact same statuses).
+// Non-READY assets stay in the list rather than being hidden — the user
+// should still see where their upload went — but are disabled with a
+// status suffix so they can't actually be run against.
+const AI_EDIT_ASSET_STATUS_SUFFIX: Partial<Record<AssetView["status"], string>> = {
+  PENDING_UPLOAD: " (Uploading…)",
+  QUEUED_FOR_NORMALIZATION: " (Preparing…)",
+  NORMALIZING: " (Preparing…)",
+  FAILED: " (Failed)",
+};
 
 export function AiAutoEditPanel({
   projectId,
@@ -384,6 +400,11 @@ export function AiAutoEditPanel({
 
   async function handleRun() {
     if (!selectedAssetId) return;
+    // Defense in depth alongside the picker's own `disabled` options above —
+    // covers the narrow window where `selectedAssetId` was set while an
+    // asset was still READY-selectable but a subsequent status change
+    // hasn't re-rendered yet (e.g. a stale query cache).
+    if (sourceAssets.find((a) => a.id === selectedAssetId)?.status !== "READY") return;
     // Guards the button's own disabled state below — ensureSourceAssetOnTimeline
     // is real async work (an addTrack/addClip round trip) that happens BEFORE
     // createJobMutation.isPending would ever flip true on its own, so without
@@ -573,8 +594,9 @@ export function AiAutoEditPanel({
             >
               <option value="">Choose a video or audio asset…</option>
               {sourceAssets.map((a) => (
-                <option key={a.id} value={a.id}>
+                <option key={a.id} value={a.id} disabled={a.status !== "READY"}>
                   {a.originalFilename}
+                  {AI_EDIT_ASSET_STATUS_SUFFIX[a.status] ?? ""}
                 </option>
               ))}
             </select>
@@ -651,12 +673,19 @@ export function AiAutoEditPanel({
                       <AlertTriangle className="size-3.5 text-editor-danger" />
                     ) : job.status === "READY_FOR_REVIEW" ? (
                       <CheckCircle2 className="size-3.5 text-emerald-400" />
+                    ) : job.status === "CANCELLED" ? (
+                      <X className="size-3.5 text-neutral-500" />
                     ) : (
                       <Loader2 className="size-3.5 animate-spin text-editor-accent" />
                     )}
                     {STATUS_LABEL[job.status]}
                   </span>
-                  <span className="text-micro text-neutral-500">{job.progress}%</span>
+                  <div className="flex items-center gap-2">
+                    {job.status !== "READY_FOR_REVIEW" && job.status !== "FAILED" && job.status !== "CANCELLED" && (
+                      <CancelJobButton projectId={projectId} jobId={job.id} />
+                    )}
+                    <span className="text-micro text-neutral-500">{job.progress}%</span>
+                  </div>
                 </div>
 
                 {job.status === "FAILED" && job.errorMessage && <p className="text-micro text-editor-danger">{job.errorMessage}</p>}
@@ -960,5 +989,25 @@ export function AiAutoEditPanel({
         </div>
       </SheetContent>
     </Sheet>
+  );
+}
+
+// Real bug fix (2026-07-24, found live during the codebase health check) —
+// this pipeline had no way to cancel a stuck/wrong-asset job at all before
+// this; the user's only recourse was waiting for the (also new) stale-job
+// reaper to eventually time it out. Mirrors the Export panel's own cancel
+// affordance.
+function CancelJobButton({ projectId, jobId }: { projectId: string; jobId: string }) {
+  const cancelMutation = useCancelAiEditJobMutation(projectId);
+  return (
+    <button
+      type="button"
+      title="Cancel this job"
+      disabled={cancelMutation.isPending}
+      onClick={() => cancelMutation.mutate(jobId)}
+      className="text-neutral-500 hover:text-editor-danger disabled:opacity-50"
+    >
+      {cancelMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <X className="size-3.5" />}
+    </button>
   );
 }

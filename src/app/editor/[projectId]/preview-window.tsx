@@ -3,6 +3,7 @@
 import * as React from "react";
 import {
   Gauge,
+  Loader2,
   Maximize,
   Minimize,
   Monitor,
@@ -30,6 +31,7 @@ import {
 } from "./store";
 import { useEditorAssetsQuery, useUpdateClipMutation, useUpdateProjectAspectRatioMutation } from "./queries";
 import { createUpdateTransformCommand, type ClipCommandDeps } from "./commands";
+import { clearLocalPreview, getLocalPreview, useLocalPreviewVersion } from "./local-preview-registry";
 import { isTextEditableTarget, resolveEditorSeekDelta } from "../keyboard-utils";
 import {
   DEFAULT_CLIP_TRANSFORM,
@@ -41,7 +43,7 @@ import {
   type Point2D,
   type ResolvedTransform,
 } from "@/lib/video-editor/transform";
-import { CompositorStage, resumeSharedAudioContext } from "./compositor-stage";
+import { CompositorStage, togglePlayback } from "./compositor-stage";
 import { clipEndMs, formatTimecode, type AssetView, type ClipView, type ProjectView, type TrackView, type TransitionView } from "../types";
 
 const PREVIEW_QUALITY_LABEL: Record<PreviewQuality, string> = {
@@ -141,10 +143,43 @@ export function PreviewWindow({
   );
 
   const assetsQuery = useEditorAssetsQuery();
+  // Local-instant-preview (2026-07-24) — while an asset a clip references is
+  // still uploading/normalizing, substitute its real (possibly nonexistent
+  // or still-transcoding) storage url with the local blob url created at
+  // file-select time, so playback works immediately off the real file
+  // bytes already sitting in the browser. localPreviewVersion is a plain
+  // render trigger (see local-preview-registry.ts) — the registry itself
+  // isn't part of assetsQuery's data so a change to it wouldn't otherwise
+  // invalidate this memo.
+  const localPreviewVersion = useLocalPreviewVersion();
   const assetById = React.useMemo(() => {
     const map = new Map<string, AssetView>();
-    for (const asset of assetsQuery.data ?? []) map.set(asset.id, asset);
+    for (const asset of assetsQuery.data ?? []) {
+      const local = asset.status !== "READY" ? getLocalPreview(asset.id) : undefined;
+      map.set(
+        asset.id,
+        local
+          ? {
+              ...asset,
+              url: local.blobUrl,
+              durationSeconds: asset.durationSeconds ?? local.durationSeconds ?? null,
+              widthPx: asset.widthPx ?? local.widthPx ?? null,
+              heightPx: asset.heightPx ?? local.heightPx ?? null,
+            }
+          : asset
+      );
+    }
     return map;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assetsQuery.data, localPreviewVersion]);
+
+  // Once an asset genuinely reaches READY, its real storage url is live —
+  // drop the local override (and revoke the blob url) so later re-renders
+  // read straight from the server value, same as any other asset.
+  React.useEffect(() => {
+    for (const asset of assetsQuery.data ?? []) {
+      if (asset.status === "READY") clearLocalPreview(asset.id);
+    }
   }, [assetsQuery.data]);
 
   const totalDurationMs = React.useMemo(() => clips.reduce((max, c) => Math.max(max, clipEndMs(c)), 0), [clips]);
@@ -153,8 +188,22 @@ export function PreviewWindow({
   const rafRef = React.useRef<number | null>(null);
   const lastTickRef = React.useRef<number>(0);
 
+  // Buffering awareness (2026-07-23) — real bug: this clock used to
+  // advance playheadMs from pure wall-clock time regardless of whether
+  // the underlying media could actually keep up, producing a stuck/black
+  // frame and/or audibly-late sound under real network conditions (see
+  // compositor-stage.tsx's own BufferingReportContext doc comment for the
+  // full live-confirmed evidence). `isBuffering` gates the clock itself —
+  // not just another seek papering over the symptom — and doubles as the
+  // loading-indicator's own visibility flag below.
+  const [isBuffering, setIsBuffering] = React.useState(false);
+
   React.useEffect(() => {
-    if (!playing) return;
+    if (!playing || isBuffering) return;
+    // Reset on every (re)start, including a resume after a buffering
+    // pause — without this, the real-world stall duration would get
+    // counted as elapsed playback time on the very next tick, jumping
+    // the playhead forward by however long the stall lasted.
     lastTickRef.current = performance.now();
 
     function tick(now: number) {
@@ -175,7 +224,7 @@ export function PreviewWindow({
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  }, [playing, playbackRate, totalDurationMs, setPlayheadMs, setPlaying]);
+  }, [playing, isBuffering, playbackRate, totalDurationMs, setPlayheadMs, setPlaying]);
 
   React.useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -400,8 +449,19 @@ export function PreviewWindow({
               playing={playing}
               playbackRate={playbackRate}
               effectiveTransform={effectiveTransform}
+              onBufferingChange={setIsBuffering}
             />
           </div>
+
+          {/* Buffering indicator (2026-07-23) — shown whenever any active
+              track's media isn't buffered enough to keep up with the RAF
+              clock above, which is paused for the same duration (see that
+              effect's own comment) rather than silently drifting/stalling. */}
+          {isBuffering && (
+            <div data-buffering-indicator className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/35">
+              <Loader2 className="size-8 animate-spin text-white/80" />
+            </div>
+          )}
         </div>
 
         {cropHandleTarget && (
@@ -478,10 +538,7 @@ export function PreviewWindow({
         <button
           type="button"
           className="flex size-9 shrink-0 items-center justify-center rounded-full bg-[linear-gradient(180deg,var(--color-editor-accent)_0%,#4057af_100%)] text-white shadow-[0_6px_16px_rgba(91,124,250,0.45)] transition-opacity disabled:opacity-40"
-          onClick={() => {
-            resumeSharedAudioContext();
-            setPlaying(!playing);
-          }}
+          onClick={() => togglePlayback(playing, setPlaying)}
           disabled={totalDurationMs === 0}
         >
           {playing ? <Pause className="size-4" fill="currentColor" /> : <Play className="size-4" fill="currentColor" />}

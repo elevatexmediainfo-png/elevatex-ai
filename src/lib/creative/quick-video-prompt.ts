@@ -38,12 +38,43 @@ export interface QuickVideoPrompt {
 export function buildQuickVideoPrompt(answers: QuickVideoAnswers): QuickVideoPrompt {
   const sentences: string[] = [`An 8-second vertical marketing video: ${answers.about.trim()}.`];
 
+  // Prompt-tuning (2026-07-24) — "every second must earn its place." With
+  // only 8 seconds available, this pushes away from generic ambient footage
+  // toward one high-impact ad moment.
+  sentences.push(
+    "Every second must earn its place — no filler, no idle moments with nothing happening. This should feel like a single high-impact beat from a real, punchy advertisement, not generic stock footage."
+  );
+
+  // Meta-ad / performance-marketing rewrite (2026-07-25) — founder feedback
+  // on the previous "premium brand commercial" sentence (2026-07-24, see
+  // git history): too slow/polished for a real Meta ad. Matches the same
+  // rewrite applied to FILM's and GENERATED's scene prompts (see their own
+  // comments for the real live before/after this was validated against).
+  // Quick Video's prompt is a deterministic template sent straight to the
+  // video provider (no LLM step in between), so this sentence is always
+  // included verbatim rather than tested for LLM-compliance.
+  sentences.push(
+    "This is a Meta (Instagram/Facebook Reels) ad, not a brand commercial — it needs to stop a thumb mid-scroll in its first 1-2 seconds with a bold visual or unexpected moment, never a slow warm-up. Favor an authentic, slightly raw, creator/UGC-adjacent energy over a slow, over-polished commercial look — a quick, purposeful camera move or handheld feel rather than a slow push-in — while the shot still stays clean enough to read as real production. The main subject is always the clear visual focus, vertical framing throughout."
+  );
+
   if (answers.see?.trim()) {
     sentences.push(`The video shows: ${answers.see.trim()}.`);
   }
 
+  // Real bug fix (2026-07-25) — this used to ask the video model to render
+  // its OWN native lip-synced speech via "...saying: '...'". Now that Quick
+  // Video also generates a real, separate ElevenLabs voiceover for this
+  // exact line (see generateVeoLiteVideo()'s own comment) and dubs it over
+  // the clip, asking the video model to ALSO voice the same words would
+  // risk two competing voices in the final output. Keeps the person
+  // visually present and engaged — matches GENERATED's own established
+  // convention (scene-split.ts explicitly treats spoken dialogue as
+  // "context for mood/setting, not words to render") rather than a new,
+  // untested trade-off.
   if (answers.speechEnabled && answers.spokenLine?.trim()) {
-    sentences.push(`A person on screen speaks directly to camera, saying: "${answers.spokenLine.trim()}"`);
+    sentences.push(
+      "A person on screen looks directly at the camera with warm, engaged energy, as if mid-conversation with the viewer — real narration is dubbed in separately, so the video itself should not attempt to render spoken audio."
+    );
   }
 
   if (answers.mood) {

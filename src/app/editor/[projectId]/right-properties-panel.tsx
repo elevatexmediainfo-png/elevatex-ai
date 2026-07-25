@@ -16,6 +16,7 @@ import { createCompositeCommand, createUpdateTransformCommand, type ClipCommandD
 import { StopwatchToggle } from "./keyframe-controls";
 import { TextGroup } from "./text-properties-group";
 import { AudioGroup } from "./audio-properties-group";
+import { AiReeditPrompt } from "./ai-reedit-prompt";
 import {
   allShareValue,
   ANIMATION_PRESETS,
@@ -32,7 +33,7 @@ import {
   type CropRect,
   type Keyframeable,
 } from "@/lib/video-editor/transform";
-import { clipEndMs, formatTimecode, type ClipView, type TrackView } from "../types";
+import { clipEndMs, formatTimecode, type ClipView, type TrackView, type TransitionView } from "../types";
 
 // Right Properties Panel (Milestone 24; Transform/Crop/Blend Module 4;
 // keyframes Module 6) — every field here edits ClipTransform
@@ -54,10 +55,12 @@ export function RightPropertiesPanel({
   projectId,
   clips,
   tracks,
+  transitions,
 }: {
   projectId: string;
   clips: ClipView[];
   tracks: TrackView[];
+  transitions: TransitionView[];
 }) {
   const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
   const liveClipOverride = useEditorStore((s) => s.liveClipOverride);
@@ -172,8 +175,10 @@ export function RightPropertiesPanel({
   // pattern as the Left Panel (creative-studio-sidebar/index.tsx), the
   // `256px` fallback matching PANEL_SIZE_LIMITS.rightPanelWidth.default.
   return (
+    // D1 (2026-07-22) — hidden below `lg`, same mobile-reachability fix as
+    // the Left Panel (creative-studio-sidebar/index.tsx) — see its comment.
     <aside
-      className="flex shrink-0 flex-col overflow-y-auto border-l border-editor-line bg-editor-panel"
+      className="hidden shrink-0 flex-col overflow-y-auto border-l border-editor-line bg-editor-panel lg:flex"
       style={{ width: "var(--editor-right-panel-width, 256px)" }}
     >
       <h2 className="border-b border-editor-line p-4 text-editor-panel-title text-neutral-100">Properties</h2>
@@ -207,6 +212,11 @@ export function RightPropertiesPanel({
             <Row label="Trim in" value={formatTimecode(selectedClips[0].trimStartMs)} />
             {selectedClips.length > 1 && <Row label="Selected" value={`${selectedClips.length} clips`} />}
           </dl>
+
+          {/* Phase 12 Module 9 — scoped to exactly one selected clip, same
+              as every other per-clip control in this panel; a multi-select
+              or empty selection never reaches this component at all. */}
+          {isSingleSelect && primaryClip && <AiReeditPrompt projectId={projectId} clip={primaryClip} transitions={transitions} />}
 
           {isSingleSelect && primaryClip ? (
             <>

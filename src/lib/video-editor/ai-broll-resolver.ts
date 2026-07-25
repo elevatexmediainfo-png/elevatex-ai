@@ -1,0 +1,312 @@
+import { randomUUID } from "node:crypto";
+
+import { prisma } from "@/lib/prisma";
+import { getStorageProvider } from "@/lib/providers/storage";
+import { searchStockMedia, materializeStockAsset, type StockSearchProviderOutcome } from "@/lib/providers/stock-media/search-service";
+import type { StockSearchResult } from "@/lib/providers/stock-media/types";
+import { generateImageThumbnail, generateVideoThumbnail } from "./thumbnails";
+import { generateImage } from "@/lib/generation/image";
+import { renderVideo } from "@/lib/generation/video";
+import { MOCK_PROVIDER_ID } from "@/lib/generation/types";
+import { logger } from "@/lib/observability/logger";
+import type { AIBroll } from "@/lib/validations/ai-timeline";
+
+// Phase 12 Module 5 (AI Auto-Editor) — resolves each broll slot GPT-5.x
+// proposed (Module 4's TASK 3) into a real, placeable EditorAsset. Two
+// paths, mirroring the SAME "generic providers already exist, reuse
+// them" investigation finding that motivated this whole module: stock
+// resolution reuses Module 11's real searchStockMedia/materializeStockAsset
+// verbatim; generation resolution reuses the app's existing, already-
+// production-live generateImage()/renderVideo() Generation Engine
+// wrappers (used today by Marketing Creative/AI Image/AI Film) with two
+// new operation literals — NOT a new adapter, since real image/video
+// generation adapters already existed in this codebase before Phase 12
+// ever started (confirmed via investigation: openai_images/flux/
+// ideogram/gemini_images/imagen for IMAGE, replicate/veo/kling/hailuo/
+// runway/sora/seedance2 for VIDEO — all real, live-tested vendor calls).
+//
+// Every resolution is independently try/caught HERE, never left to throw
+// up into the caller — one broll item failing to resolve (no stock
+// match, generation unavailable/erroring) must never take down the
+// other items or the whole job. Failure is recorded via `resolutionNote`
+// (aiBrollSchema, Module 5) so the review UI can flag it distinctly
+// rather than the item just silently vanishing.
+
+export interface BrollResolutionContext {
+  userId: string;
+  aspectRatio: "RATIO_9_16" | "RATIO_1_1" | "RATIO_16_9";
+  // Founder policy (2026-07-18) — see AiEditJob.brollStockOnly's own doc
+  // comment (prisma/schema.prisma). This is the HARD enforcement point:
+  // the reasoning prompt also tells the model to always propose "stock"
+  // (gpt5.provider.ts's stockOnlyGuidance), but that's advisory — this
+  // flag makes the resolver itself ignore `item.source` and always try
+  // stock first when true, regardless of what the model actually
+  // returned, so the policy holds even against a model that doesn't
+  // comply. Generation only fires as an absolute last resort, when stock
+  // (every enabled provider, searchStockMedia's own exhaustive fan-out)
+  // returns literally nothing usable for that slot.
+  stockOnly: boolean;
+  // Founder policy follow-up (2026-07-23) — see AiEditJob.brollRelevanceFallbackThreshold's
+  // own doc comment (prisma/schema.prisma). Only consulted when stockOnly
+  // is true: if the best stock match's relevanceScore falls below this,
+  // resolveStockBroll treats it the same as "no usable match," letting
+  // resolveBrollItem's existing stockOnly fallback-to-generation branch
+  // handle it — no separate fallback path needed.
+  relevanceFallbackThreshold: number;
+}
+
+// Pure and independently testable. This is Module 5's own "best match"
+// heuristic: prefer a result whose kind matches the caller's preference
+// (b-roll: VIDEO over IMAGE; stickers: ICON/IMAGE; music/sfx: AUDIO) as a
+// TIEBREAKER, and if genuinely nothing of the preferred kind exists at all,
+// the best-ranked result of ANY kind still resolves the slot rather than
+// leaving it unresolved for want of the preferred kind. Reused by
+// ai-asset-resolver.ts (Module 6, stickers/music/sfx) and ai-reedit.ts
+// (Module 9, change_asset) as well as broll — one scoring rule, not a
+// parallel reimplementation per section.
+//
+// B1 investigation (2026-07-22) — this used to trust each provider's OWN
+// rank blindly within a kind (index 0 always won), with zero use of the
+// search query itself. Two real live failures this way: "automatic water
+// pump" resolved to an unrelated construction "concrete_pump" clip, and
+// "water conservation" resolved to an orca whale clip (matched only on the
+// stray word "water"). First fix attempt scored kind-match as a fixed
+// +1000 "gate" ahead of relevance — but live-verifying against the REAL
+// provider APIs (not just synthetic unit tests) showed that still failed
+// "automatic water pump": every VIDEO result only weakly matched (one of
+// three query words), while several IMAGE results were a strong match (two
+// of three words, an actual water pump) — the +1000 gate let the weak
+// video always beat the strong image regardless. Fixed by making relevance
+// the dominant signal (weighted 0-1000, i.e. it can outrank a kind
+// mismatch when the gap is real) and kind-match a small +50 tiebreak that
+// only matters between otherwise-equally-relevant candidates; vendor index
+// remains the last-resort tiebreak below that.
+interface ScoredStockResult {
+  providerId: string;
+  result: StockSearchResult;
+  score: number;
+  relevanceScore: number;
+}
+
+const STOPWORDS = new Set(["a", "an", "the", "of", "in", "on", "at", "for", "with", "and", "to", "is", "this", "that"]);
+
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length > 1 && !STOPWORDS.has(token));
+}
+
+// Fraction (0..1) of the query's own meaningful tokens that literally
+// appear in the candidate's title/tag text — deliberately simple (no
+// external NLP/embedding dependency) since these titles are themselves
+// just keyword lists, not sentences a semantic model would help with.
+function relevanceScore(query: string, title: string): number {
+  const queryTokens = tokenize(query);
+  if (queryTokens.length === 0) return 0;
+  const titleTokens = new Set(tokenize(title));
+  const matched = queryTokens.filter((token) => titleTokens.has(token)).length;
+  return matched / queryTokens.length;
+}
+
+// `relevanceScore` (2026-07-23) — the winning candidate's own 0..1 token-
+// overlap score, exposed so callers can decide whether a "best available"
+// match is actually good enough (see BrollResolutionContext.relevanceFallbackThreshold)
+// rather than just trusting that SOME result was returned.
+export function pickBestStockResult(
+  outcomes: StockSearchProviderOutcome[],
+  preferredKind: StockSearchResult["kind"],
+  query: string
+): { providerId: string; result: StockSearchResult; relevanceScore: number } | null {
+  const candidates: ScoredStockResult[] = [];
+  for (const outcome of outcomes) {
+    if (outcome.error) continue;
+    outcome.results.forEach((result, index) => {
+      const relevance = relevanceScore(query, result.title);
+      const kindBonus = result.kind === preferredKind ? 50 : 0;
+      candidates.push({ providerId: outcome.providerId, result, score: relevance * 1000 + kindBonus - index, relevanceScore: relevance });
+    });
+  }
+  if (candidates.length === 0) return null;
+  const best = candidates.reduce((a, b) => (b.score > a.score ? b : a));
+  return { providerId: best.providerId, result: best.result, relevanceScore: best.relevanceScore };
+}
+
+// `queryOverride` (2026-07-18, stock-only policy) — lets the stock-only
+// hard-enforcement path in resolveBrollItem search stock even for an item
+// GPT proposed as "generate" (which has no searchQuery of its own),
+// falling back to the generation prompt's own text as a literal search
+// phrase. Plain `item.searchQuery` is used when no override is given —
+// unchanged behavior for the normal, non-override call site below.
+//
+// `minRelevanceScore` (2026-07-23) — only ever passed by resolveBrollItem's
+// stockOnly branch (see BrollResolutionContext.relevanceFallbackThreshold's
+// own doc comment). When set and the best pick's own relevanceScore falls
+// below it, this returns the SAME "no usable match" shape as the
+// zero-results case above, deliberately — resolveBrollItem's existing
+// stockOnly fallback-to-generation branch already treats "no
+// resolvedAssetId" as its trigger, so a low-relevance match and a missing
+// one are handled identically with no new branching there.
+async function resolveStockBroll(item: AIBroll, ctx: BrollResolutionContext, queryOverride?: string, minRelevanceScore?: number): Promise<AIBroll> {
+  const query = queryOverride ?? item.searchQuery;
+  if (!query) return { ...item, resolutionNote: 'source:"stock" but no searchQuery was provided.' };
+
+  // Search both kinds in parallel — b-roll is conventionally VIDEO
+  // footage, but a well-matched IMAGE is a real, usable fallback when no
+  // video result exists for this specific query (see pickBestStockResult).
+  const [videoOutcomes, imageOutcomes] = await Promise.all([
+    searchStockMedia("STOCK_MEDIA", query, { type: "video", perPage: 5 }),
+    searchStockMedia("STOCK_MEDIA", query, { type: "image", perPage: 5 }),
+  ]);
+  const picked = pickBestStockResult([...videoOutcomes.outcomes, ...imageOutcomes.outcomes], "VIDEO", query);
+  if (!picked) {
+    return { ...item, resolutionNote: `No stock results found for "${query}".` };
+  }
+  if (minRelevanceScore != null && picked.relevanceScore < minRelevanceScore) {
+    return {
+      ...item,
+      resolutionNote: `Best stock match ("${picked.result.title}") scored ${picked.relevanceScore.toFixed(2)} relevance for "${query}", below the ${minRelevanceScore} confidence threshold.`,
+    };
+  }
+
+  const materialized = await materializeStockAsset(ctx.userId, picked.providerId, "STOCK_MEDIA", picked.result);
+  return { ...item, resolvedAssetId: materialized.id, resolvedAssetUrl: materialized.thumbnailUrl ?? materialized.url, costUsd: 0 };
+}
+
+// Downloads/decodes a freshly-generated image or video's output (a
+// `data:` URI for most adapters here — Gemini Images/Veo's own
+// convention — or a plain https URL for others, e.g. OpenAI Images) and
+// persists it as a real EditorAsset, the SAME shape materializeStockAsset
+// produces for a stock result — no existing helper does this for
+// GENERATED (as opposed to stock) output, so this is new, but it's a
+// deliberate mirror of that function's own upload+create+best-effort-
+// thumbnail structure, not a divergent one.
+export async function persistGeneratedMediaAsset(
+  userId: string,
+  kind: "IMAGE" | "VIDEO",
+  mediaUrl: string,
+  durationSeconds?: number
+): Promise<{ id: string; url: string; thumbnailUrl: string | null }> {
+  let buffer: Buffer;
+  let contentType: string;
+  if (mediaUrl.startsWith("data:")) {
+    const match = /^data:([^;]+);base64,([\s\S]*)$/.exec(mediaUrl);
+    if (!match) throw new Error("Generated media returned an unparseable data URI.");
+    contentType = match[1];
+    buffer = Buffer.from(match[2], "base64");
+  } else {
+    const res = await fetch(mediaUrl, { signal: AbortSignal.timeout(60_000) });
+    if (!res.ok) throw new Error(`Failed to download generated media (${res.status}).`);
+    buffer = Buffer.from(await res.arrayBuffer());
+    contentType = res.headers.get("content-type") ?? (kind === "IMAGE" ? "image/png" : "video/mp4");
+  }
+
+  const storage = await getStorageProvider();
+  const key = `ai-broll/${kind.toLowerCase()}/${userId}/${randomUUID()}`;
+  await storage.upload({ key, data: buffer, contentType });
+
+  const asset = await prisma.editorAsset.create({
+    data: {
+      userId,
+      scope: "USER",
+      kind,
+      status: "READY",
+      storageKey: key,
+      originalFilename: `AI-generated ${kind.toLowerCase()} b-roll`,
+      mimeType: contentType,
+      fileSizeBytes: buffer.byteLength,
+      // Same defensive coercion as search-service.ts's materializeStockAsset
+      // (2026-07-21) — a real incident traced to a stock adapter passing a
+      // numeric-looking string here, which Prisma rejects with no
+      // compile-time warning. Cheap to apply here too rather than trust
+      // every current and future generation provider adapter to always
+      // return a real number.
+      durationSeconds: durationSeconds != null ? Number(durationSeconds) : null,
+    },
+  });
+
+  try {
+    const thumb = kind === "IMAGE" ? await generateImageThumbnail(buffer) : await generateVideoThumbnail(buffer);
+    const thumbKey = `${key}.thumb.jpg`;
+    await storage.upload({ key: thumbKey, data: thumb, contentType: "image/jpeg" });
+    await prisma.editorAsset.update({ where: { id: asset.id }, data: { thumbnailKey: thumbKey } });
+  } catch (err) {
+    logger.error({ err, assetId: asset.id }, "[ai broll resolver] thumbnail generation failed for a generated asset");
+  }
+
+  const finalRow = await prisma.editorAsset.findUniqueOrThrow({ where: { id: asset.id } });
+  return {
+    id: finalRow.id,
+    url: storage.getPublicUrl(finalRow.storageKey),
+    thumbnailUrl: finalRow.thumbnailKey ? storage.getPublicUrl(finalRow.thumbnailKey) : null,
+  };
+}
+
+async function resolveGeneratedBroll(item: AIBroll, ctx: BrollResolutionContext): Promise<AIBroll> {
+  const generation = item.generation;
+  if (!generation) return { ...item, resolutionNote: 'source:"generate" but no generation block was provided.' };
+
+  // Fixed (2026-07-24) — neither branch below checked for a mock-fallback
+  // result; resolveBrollItem()'s own outer try/catch already converts any
+  // thrown error here into a graceful "couldn't resolve this item"
+  // resolutionNote (no resolvedAssetId) rather than failing the whole AI
+  // Auto-Edit apply — the same per-item degradation this resolver already
+  // uses for a stock search that finds nothing, so throwing here is the
+  // right fit, not a new failure mode.
+  if (generation.kind === "image") {
+    const result = await generateImage({ prompt: generation.prompt, aspectRatio: ctx.aspectRatio }, "ai_broll_image", { userId: ctx.userId });
+    if (result.providerId === MOCK_PROVIDER_ID) {
+      throw new Error("B-roll image generation used the placeholder provider, not a real one.");
+    }
+    const asset = await persistGeneratedMediaAsset(ctx.userId, "IMAGE", result.imageUrl);
+    return { ...item, resolvedAssetId: asset.id, resolvedAssetUrl: asset.thumbnailUrl ?? asset.url, costUsd: result.costUsd ?? 0 };
+  }
+
+  const durationSeconds = Math.max(1, Math.round((item.endMs - item.startMs) / 1000));
+  const result = await renderVideo(
+    { script: generation.prompt, aspectRatio: ctx.aspectRatio, durationSeconds, quality: "720p" },
+    "ai_broll_video",
+    { userId: ctx.userId }
+  );
+  if (result.providerId === MOCK_PROVIDER_ID) {
+    throw new Error("B-roll video generation used the placeholder provider, not a real one.");
+  }
+  const asset = await persistGeneratedMediaAsset(ctx.userId, "VIDEO", result.videoUrl, result.durationSeconds);
+  return { ...item, resolvedAssetId: asset.id, resolvedAssetUrl: asset.thumbnailUrl ?? asset.url, costUsd: result.costUsd ?? 0 };
+}
+
+export async function resolveBrollItem(item: AIBroll, ctx: BrollResolutionContext): Promise<AIBroll> {
+  try {
+    if (!ctx.stockOnly) {
+      return item.source === "stock" ? await resolveStockBroll(item, ctx) : await resolveGeneratedBroll(item, ctx);
+    }
+    // Founder policy (2026-07-18) — hard backstop, independent of
+    // item.source: always try stock first, using item.searchQuery if
+    // present, otherwise falling back to the generation prompt's own text
+    // as a literal search phrase (covers a model that didn't comply with
+    // the prompt's stock-only instruction and still proposed "generate").
+    // Generation only fires if that stock attempt found literally nothing.
+    const stockResult = await resolveStockBroll(item, ctx, item.searchQuery ?? item.generation?.prompt, ctx.relevanceFallbackThreshold);
+    if (stockResult.resolvedAssetId) return stockResult;
+    if (!item.generation) {
+      return { ...stockResult, resolutionNote: `${stockResult.resolutionNote ?? "No stock results found."} (stock-only policy active — no generation prompt was available to fall back to.)` };
+    }
+    logger.warn({ item, resolutionNote: stockResult.resolutionNote }, "[ai broll resolver] stock-only policy: no usable stock match (missing or below relevance threshold), falling back to generation as a last resort");
+    const generated = await resolveGeneratedBroll(item, ctx);
+    return generated.resolvedAssetId
+      ? { ...generated, resolutionNote: "Stock-only policy active, but no stock provider had a usable match — fell back to generation as a last resort." }
+      : generated;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "B-roll resolution failed.";
+    logger.error({ err, item }, "[ai broll resolver] resolution failed");
+    return { ...item, resolutionNote: message };
+  }
+}
+
+// Runs every item's resolution independently and in parallel — one slow
+// or failing item never blocks/breaks another (each is already its own
+// try/catch inside resolveBrollItem, so Promise.all here can never
+// reject).
+export async function resolveBrollItems(items: AIBroll[], ctx: BrollResolutionContext): Promise<AIBroll[]> {
+  return Promise.all(items.map((item) => resolveBrollItem(item, ctx)));
+}

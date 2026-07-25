@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { generateImage } from "@/lib/generation/image";
+import { MOCK_PROVIDER_ID } from "@/lib/generation/types";
 import { getStorageProvider } from "@/lib/providers/storage";
 import { recordAsset } from "@/lib/assets/service";
 import { getCreditBalance, consumeCredits, InsufficientCreditsError } from "@/lib/credits/engine";
@@ -227,6 +228,20 @@ export async function generateCreativeImage(
         { userId, creativeProjectId: project.id },
         tool.defaultProviderId ?? undefined
       );
+
+      // Fixed (2026-07-24) — the Universal Creative Workflow (AI Image /
+      // Social Media / Marketing Creative's non-compositor path) never
+      // checked for a mock-fallback result — a real IMAGE provider outage
+      // would silently persist MockImageProvider's canned sample as the
+      // user's "generated" image/social post/poster, reported COMPLETED.
+      // Thrown before any upload/resize/composite/persist step; the
+      // existing catch block below already marks the project FAILED with
+      // this message and re-throws, no new error-handling path needed.
+      if (result.providerId === MOCK_PROVIDER_ID) {
+        throw new Error(
+          "Generation used the placeholder provider, not a real one — no IMAGE provider is currently enabled and reachable. Check Admin → AI Providers, then try again."
+        );
+      }
 
       ({ buffer, contentType } = await toBuffer(result.imageUrl));
 

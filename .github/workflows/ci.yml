@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# No deploy job here by design (the confirmed deployment target is a
+# self-hosted VPS via Docker Compose, not a platform with a CI-triggered
+# deploy hook) — see PRODUCTION_DEPLOYMENT.md for the actual deploy steps.
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    env:
+      # Build-time placeholders only — next build/prisma generate need a
+      # non-empty value but never connect to a real database. Same pattern
+      # as the Dockerfile's builder stage.
+      DATABASE_URL: postgresql://placeholder:placeholder@placeholder:5432/placeholder
+      AUTH_SECRET: ci-build-time-secret-not-used-at-runtime
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Typecheck
+        run: npx tsc --noEmit -p .
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build

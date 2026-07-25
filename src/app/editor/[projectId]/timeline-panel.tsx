@@ -24,6 +24,7 @@ import {
   Scissors,
   Sparkles,
   Trash2,
+  TriangleAlert,
   Type as TypeIcon,
   Undo2,
   Ungroup as UngroupIcon,
@@ -61,6 +62,7 @@ import {
 import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
 import { Slider } from "@/components/ui/slider";
 import { cn } from "@/lib/utils";
+import { togglePlayback } from "./compositor-stage";
 import { useEditorStore, useEditorStoreApi } from "./store";
 import {
   useAddClipMutation,
@@ -91,6 +93,7 @@ import {
 import { toast } from "sonner";
 import {
   createAddTrackAndClipCommand,
+  createAddClipCommand,
   createAddTransitionCommand,
   createCompositeCommand,
   createDeleteClipCommand,
@@ -581,7 +584,7 @@ export function TimelinePanel({
         }
       } else if (e.key === " ") {
         e.preventDefault();
-        setPlaying(!playing);
+        togglePlayback(playing, setPlaying);
         // Real bug found and fixed (2026-07-15) — an ArrowLeft/ArrowRight
         // branch used to live here too, DUPLICATING the exact same real
         // handler preview-window.tsx already registers on `window` (both
@@ -768,7 +771,11 @@ export function TimelinePanel({
       // direct-onto-a-track-row case; this branch reuses an existing track
       // that may already have clips near the drop point.
       const clampedStartMs = clampMoveStart(clipPatch.startMs, clipPatch.durationMs, clipsOnTrackExcluding(clips, existing.id, new Set()));
-      addClipMutation.mutate({ trackId: existing.id, ...clipPatch, startMs: clampedStartMs });
+      // Real bug fix (2026-07-22) — same undo-history gap as handleDrop's
+      // own direct-onto-a-track-row case (see its own comment): calling
+      // the raw mutation here instead of runCommand() silently dropped
+      // this add off the undo/redo stack.
+      runCommand(createAddClipCommand(commandDeps, { trackId: existing.id, ...clipPatch, startMs: clampedStartMs }));
       return;
     }
 
@@ -811,7 +818,17 @@ export function TimelinePanel({
     // collision handling); clamp to the nearest non-overlapping slot near
     // the drop point instead, same convention move/trim now both use.
     const startMs = clampMoveStart(rawStartMs, resolved.durationMs, clipsOnTrackExcluding(clips, trackId, new Set()));
-    addClipMutation.mutate({ trackId, assetId: resolved.assetId, startMs, durationMs: resolved.durationMs });
+    // Real bug fix (2026-07-22, found live) — this used to call
+    // addClipMutation.mutate() directly, bypassing runCommand()/the
+    // undo/redo stack entirely, for what's actually the MOST common real
+    // drop scenario (dropping onto a track that's already visible on the
+    // timeline). Confirmed live: a real drag-drop added a real clip
+    // (verified via a DB row), yet the Undo button stayed disabled
+    // immediately afterward. Every other clip-adding path in this file
+    // already goes through runCommand (see this file's own "every one
+    // goes through the store's runCommand" comment below) — this brings
+    // drops in line with that same rule.
+    runCommand(createAddClipCommand(commandDeps, { trackId, assetId: resolved.assetId, startMs, durationMs: resolved.durationMs }));
   }
 
   // Fallback for a drop that didn't land on any existing track row
@@ -1132,15 +1149,21 @@ export function TimelinePanel({
                       ? () => {
                           const playheadMs = storeApi.getState().playheadMs;
                           const startMs = Math.round(playheadMs / 100) * 100;
-                          addClipMutation.mutate({
-                            trackId: track.id,
-                            startMs,
-                            durationMs: 3000,
-                            content:
-                              track.kind === "SUBTITLE"
-                                ? { text: "Subtitle text", fontSize: 28, color: "#FFFFFF" }
-                                : { text: "New Text", fontSize: 48, color: "#FFFFFF" },
-                          });
+                          // Real bug fix (2026-07-22) — same undo-history
+                          // gap as handleDrop/dropAssetOntoSuitableTrack
+                          // (see their own comments): a third, separate
+                          // call site that skipped runCommand().
+                          runCommand(
+                            createAddClipCommand(commandDeps, {
+                              trackId: track.id,
+                              startMs,
+                              durationMs: 3000,
+                              content:
+                                track.kind === "SUBTITLE"
+                                  ? { text: "Subtitle text", fontSize: 28, color: "#FFFFFF" }
+                                  : { text: "New Text", fontSize: 48, color: "#FFFFFF" },
+                            })
+                          );
                         }
                       : undefined
                   }
@@ -2608,6 +2631,14 @@ const ClipBlock = React.memo(function ClipBlock({
   // AUDIO->Waves entry is only ever relevant for TrackHeader itself.
   const NonMediaKindIcon = TRACK_KIND_ICON[trackKind];
   const asset = clip.assetId ? assets.find((a) => a.id === clip.assetId) : undefined;
+  // Real bug fix (2026-07-24, found live during the codebase health check)
+  // — this component never read asset.status at all: a clip whose source
+  // upload failed (local-instant-preview's own background-upload catch
+  // path, queries.ts) rendered completely indistinguishable from a
+  // healthy one, forever, with no way to tell without opening the Uploads
+  // panel separately. Same real signal (asset.status === "FAILED") the
+  // Uploads panel's own AssetThumb card already uses.
+  const assetFailed = asset?.status === "FAILED";
   const waveformCanvasRef = React.useRef<HTMLCanvasElement | null>(null);
   const [fadeDraft, setFadeDraft] = React.useState<{ fadeInMs: number; fadeOutMs: number } | null>(null);
   const fadeDraftRef = React.useRef<{ fadeInMs: number; fadeOutMs: number } | null>(null);
@@ -2803,13 +2834,19 @@ const ClipBlock = React.memo(function ClipBlock({
         // token, not a reused one.
         "absolute top-1 bottom-1 overflow-hidden rounded-editor-clip border-2 px-1.5 text-micro text-white select-none will-change-transform",
         locked ? "cursor-not-allowed opacity-70" : "cursor-grab",
-        color,
-        selected ? "border-white ring-2 ring-editor-accent" : "border-transparent",
+        assetFailed ? "bg-editor-danger/20" : color,
+        selected ? "border-white ring-2 ring-editor-accent" : assetFailed ? "border-editor-danger" : "border-transparent",
         clip.groupId && "outline outline-dashed outline-1 outline-white/40"
       )}
       style={{ left, width }}
+      title={assetFailed ? "This clip's source file failed to upload — remove it and try again." : undefined}
       onPointerDown={locked ? selectOnly : startDrag("move")}
     >
+      {assetFailed && (
+        <div className="pointer-events-none absolute inset-0 z-[6] flex items-center justify-center gap-1 bg-editor-danger/10">
+          <TriangleAlert className="size-3 shrink-0 text-editor-danger" />
+        </div>
+      )}
       {/* Fix (2026-07-13) — real per-position video frames (see the
           filmstripCanvasRef effect above), not the single static repeated
           frame the 2026-07-12 visual-fidelity pass used. Falls back to

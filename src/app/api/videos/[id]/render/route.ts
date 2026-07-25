@@ -27,7 +27,7 @@ class AlreadyProcessedError extends Error {}
 // below), since that gate was previously only wired into dead code
 // (lib/creative/veo-multiscene-video.ts, never called from this live path).
 export async function POST(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const session = await requireSession();
@@ -36,6 +36,8 @@ export async function POST(
   }
 
   const { id } = await params;
+  const body = await req.json().catch(() => ({}));
+  const preferredVideoProviderId = typeof body.preferredProviderId === "string" ? body.preferredProviderId : null;
 
   const project = await prisma.videoProject.findFirst({
     where: { id, userId: session.user.id },
@@ -87,7 +89,7 @@ export async function POST(
     const updated = await prisma.$transaction(async (tx) => {
       const claim = await tx.videoProject.updateMany({
         where: { id: project.id, status: "SCRIPT_READY" },
-        data: { status: "QUEUED" },
+        data: { status: "QUEUED", preferredVideoProviderId },
       });
       if (claim.count === 0) {
         throw new AlreadyProcessedError();

@@ -100,3 +100,18 @@ export function convertUsdToCredits(costUsd: number, usdToInrRate: number): numb
   if (costUsd <= 0) return 0;
   return Math.ceil((costUsd * usdToInrRate * VIDEO_ACTION_MARGIN_MULTIPLIER) / VIDEO_ACTION_CREDIT_FLOOR_INR);
 }
+
+// User-facing video-provider selector (2026-07-24) — the real CHARGE
+// (called after a real render succeeds, with the provider that actually
+// served it) is provider-aware; checkVideoActionAccess()'s PRECHECK above
+// stays a flat, provider-agnostic estimate (the real provider isn't known
+// until after the vendor call). baseCredits is the flow's own normal cost
+// (VIDEO_ACTION_CREDIT_COSTS[actionKey].credits, or a template's own
+// creditCost for Marketing Templates, which has no action key) — passed in
+// rather than re-derived, so this one function works for both action-keyed
+// and DB-column-priced flows alike.
+export async function resolveVideoProviderCredits(baseCredits: number, providerId?: string): Promise<number> {
+  if (!providerId) return baseCredits;
+  const overrides = await getConfig("VIDEO_PROVIDER_CREDIT_COSTS");
+  return overrides[providerId] ?? baseCredits;
+}

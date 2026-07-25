@@ -3,7 +3,17 @@ import { getConfig } from "@/lib/admin/config";
 import { getUserTier } from "@/lib/credits/video-actions";
 import { InvalidStateError } from "./errors";
 import { getOwnedProject } from "./projects";
-import { canRemoveWatermark, computeProgressPercent, isValidCodecForFormat, resolveCodec, type ExportCodec, type ExportFormat, type ExportResolution } from "./export-engine";
+import {
+  canRemoveWatermark,
+  computeProgressPercent,
+  computeTotalFrames,
+  isValidCodecForFormat,
+  resolveCodec,
+  resolveExportDimensions,
+  type ExportCodec,
+  type ExportFormat,
+  type ExportResolution,
+} from "./export-engine";
 
 // Export job/history service (Module 10). EditorExport doubles as both the
 // queue row (status QUEUED is claimed atomically, same compare-and-swap
@@ -30,10 +40,48 @@ export async function createExport(input: CreateExportInput) {
     throw new InvalidStateError(`This project (${Math.round(project.durationMs / 1000)}s) exceeds the maximum exportable duration (${Math.round(maxDurationMs / 1000)}s).`);
   }
 
+  // Real bug fix (2026-07-24, found live during the codebase health check)
+  // — the duration check above says nothing about fps (up to 120) or
+  // resolution (up to 4K), so a single request combining all three near
+  // their individual maxima could demand ~216,000 individual PNG frame
+  // files with no guardrail at all. Checked here, before any real work
+  // (headless Chromium, frame capture, FFmpeg) or even a real DB row is
+  // created — see EDITOR_EXPORT_MAX_PIXEL_FRAMES's own doc comment for why
+  // pixel-frames (not any single dimension) is the right combined budget.
+  const { widthPx, heightPx } = resolveExportDimensions(input.resolution, project.widthPx, project.heightPx);
+  const totalFrames = computeTotalFrames(project.durationMs, input.fps);
+  const pixelFrames = widthPx * heightPx * totalFrames;
+  const maxPixelFrames = await getConfig("EDITOR_EXPORT_MAX_PIXEL_FRAMES");
+  if (pixelFrames > maxPixelFrames) {
+    throw new InvalidStateError(
+      `This export's combined resolution (${widthPx}×${heightPx}), frame rate (${input.fps}fps), and duration (${Math.round(project.durationMs / 1000)}s) exceed what a single export can render. Lower the resolution, frame rate, or trim the project, then try again.`
+    );
+  }
+
   if (input.codec && !isValidCodecForFormat(input.format, input.codec)) {
     throw new InvalidStateError(`${input.codec} is not a valid codec for ${input.format}.`);
   }
   const codec = resolveCodec(input.format, input.codec);
+
+  // Local-instant-preview (2026-07-24) — a clip can now legally reference a
+  // still-uploading (PENDING_UPLOAD/QUEUED_FOR_NORMALIZATION/NORMALIZING)
+  // asset while the real upload finishes in the background. That's fine for
+  // editing (the compositor renders a local blob override in the meantime)
+  // but export renders server-side off the real storage object, so it must
+  // block until every referenced asset has actually arrived.
+  const notReady = await prisma.editorClip.findFirst({
+    where: {
+      projectId: input.projectId,
+      assetId: { not: null },
+      asset: { status: { not: "READY" } },
+    },
+    select: { id: true, asset: { select: { status: true } } },
+  });
+  if (notReady) {
+    throw new InvalidStateError(
+      "One or more clips reference a file that is still uploading or processing. Wait for the upload to finish before exporting."
+    );
+  }
 
   // Server-side watermark tier gate — the real enforcement point. The
   // export panel's own UI gate (disabled checkbox for non-PREMIUM) is a

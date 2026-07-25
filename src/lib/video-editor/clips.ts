@@ -13,6 +13,7 @@ import { pruneInvalidTransitionsForTrack } from "./transitions";
 
 export interface AddClipInput {
   projectId: string;
+  userId: string;
   trackId: string;
   assetId?: string;
   startMs: number;
@@ -28,7 +29,21 @@ export async function addClip(input: AddClipInput) {
     if (!track) throw new InvalidStateError("Track not found in this project.");
 
     if (input.assetId) {
-      const asset = await tx.editorAsset.findUnique({ where: { id: input.assetId }, select: { id: true } });
+      // Real bug fix (2026-07-24, found live during the codebase health
+      // check) — this only ever checked the asset ROW exists, never that
+      // it belongs to the requesting user. Project ownership is already
+      // checked by every caller (see this file's own header comment), but
+      // the asset itself wasn't — any authenticated user who obtained
+      // another user's EditorAsset id (a leak, a shared link, a future
+      // collaboration feature) could attach it to their own clip, which
+      // then renders in their preview and gets included in their export.
+      // A LIBRARY-scope asset (admin-curated, shared) stays usable by
+      // anyone, same as every other user-facing query in this codebase
+      // already treats it (see EditorAsset.scope's own doc comment).
+      const asset = await tx.editorAsset.findFirst({
+        where: { id: input.assetId, OR: [{ scope: "LIBRARY" }, { userId: input.userId }] },
+        select: { id: true },
+      });
       if (!asset) throw new InvalidStateError("Asset not found.");
     }
 
@@ -194,12 +209,12 @@ export async function duplicateEditorClip(projectId: string, clipId: string) {
 }
 
 // Replace source: swaps only which asset a clip plays, leaving its
-// timing/content untouched. Existence-only check on the asset, matching
-// addClip's existing check above — EditorAsset is a user-level Media
-// Library, not project-scoped, same as every other clip-creation path here.
-export async function replaceClipSource(projectId: string, clipId: string, assetId: string) {
+// timing/content untouched. Same ownership check as addClip's own fix
+// above (2026-07-24) — an existence-only check let any authenticated user
+// attach another user's asset to their own clip via this route.
+export async function replaceClipSource(projectId: string, userId: string, clipId: string, assetId: string) {
   return prisma.$transaction(async (tx) => {
-    const asset = await tx.editorAsset.findUnique({ where: { id: assetId }, select: { id: true } });
+    const asset = await tx.editorAsset.findFirst({ where: { id: assetId, OR: [{ scope: "LIBRARY" }, { userId }] }, select: { id: true } });
     if (!asset) throw new InvalidStateError("Asset not found.");
 
     const claim = await tx.editorClip.updateMany({ where: { id: clipId, projectId }, data: { assetId } });

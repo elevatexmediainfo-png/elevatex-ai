@@ -195,6 +195,19 @@ export const CONFIG_REGISTRY = {
       // not a claim of exact vendor-invoice precision.
       assemblyai: { unit: "PER_SECOND", rate: 0.00025 },
       gpt5: { unit: "PER_1K_TOKENS", rate: 0.2 },
+      // Fixed 2026-07-23 — third occurrence of this exact bug class (see
+      // assemblyai/gpt5 above, Module 10): "gemini_images" was missing
+      // here, so every real gemini-3-pro-image ("Nano Banana Pro") call
+      // was silently tracked as $0 cost. Confirmed live via the B1
+      // relevance-fallback feature's own verification (2026-07-23) — real
+      // generation calls fired, computeCost() had nothing to look up.
+      // $0.134/image is Google's own published rate for 1K/2K output
+      // (ai.google.dev/gemini-api/docs/pricing, standard non-batch tier —
+      // 1120 output tokens at $120/1M) — this app's own adapter
+      // (gemini-images.provider.ts) always requests image_size: "1K", so
+      // this is the correct tier, not an estimate like assemblyai/gpt5
+      // above.
+      gemini_images: { unit: "PER_IMAGE", rate: 0.134 },
     } as const,
     label: "Generation cost rates (USD)",
     description:
@@ -322,6 +335,22 @@ export const CONFIG_REGISTRY = {
     default: 3,
     label: "Render queue concurrency",
     description: "Max scene/merge render jobs the worker processes in parallel at once.",
+    category: "render_policy",
+  },
+
+  // AI Film bulk-approve (2026-07-23) — "Approve storyboard & generate all
+  // scenes" fires one real Veo call per scene; unlike RENDER_QUEUE_CONCURRENCY
+  // above (a persistent background worker with its own retry/backoff),
+  // this runs as one interactive, in-request bounded-concurrency batch
+  // (scenes/generate-all/route.ts), so it gets its own, more conservative
+  // default — each Veo call is a genuinely long-running vendor operation
+  // (predictLongRunning + poll), and firing all of a film's scenes at once
+  // risks real per-account rate limits/cost bursts.
+  FILM_BULK_GENERATE_CONCURRENCY: {
+    schema: z.number().int().min(1).max(10),
+    default: 2,
+    label: "Film bulk-generate concurrency",
+    description: "Max scenes generated in parallel when a founder clicks \"Approve storyboard & generate all scenes\" on an AI Film project.",
     category: "render_policy",
   },
   RENDER_MAX_ATTEMPTS: {
@@ -625,10 +654,40 @@ export const CONFIG_REGISTRY = {
       // part of this feature's design — this exists to gate credits, not
       // to newly paywall the feature by subscription tier.
       ai_auto_edit: { credits: 10, minimumTier: "BASIC" },
+      // FILM storyboard preview images (2026-07-24) — one cheap real image
+      // per scene (1-2 scenes at the current 10/20s cap), generated at
+      // storyboard-review time so the user can see roughly what each scene
+      // will look like before committing to expensive video generation.
+      // Priced against gemini_images' real $0.134/image rate (the more
+      // expensive of the 2 real IMAGE providers, priced conservatively
+      // rather than assuming the cheaper one is always used) — same 2.5x
+      // margin / ₹6.66-per-credit-floor formula as every other fixed-price
+      // action here: $0.134 × ₹83/USD × 2.5 / 6.66 ≈ 4.17 → 5. Same
+      // PREMIUM gate as every other FILM action (film, film_scene).
+      film_storyboard_preview: { credits: 5, minimumTier: "PREMIUM" },
     } as const,
     label: "Video action credit costs",
     description:
       "Credits charged per AI video action (Animated Poster, and future Veo/Kling/Seedance/UGC actions), plus the minimum subscription tier required to access each one. Priced with margin against real vendor cost — see the AI Video plan.",
+    category: "credit_rules",
+  },
+
+  // User-facing video-provider selector (2026-07-24) — optional PER-
+  // PROVIDER credit cost override, keyed by ProviderConfig.providerId (e.g.
+  // "veo", "seedance2"), layered on top of VIDEO_ACTION_CREDIT_COSTS above.
+  // Empty by default: every provider charges its flow's normal fixed action
+  // cost (veo_lite/film_scene/a template's own creditCost) until an admin
+  // explicitly sets a different number here for a specific provider — this
+  // never changes existing pricing on its own. Only consulted when a user
+  // explicitly picks a provider (resolveVideoActionCredits(), lib/credits/
+  // video-actions.ts) — the system's own default auto-selection always uses
+  // the flat action cost, unaffected by this table.
+  VIDEO_PROVIDER_CREDIT_COSTS: {
+    schema: z.record(z.string(), z.number().int().min(0)),
+    default: {} as const,
+    label: "Video provider credit cost overrides",
+    description:
+      "Optional per-provider credit cost override for the user-facing video provider selector (e.g. charge Seedance differently from Veo). A provider not listed here charges its flow's normal cost from Video actions above.",
     category: "credit_rules",
   },
 
@@ -851,6 +910,27 @@ export const CONFIG_REGISTRY = {
     description: "Upper bound on a project's total duration eligible for export — a frame-by-frame headless-browser render's cost scales with duration × fps × resolution, so this is a real throughput guardrail, not an arbitrary limit. Wired in Module 10.",
     category: "video_editor_policy",
   },
+  // Real bug fix (2026-07-24, found live during the codebase health check)
+  // — EDITOR_EXPORT_MAX_DURATION_MS alone caps duration, but fps (up to
+  // 120) and resolution (up to 4K) were independently uncapped, so a
+  // single legitimate-looking request (4K/120fps/30min) could demand
+  // ~216,000 individual PNG frame files with no combined guardrail —
+  // real disk exhaustion risk, and with EDITOR_EXPORT_QUEUE_CONCURRENCY
+  // defaulting to 1, a single such job (or one that simply hangs) occupies
+  // the only export worker slot for every user on the instance. This caps
+  // the actual cost driver directly — total output pixels (width × height
+  // × totalFrames) — rather than any one dimension alone, so a low-res
+  // long export and a high-res short one are judged by the same real
+  // resource budget. Default permits a full 4K/30fps/30min export
+  // (~447.9 billion) with headroom, while rejecting 4K/120fps/30min
+  // (~1.79 trillion, 4x over) — tune per your own hardware if needed.
+  EDITOR_EXPORT_MAX_PIXEL_FRAMES: {
+    schema: z.number().int().min(1_000_000),
+    default: 500_000_000_000,
+    label: "Editor export max total pixel-frames (width × height × frame count)",
+    description: "Rejects an export request whose combined resolution × fps × duration exceeds this budget, before any real work starts — the actual resource driver a duration-only cap misses. See EDITOR_EXPORT_MAX_DURATION_MS for the duration-only guardrail this complements.",
+    category: "video_editor_policy",
+  },
   EDITOR_NORMALIZE_QUEUE_CONCURRENCY: {
     schema: z.number().int().min(1).max(8),
     default: 1,
@@ -884,6 +964,13 @@ export const CONFIG_REGISTRY = {
     default: true,
     label: "AI Auto-Editor: stock-only b-roll (no generation)",
     description: "Founder policy (2026-07-18) — while true, AI Auto-Edit b-roll resolution never spends real generation credits: the resolver always searches stock (Pexels/Pixabay/Openverse/Coverr/Unsplash, whichever are enabled) first regardless of GPT's own stock-vs-generate judgment, and only falls back to a real generateImage()/renderVideo() call as an absolute last resort when literally zero stock providers return a usable result for that slot. The value at job-creation time is captured onto the job itself (AiEditJob.brollStockOnly) so a job's behavior stays consistent even if this default is flipped later — turn it back off here (no prompt-engineering pass needed) once generation is wanted again.",
+    category: "video_editor_policy",
+  },
+  AI_EDIT_BROLL_RELEVANCE_FALLBACK_THRESHOLD: {
+    schema: z.number().min(0).max(1),
+    default: 0.5,
+    label: "AI Auto-Editor: b-roll relevance fallback threshold",
+    description: "Founder policy (2026-07-23) — while AI_EDIT_BROLL_STOCK_ONLY is on, the resolver still tries stock first, but if the best real match's relevance score (fraction of the search query's words actually present in the stock candidate's title/tags, 0-1) falls below this, it falls back to real generation for just that one item instead of placing a weak/irrelevant stock match. Calibrated against 39 real production search queries: 0.5 cleanly separated 2 genuinely bad matches from 37 acceptable-to-good ones (a ~5% real-world fallback rate). Same 'captured onto the job at creation time' pattern as AI_EDIT_BROLL_STOCK_ONLY (AiEditJob.brollRelevanceFallbackThreshold) — retune here without a prompt-engineering pass.",
     category: "video_editor_policy",
   },
 } as const;

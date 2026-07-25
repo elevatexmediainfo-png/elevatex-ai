@@ -1,7 +1,14 @@
+import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 
 import { editorApi } from "../api-client";
+import { useEditorStoreApi } from "./store";
+import { createAddClipCommand, createAddTrackAndClipCommand } from "./commands";
+import { registerLocalPreview, clearLocalPreview } from "./local-preview-registry";
 import type {
+  AiEditJobStatus,
+  AiEditJobView,
   AssetView,
   ClipView,
   EditorAudioSubtype,
@@ -21,6 +28,7 @@ import type { ClipTransform } from "@/lib/video-editor/transform";
 import { computePeaksFromChannelData } from "@/lib/video-editor/audio";
 import type { TransitionDirection, TransitionEasing, TransitionType } from "@/lib/video-editor/transition-engine";
 import type { PricingTierLevel } from "@/lib/credits/video-actions";
+import type { ReeditClipResult } from "@/lib/video-editor/ai-reedit";
 
 // TanStack Query hooks for the Cloud Video Editor workspace (Milestone 24).
 // Server state only — every panel that needs tracks/clips/assets calls
@@ -53,7 +61,7 @@ export function useEditorProjectQuery(projectId: string, initialData?: ProjectWo
 // below keeps invalidating every variant of this query via TanStack Query's
 // default prefix matching — including the new project-scoped one, whose key
 // extends this same array rather than replacing it.
-function assetsQueryKey(projectId?: string) {
+export function assetsQueryKey(projectId?: string) {
   return projectId ? (["editor", "assets", projectId] as const) : (["editor", "assets"] as const);
 }
 
@@ -68,6 +76,16 @@ export function useEditorAssetsQuery(initialData?: AssetView[], projectId?: stri
     queryFn: () =>
       editorApi<{ assets: AssetView[] }>(`/api/editor/assets${projectId ? `?projectId=${projectId}` : ""}`, "GET").then((d) => d.assets),
     initialData,
+    // Upload normalization (2026-07-19) — QUEUED_FOR_NORMALIZATION/
+    // NORMALIZING resolve asynchronously in the background (the async
+    // normalize queue worker), unlike the old synchronous confirm-upload
+    // flow where a READY response came back in the same request. Same
+    // "poll while anything's still in flight" pattern already used for
+    // exports/AI-edit jobs (useEditorExportsQuery/useAiEditJobsQuery).
+    refetchInterval: (query) => {
+      const stillProcessing = query.state.data?.some((a) => a.status === "QUEUED_FOR_NORMALIZATION" || a.status === "NORMALIZING");
+      return stillProcessing ? 2000 : false;
+    },
   });
 }
 
@@ -79,8 +97,8 @@ function useInvalidateProject(projectId: string) {
 export function useAddTrackMutation(projectId: string) {
   const invalidate = useInvalidateProject(projectId);
   return useMutation({
-    mutationFn: ({ kind, audioSubtype }: { kind: EditorTrackKind; audioSubtype?: EditorAudioSubtype }) =>
-      editorApi<{ track: TrackView }>(`/api/editor/projects/${projectId}/tracks`, "POST", { kind, audioSubtype }),
+    mutationFn: ({ kind, audioSubtype, insertBelowOrder }: { kind: EditorTrackKind; audioSubtype?: EditorAudioSubtype; insertBelowOrder?: number }) =>
+      editorApi<{ track: TrackView }>(`/api/editor/projects/${projectId}/tracks`, "POST", { kind, audioSubtype, insertBelowOrder }),
     onSuccess: invalidate,
   });
 }
@@ -290,6 +308,19 @@ export function useReplaceClipSourceMutation(projectId: string) {
   });
 }
 
+// Phase 12 Module 9 — interpretation-only: this call never changes
+// server state by itself (no `onSuccess: invalidate`), it just returns a
+// validated instruction interpretation for the caller to map onto a real
+// Command and runCommand() — the SAME mutation hooks above are what
+// actually mutate anything, once the panel decides what to do with the
+// response.
+export function useReeditClipMutation(projectId: string) {
+  return useMutation({
+    mutationFn: ({ clipId, instruction }: { clipId: string; instruction: string }) =>
+      editorApi<ReeditClipResult>(`/api/editor/projects/${projectId}/clips/${clipId}/re-edit`, "POST", { instruction }),
+  });
+}
+
 export function useGroupClipsMutation(projectId: string) {
   const invalidate = useInvalidateProject(projectId);
   return useMutation({
@@ -439,18 +470,50 @@ export function useRestoreVersionMutation(projectId: string) {
 // meant to stay available across every project (a brand font, unlike a
 // project's own media upload, isn't tied to one project) — omitting it
 // there preserves that intentionally-global behavior unchanged.
+// Fix (2026-07-21) — plain fetch() has no upload-progress API at all (only
+// download/response-body progress is observable), so a large PUT to R2
+// looked visually identical whether it was genuinely still transferring or
+// had silently stalled — a real, founder-reported "feels broken" complaint.
+// XMLHttpRequest is the only browser API that exposes real upload progress
+// (xhr.upload.onprogress), so the PUT step specifically uses it instead of
+// fetch — everything else (minting the URL, confirm-upload) stays on the
+// existing editorApi()/fetch() convention, this is a narrow, targeted swap.
+function putWithProgress(url: string, file: File, onProgress?: (loadedBytes: number, totalBytes: number) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", url);
+    xhr.setRequestHeader("Content-Type", file.type);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress?.(e.loaded, e.total);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new Error("Upload failed. Please try again."));
+    };
+    xhr.onerror = () => reject(new Error("Upload failed. Please try again."));
+    xhr.send(file);
+  });
+}
+
 export function useUploadEditorAssetMutation(projectId?: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ file, kind }: { file: File; kind: AssetView["kind"] }) => {
+    mutationFn: async ({
+      file,
+      kind,
+      onProgress,
+    }: {
+      file: File;
+      kind: AssetView["kind"];
+      onProgress?: (loadedBytes: number, totalBytes: number) => void;
+    }) => {
       const { assetId, uploadUrl } = await editorApi<{ assetId: string; uploadUrl: string }>(
         "/api/editor/assets/upload-url",
         "POST",
         { filename: file.name, contentType: file.type, kind, fileSizeBytes: file.size, projectId }
       );
 
-      const putRes = await fetch(uploadUrl, { method: "PUT", body: file, headers: { "Content-Type": file.type } });
-      if (!putRes.ok) throw new Error("Upload failed. Please try again.");
+      await putWithProgress(uploadUrl, file, onProgress);
 
       const metadata = await readClientMediaMetadata(file, kind);
       return editorApi<{ asset: AssetView }>(`/api/editor/assets/${assetId}/confirm-upload`, "POST", metadata);
@@ -508,6 +571,178 @@ function readClientMediaMetadata(
     });
   }
   return Promise.resolve({});
+}
+
+// Local-instant-preview (2026-07-24) — selecting a video file for manual
+// editing must not block on the real R2 upload: this creates the real,
+// persisted EditorAsset + a real, persisted clip pointing at it IMMEDIATELY
+// (addClip only ever validates the asset ROW exists, never its status — see
+// lib/video-editor/clips.ts's addClip), registers a local blob URL as that
+// asset's stand-in preview (local-preview-registry.ts, consulted by
+// preview-window.tsx's assetById), then uploads+confirms in the background.
+// Deliberately NOT built on useUploadEditorAssetMutation above — that hook's
+// contract (mint → PUT → confirm, one atomic mutation) is relied on as-is by
+// Brand Kit's font upload and is not the right shape here (this needs to
+// return control to the caller after the mint+placeholder step, long before
+// the PUT finishes) — reuses its private putWithProgress/readClientMediaMetadata
+// helpers instead of duplicating them.
+//
+// Same reuse-existing-unlocked-track-or-create-new-one resolution as
+// ensureSourceAssetOnTimeline (ai-auto-edit-panel.tsx) and timeline-panel.tsx's
+// own drag-drop (dropAssetOntoSuitableTrack) — this is the same "asset lands
+// on the timeline" operation those already established, just triggered from
+// file-select instead of an AI plan or a drag gesture.
+export function useInstantAddVideoClip(projectId: string) {
+  const queryClient = useQueryClient();
+  const storeApi = useEditorStoreApi();
+  const addClipMutation = useAddClipMutation(projectId);
+  const deleteClipMutation = useDeleteClipMutation(projectId);
+  const addTrackMutation = useAddTrackMutation(projectId);
+  const removeTrackMutation = useRemoveTrackMutation(projectId);
+
+  return React.useCallback(
+    async (file: File, onProgress?: (loadedBytes: number, totalBytes: number) => void) => {
+      const { assetId, uploadUrl } = await editorApi<{ assetId: string; uploadUrl: string }>(
+        "/api/editor/assets/upload-url",
+        "POST",
+        { filename: file.name, contentType: file.type, kind: "VIDEO", fileSizeBytes: file.size, projectId }
+      );
+
+      const blobUrl = URL.createObjectURL(file);
+      const localMeta = await probeLocalVideoMetadata(blobUrl);
+      registerLocalPreview(assetId, { blobUrl, ...localMeta });
+
+      const placeholder: AssetView = {
+        id: assetId,
+        kind: "VIDEO",
+        status: "PENDING_UPLOAD",
+        url: blobUrl,
+        originalFilename: file.name,
+        durationSeconds: localMeta.durationSeconds ?? null,
+        widthPx: localMeta.widthPx ?? null,
+        heightPx: localMeta.heightPx ?? null,
+        createdAt: new Date().toISOString(),
+        waveformPeaks: null,
+        thumbnailUrl: null,
+        filmstripUrl: null,
+        filmstripFrameCount: null,
+      };
+      queryClient.setQueryData<AssetView[]>(assetsQueryKey(), (old) => [...(old ?? []), placeholder]);
+      queryClient.setQueryData<AssetView[]>(assetsQueryKey(projectId), (old) => [...(old ?? []), placeholder]);
+
+      const durationMs = Math.max(1000, Math.round((localMeta.durationSeconds ?? 0) * 1000));
+      const ws = queryClient.getQueryData<ProjectWorkspaceData>(projectQueryKey(projectId));
+      // Command deps: only addClip/deleteClip/addTrack/removeTrack are ever
+      // actually invoked by createAddClipCommand/createAddTrackAndClipCommand
+      // (both do/undo bodies only touch those four) — the rest are stubbed
+      // the same way right-properties-panel.tsx/fonts-section.tsx already
+      // stub a deps object that only needs one or two real methods.
+      //
+      // addClip/addTrack splice their own real server response straight into
+      // the cache (rather than relying on their mutation's own onSuccess,
+      // which only invalidates — marks stale + a BACKGROUND refetch, no
+      // guarantee it's landed by the time this function returns). Real bug
+      // found live here: a plain awaited queryClient.refetchQueries() after
+      // the command fixed the compositor/export-panel staleness, but added
+      // a full extra network round trip to every add — splicing the result
+      // we already have is both correct (it's the server's own row, not a
+      // guess) and faster, same principle as useUpdateTrackMutation's own
+      // optimistic-update triad above, just using the real response instead
+      // of a client-predicted one since we already have to wait for it.
+      //
+      // Second real bug found live here: the mutation's OWN onSuccess
+      // (invalidate) fires its background refetch concurrently with this
+      // splice, and that refetch can legitimately WIN the race (it's a
+      // plain GET, often faster than however long this function takes to
+      // resume after the POST) — confirmed live via a duplicate-React-key
+      // warning, the background refetch had already landed the same clip
+      // by the time the splice ran unconditionally. Filtering out any
+      // existing same-id entry before appending makes the splice idempotent
+      // regardless of which lands first.
+      const commandDeps = {
+        updateClip: () => Promise.reject(new Error("not used")),
+        deleteClip: (clipId: string) => deleteClipMutation.mutateAsync(clipId),
+        addClip: async (patch: AddClipPatch) => {
+          const result = await addClipMutation.mutateAsync(patch);
+          queryClient.setQueryData<ProjectWorkspaceData>(projectQueryKey(projectId), (old) =>
+            old ? { ...old, clips: [...old.clips.filter((c) => c.id !== result.clip.id), result.clip] } : old
+          );
+          return result;
+        },
+        splitClip: () => Promise.reject(new Error("not used")),
+        rippleDeleteClip: () => Promise.reject(new Error("not used")),
+        duplicateClip: () => Promise.reject(new Error("not used")),
+        replaceClipSource: () => Promise.reject(new Error("not used")),
+        groupClips: () => Promise.reject(new Error("not used")),
+        ungroupClips: () => Promise.reject(new Error("not used")),
+        restoreTransition: () => Promise.reject(new Error("not used")),
+        addTrack: async (input: Parameters<typeof addTrackMutation.mutateAsync>[0]) => {
+          const result = await addTrackMutation.mutateAsync(input);
+          queryClient.setQueryData<ProjectWorkspaceData>(projectQueryKey(projectId), (old) =>
+            old ? { ...old, tracks: [...old.tracks.filter((t) => t.id !== result.track.id), result.track] } : old
+          );
+          return result;
+        },
+        removeTrack: (trackId: string) => removeTrackMutation.mutateAsync(trackId),
+      } as const;
+
+      if (ws) {
+        const existingTrack = ws.tracks.find((t) => t.kind === "VIDEO" && !t.isLocked);
+        if (existingTrack) {
+          const clipsOnTrack = ws.clips.filter((c) => c.trackId === existingTrack.id);
+          const startMs = clipsOnTrack.reduce((max, c) => Math.max(max, c.startMs + c.durationMs), 0);
+          await storeApi
+            .getState()
+            .runCommand(createAddClipCommand(commandDeps, { trackId: existingTrack.id, assetId, startMs, durationMs }));
+        } else {
+          await storeApi
+            .getState()
+            .runCommand(createAddTrackAndClipCommand(commandDeps, { kind: "VIDEO" }, { assetId, startMs: 0, durationMs }));
+        }
+      }
+
+      // Background upload — same PUT-then-confirm shape as
+      // useUploadEditorAssetMutation, just not awaited by the caller.
+      try {
+        await putWithProgress(uploadUrl, file, onProgress);
+        const metadata = await readClientMediaMetadata(file, "VIDEO");
+        await editorApi<{ asset: AssetView }>(`/api/editor/assets/${assetId}/confirm-upload`, "POST", metadata);
+        await queryClient.invalidateQueries({ queryKey: assetsQueryKey() });
+        await queryClient.invalidateQueries({ queryKey: assetsQueryKey(projectId) });
+      } catch (err) {
+        // Real bug fix (2026-07-24, found live during the codebase health
+        // check) — this used to only clear the local preview and toast; the
+        // asset itself stayed PENDING_UPLOAD forever in the DB, so the
+        // clip looked completely healthy (no FAILED badge anywhere) once
+        // the toast disappeared. markEditorAssetUploadFailed() is scoped to
+        // PENDING_UPLOAD only, so it can't clobber a real confirm-upload
+        // success that happens to land around the same time. Fire-and-
+        // forget (not awaited into the outer catch) since the user-facing
+        // failure is already real regardless of whether this specific
+        // follow-up call succeeds.
+        void editorApi(`/api/editor/assets/${assetId}`, "PATCH", { action: "mark-upload-failed" })
+          .then(() => queryClient.invalidateQueries({ queryKey: assetsQueryKey() }))
+          .then(() => queryClient.invalidateQueries({ queryKey: assetsQueryKey(projectId) }))
+          .catch(() => {});
+        clearLocalPreview(assetId);
+        toast.error(`"${file.name}" failed to upload. The clip on your timeline is marked failed — remove it and try again.`);
+        throw err;
+      }
+    },
+    [projectId, queryClient, storeApi, addClipMutation, deleteClipMutation, addTrackMutation, removeTrackMutation]
+  );
+}
+
+function probeLocalVideoMetadata(blobUrl: string): Promise<{ durationSeconds?: number; widthPx?: number; heightPx?: number }> {
+  return new Promise((resolve) => {
+    const el = document.createElement("video");
+    el.preload = "metadata";
+    el.onloadedmetadata = () => {
+      resolve({ durationSeconds: el.duration, widthPx: el.videoWidth || undefined, heightPx: el.videoHeight || undefined });
+    };
+    el.onerror = () => resolve({});
+    el.src = blobUrl;
+  });
 }
 
 // Decodes the WHOLE file via Web Audio (decodeAudioData needs the full
@@ -602,6 +837,45 @@ export function useCreateExportMutation(projectId: string) {
   });
 }
 
+function aiEditJobsQueryKey(projectId: string) {
+  return ["editor", "project", projectId, "ai-edit-jobs"] as const;
+}
+
+const AI_EDIT_JOB_TERMINAL_STATUSES = new Set<AiEditJobStatus>(["READY_FOR_REVIEW", "FAILED", "CANCELLED"]);
+
+// Phase 12 Module 2 — same polling shape as useExportsQuery above (poll
+// while anything is still in flight, stop once everything's terminal).
+export function useAiEditJobsQuery(projectId: string) {
+  return useQuery({
+    queryKey: aiEditJobsQueryKey(projectId),
+    queryFn: () => editorApi<{ jobs: AiEditJobView[] }>(`/api/editor/projects/${projectId}/ai-edit-jobs`, "GET").then((d) => d.jobs),
+    refetchInterval: (query) => {
+      const stillActive = query.state.data?.some((j) => !AI_EDIT_JOB_TERMINAL_STATUSES.has(j.status));
+      return stillActive ? 2000 : false;
+    },
+  });
+}
+
+export function useCreateAiEditJobMutation(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { assetId: string; stylePreset?: string; brollDensity?: "MINIMAL" | "BALANCED" | "HEAVY"; brollStockOnly?: boolean; script?: string }) =>
+      editorApi<{ job: AiEditJobView }>(`/api/editor/projects/${projectId}/ai-edit-jobs`, "POST", input),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: aiEditJobsQueryKey(projectId) }),
+  });
+}
+
+// Real bug fix (2026-07-24, found live during the codebase health check) —
+// same shape as useCancelExportMutation right below: this pipeline had no
+// cancel mutation at all before this.
+export function useCancelAiEditJobMutation(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (jobId: string) => editorApi(`/api/editor/projects/${projectId}/ai-edit-jobs/${jobId}`, "DELETE"),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: aiEditJobsQueryKey(projectId) }),
+  });
+}
+
 export function useCancelExportMutation(projectId: string) {
   const queryClient = useQueryClient();
   return useMutation({
@@ -679,7 +953,14 @@ export interface LibraryAssetView {
   id: string;
   kind: "VIDEO" | "AUDIO" | "IMAGE" | "ANIMATION";
   category: string;
-  status: "PENDING_UPLOAD" | "READY" | "FAILED";
+  // Upload normalization (2026-07-19) — widened to match the full
+  // EditorAssetStatus enum for structural compatibility with a real DB
+  // row; in practice a LIBRARY-scope row never passes through
+  // confirmEditorAssetUpload (asset-library.ts creates them straight to
+  // READY), so QUEUED_FOR_NORMALIZATION/NORMALIZING never actually occur
+  // here — same "widened for compatibility, not because it happens"
+  // precedent as EditorAssetView.kind's own doc comment in assets.ts.
+  status: "PENDING_UPLOAD" | "QUEUED_FOR_NORMALIZATION" | "NORMALIZING" | "READY" | "FAILED";
   url: string;
   thumbnailUrl: string | null;
   originalFilename: string;
@@ -714,6 +995,7 @@ export interface StockSearchResultView {
   downloadUrl: string;
   kind: string;
   attribution?: string;
+  attributionRequired?: boolean;
   widthPx?: number;
   heightPx?: number;
   durationSeconds?: number;

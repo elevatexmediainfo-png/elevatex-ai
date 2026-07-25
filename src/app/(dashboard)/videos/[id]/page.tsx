@@ -38,8 +38,17 @@ export default async function VideoDetailPage({
   // this reuses the existing per-scene GenerationLog rows (Milestone 10
   // Part 8's cost-tracking table already records providerId + sceneId for
   // every scene_render/scene_image call) — no new persistence needed.
+  //
+  // Extended to GENERATED (2026-07-23) — this check was TALKING_HEAD_UPLOAD-
+  // only, so a GENERATED project whose scenes silently mock-fell-back could
+  // reach COMPLETED with zero indication anything was wrong (confirmed
+  // live: 10 of 16 real GENERATED projects in production). New renders now
+  // hard-fail instead of reaching COMPLETED at all (processSceneRenderJob's
+  // own fix, lib/render/pipeline.ts) — this banner is what surfaces that
+  // history honestly for the projects that already got stuck in that state
+  // before the hard-fail existed, rather than leaving them looking fine.
   const hasMockFallbackScenes =
-    project.sourceType === "TALKING_HEAD_UPLOAD" &&
+    (project.sourceType === "TALKING_HEAD_UPLOAD" || project.sourceType === "GENERATED") &&
     (await prisma.generationLog.findFirst({
       where: {
         videoProjectId: project.id,

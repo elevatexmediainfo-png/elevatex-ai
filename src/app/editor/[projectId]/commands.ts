@@ -1,6 +1,7 @@
 import type { AddClipPatch, AddTransitionPatch, UpdateClipPatch, UpdateTrackPatch, UpdateTransitionPatch } from "./queries";
 import type { ClipContent, ClipView, EditorAudioSubtype, EditorTrackKind, TrackView, TransitionView } from "../types";
-import type { ClipTransform } from "@/lib/video-editor/transform";
+import { DEFAULT_CLIP_TRANSFORM, DEFAULT_KEYFRAME_EASING, type ClipTransform } from "@/lib/video-editor/transform";
+import type { TransitionType } from "@/lib/video-editor/transition-engine";
 
 // Command-pattern plumbing for the Timeline's mutating operations (Module
 // 2) — every operation below is performed by constructing one of these and
@@ -154,6 +155,32 @@ export function createTrimClipCommand(
   };
 }
 
+// A plain "add one clip to an EXISTING track" command — undo simply
+// deletes it. Small and easy to miss because most manual-editing add
+// paths don't need it (a media-library drag either lands on an existing
+// suitable track via a raw mutation call, or hits
+// createAddTrackAndClipCommand below when it needs a NEW track too) — but
+// the AI Auto-Editor's translator (Phase 12 Module 1) very often DOES
+// need "add a clip to a track that already exists" as its own atomic,
+// undo-able step (captions/broll/stickers/sfx/music all resolve to an
+// existing track most of the time), and the standing rule for all of
+// Phase 12 is that every AI-driven edit goes through the Command pattern
+// — this fills that real, previously-unfilled gap rather than having the
+// translator call deps.addClip directly (outside the pattern).
+export function createAddClipCommand(deps: ClipCommandDeps, patch: AddClipPatch): EditorCommand {
+  let currentClipId: string | null = null;
+  return {
+    label: "Add Clip",
+    execute: async () => {
+      const { clip } = await deps.addClip(patch);
+      currentClipId = clip.id;
+    },
+    undo: async () => {
+      if (currentClipId) await deps.deleteClip(currentClipId);
+    },
+  };
+}
+
 // Best-effort undo: deletes the newly-created second half and restores the
 // first half's original duration. Correct as long as nothing else touched
 // either half between execute() and undo().
@@ -211,6 +238,164 @@ export function createRippleDeleteCommand(deps: ClipCommandDeps, deletedClip: Cl
           .filter((c) => c.id !== deletedClip.id)
           .map((c) => deps.updateClip({ clipId: c.id, patch: { startMs: c.startMs } }))
       );
+    },
+  };
+}
+
+export interface SceneRemovalSegment {
+  // Repacked position on the SAME track, replacing originalClip.
+  startMs: number;
+  durationMs: number;
+  // originalClip.trimStartMs + this segment's own offset within the
+  // original clip — preserves which part of the SOURCE media each
+  // surviving segment shows.
+  trimStartMs: number;
+}
+
+// Phase 12 Module 1 (AI Auto-Editor) — cuts one or more unwanted windows
+// (silence/filler/bad-take/etc, see ai-timeline-translator.ts's
+// normalizeSceneRemovalWindows) out of a single clip in ONE atomic,
+// undo-able step. Deliberately NOT a split+split+ripple-delete chain per
+// window: createCompositeCommand runs its children in PARALLEL
+// (Promise.all, see below), with no way to thread a split's server-
+// generated second-half id into a later dependent step — sequential
+// chaining would need a bespoke closure per window. Instead: delete the
+// original clip and re-add each SURVIVING segment (computed by the
+// translator as the complement of the removal windows) at repacked,
+// gap-free positions — the exact same clean shape createRippleDeleteCommand's
+// own undo already uses (delete + recreate-from-snapshot), just applied
+// once to N pieces instead of one. `laterClipsOnTrack` (everything on this
+// track starting at/after the original clip's end) shifts left ONCE by
+// the total removed duration to close the gap.
+// Phase 12 Module 4 — a zoom keyframe pair to apply to ONE surviving
+// segment, already resolved to that segment's OWN clip-relative time by
+// ai-timeline-translator.ts's mapZoomToSurvivingSegments (which also owns
+// the "which segment does this zoom window land in, after removal"
+// mapping — commands.ts stays a dumb executor, same architectural split
+// as everywhere else in this file). Index-aligned with survivingSegments.
+export interface SegmentZoomKeyframes {
+  scaleFrom: number;
+  scaleTo: number;
+  startMs: number;
+  endMs: number;
+}
+
+// Phase 12 Module 6 — a transition to add between two ADJACENT surviving
+// segments, by INDEX (afterSegmentIndex connects survivingSegments[i] to
+// survivingSegments[i+1]) — the same "can't be an independent parallel
+// command" problem zoom already hit: GPT can't know real clip ids for
+// segments that don't exist yet, and even a resolved index-pair would
+// race createAddTransitionCommand against this command's own delete/
+// recreate if run separately. Folded in here instead, applied after
+// every segment is created (so both sides of the pair have real ids) —
+// segments are already gap-free adjacent by construction
+// (computeSurvivingSegments), exactly the precondition
+// createAddTransitionCommand's own ripple-shift expects.
+export interface SegmentBoundaryTransition {
+  afterSegmentIndex: number;
+  type: TransitionType;
+  durationMs: number;
+}
+
+export function createSceneRemovalCommand(
+  deps: ClipCommandDeps,
+  originalClip: ClipView,
+  survivingSegments: SceneRemovalSegment[],
+  laterClipsOnTrack: { id: string; startMs: number }[],
+  // Phase 12 Module 4 — zoom items targeting THIS SAME clip can't be a
+  // separate, independent createUpdateTransformCommand run through the
+  // parallel createCompositeCommand: that command would target
+  // originalClip.id, which THIS command deletes as part of the same
+  // batch — confirmed live (a real 500, "No record was found for an
+  // update," P2025) the first time a scripted test actually exercised a
+  // plan with both sceneRemoval AND zoom on the same clip. Folding the
+  // zoom's transform update into THIS command's own sequential execute()
+  // (applied to the newly-created segment clip, right after it's
+  // created, before anything else can race it) is the same "write one
+  // bespoke sequential command instead of reaching for the parallel
+  // composite" fix Module 1's own doc comment already prescribes for
+  // exactly this class of problem.
+  zoomBySegment: (SegmentZoomKeyframes | undefined)[] = [],
+  // Phase 12 Module 6 — see SegmentBoundaryTransition's own doc comment.
+  // Undo needs no special handling: EditorTransition rows cascade-delete
+  // (onDelete: Cascade on both clipA/clipB relations) the moment either
+  // side's clip is deleted, which undo() below already does for every
+  // created segment.
+  segmentBoundaryTransitions: SegmentBoundaryTransition[] = [],
+  transitionDeps?: TransitionCommandDeps
+): EditorCommand {
+  let currentOriginalId: string | null = originalClip.id;
+  let createdSegmentIds: string[] = [];
+  const totalShiftMs = originalClip.durationMs - survivingSegments.reduce((sum, s) => sum + s.durationMs, 0);
+
+  return {
+    label: "AI Scene Removal",
+    execute: async () => {
+      const targetId = currentOriginalId ?? originalClip.id;
+      await deps.deleteClip(targetId);
+      currentOriginalId = null;
+      const created: string[] = [];
+      for (let i = 0; i < survivingSegments.length; i++) {
+        const seg = survivingSegments[i];
+        const { clip } = await deps.addClip({
+          trackId: originalClip.trackId,
+          assetId: originalClip.assetId ?? undefined,
+          startMs: seg.startMs,
+          durationMs: seg.durationMs,
+          trimStartMs: seg.trimStartMs,
+          content: (originalClip.content as Record<string, unknown> | null) ?? undefined,
+          transform: originalClip.transform ?? undefined,
+        });
+        created.push(clip.id);
+
+        const zoom = zoomBySegment[i];
+        if (zoom) {
+          const previous = originalClip.transform ?? DEFAULT_CLIP_TRANSFORM;
+          const next: ClipTransform = {
+            ...previous,
+            scale: {
+              value: zoom.scaleFrom,
+              keyframes: [
+                { id: `ai-zoom-${clip.id}-in`, timeMs: zoom.startMs, value: zoom.scaleFrom, easing: DEFAULT_KEYFRAME_EASING },
+                { id: `ai-zoom-${clip.id}-out`, timeMs: zoom.endMs, value: zoom.scaleTo, easing: DEFAULT_KEYFRAME_EASING },
+              ],
+            },
+          };
+          await deps.updateClip({ clipId: clip.id, patch: { transform: next } });
+        }
+      }
+      createdSegmentIds = created;
+      if (totalShiftMs > 0) {
+        await Promise.all(laterClipsOnTrack.map((c) => deps.updateClip({ clipId: c.id, patch: { startMs: c.startMs - totalShiftMs } })));
+      }
+      // Runs AFTER every segment exists — both sides of any boundary
+      // pair now have real ids, so this is safe as a sequential tail,
+      // never a race against the creates above.
+      if (transitionDeps) {
+        for (const t of segmentBoundaryTransitions) {
+          const clipAId = created[t.afterSegmentIndex];
+          const clipBId = created[t.afterSegmentIndex + 1];
+          if (!clipAId || !clipBId) continue; // out-of-range index — already warned at translate time
+          await transitionDeps.addTransition({ trackId: originalClip.trackId, clipAId, clipBId, type: t.type, durationMs: t.durationMs });
+        }
+      }
+    },
+    undo: async () => {
+      if (totalShiftMs > 0) {
+        await Promise.all(laterClipsOnTrack.map((c) => deps.updateClip({ clipId: c.id, patch: { startMs: c.startMs } })));
+      }
+      await Promise.all(createdSegmentIds.map((id) => deps.deleteClip(id)));
+      createdSegmentIds = [];
+      const { clip } = await deps.addClip({
+        trackId: originalClip.trackId,
+        assetId: originalClip.assetId ?? undefined,
+        startMs: originalClip.startMs,
+        durationMs: originalClip.durationMs,
+        trimStartMs: originalClip.trimStartMs,
+        content: (originalClip.content as Record<string, unknown> | null) ?? undefined,
+        transform: originalClip.transform ?? undefined,
+      });
+      currentOriginalId = clip.id;
     },
   };
 }
@@ -302,13 +487,13 @@ export function createReorderTrackCommand(deps: TrackReorderDeps, trackId: strin
 // removes the clip then the track it was auto-created on — correct as long
 // as nothing else was added to that track between execute() and undo().
 export interface AddTrackAndClipDeps extends ClipCommandDeps {
-  addTrack: (input: { kind: EditorTrackKind; audioSubtype?: EditorAudioSubtype }) => Promise<{ track: TrackView }>;
+  addTrack: (input: { kind: EditorTrackKind; audioSubtype?: EditorAudioSubtype; insertBelowOrder?: number }) => Promise<{ track: TrackView }>;
   removeTrack: (trackId: string) => Promise<unknown>;
 }
 
 export function createAddTrackAndClipCommand(
   deps: AddTrackAndClipDeps,
-  trackInput: { kind: EditorTrackKind; audioSubtype?: EditorAudioSubtype },
+  trackInput: { kind: EditorTrackKind; audioSubtype?: EditorAudioSubtype; insertBelowOrder?: number },
   clipInput: Omit<AddClipPatch, "trackId">
 ): EditorCommand {
   let createdTrackId: string | null = null;
@@ -324,6 +509,153 @@ export function createAddTrackAndClipCommand(
     undo: async () => {
       if (createdClipId) await deps.deleteClip(createdClipId);
       if (createdTrackId) await deps.removeTrack(createdTrackId);
+    },
+  };
+}
+
+// Phase 12 Module 4 — real bug fix, not a new feature: ai-timeline-
+// translator.ts's translateCaptions() maps EVERY AICaption to its own
+// independent createAddTrackAndClipCommand above when no SUBTITLE track
+// exists yet, because it checks the STATIC snapshot's subtitleTrack
+// (computed once, before any command runs) for each item — with N
+// captions and no pre-existing track, that's N commands each racing to
+// create their OWN new track, confirmed live: a real plan with 4
+// captions produced 4 separate SUBTITLE tracks (one clip each) instead
+// of one track with 4 clips. Same class of "genuinely dependent create"
+// problem createAddTrackAndClipCommand's own doc comment already
+// describes for ONE clip — this is that same fix generalized to N: the
+// track is created ONCE, then every clip is added to it sequentially,
+// all within one atomic, undo-able command.
+export function createAddTrackWithClipsCommand(
+  deps: AddTrackAndClipDeps,
+  trackInput: { kind: EditorTrackKind; audioSubtype?: EditorAudioSubtype; insertBelowOrder?: number },
+  clipInputs: Omit<AddClipPatch, "trackId">[]
+): EditorCommand {
+  let createdTrackId: string | null = null;
+  let createdClipIds: string[] = [];
+  return {
+    label: "Add Track",
+    execute: async () => {
+      const { track } = await deps.addTrack(trackInput);
+      createdTrackId = track.id;
+      const clipIds: string[] = [];
+      for (const clipInput of clipInputs) {
+        const { clip } = await deps.addClip({ ...clipInput, trackId: track.id });
+        clipIds.push(clip.id);
+      }
+      createdClipIds = clipIds;
+    },
+    undo: async () => {
+      await Promise.all(createdClipIds.map((id) => deps.deleteClip(id)));
+      createdClipIds = [];
+      if (createdTrackId) await deps.removeTrack(createdTrackId);
+      createdTrackId = null;
+    },
+  };
+}
+
+// Real bug found live (2026-07-18/19) — when the AI Auto-Editor needs to
+// create BOTH a fresh SUBTITLE (captions) track AND a fresh OVERLAY
+// (b-roll/stickers) track in the SAME apply, running them as two
+// independent createAddTrackWithClipsCommands inside the top-level
+// parallel createCompositeCommand raced for which one landed at the
+// lower `order` (renders in front, see track-stacking.ts's own
+// convention) — live-confirmed b-roll winning that race and covering
+// captions for an overlapping time window. Promise.all gives no ordering
+// guarantee between sibling promises, so no amount of array-ordering in
+// ai-timeline-translator.ts's own `commands` list could have fixed this;
+// it needed genuine sequencing. This command creates SUBTITLE first,
+// AWAITS its real committed order, THEN creates OVERLAY via addTrack's
+// insertBelowOrder param targeting that real value — captions render
+// above b-roll by construction now, not by chance of scheduling.
+// Deliberately builds only the "both fresh" case; ai-timeline-translator.ts
+// only reaches for this when it actually applies (see its own call site).
+export function createCaptionsAboveOverlayCommand(
+  deps: AddTrackAndClipDeps,
+  captionClipInputs: Omit<AddClipPatch, "trackId">[],
+  overlayClipInputs: Omit<AddClipPatch, "trackId">[]
+): EditorCommand {
+  let subtitleTrackId: string | null = null;
+  let subtitleClipIds: string[] = [];
+  let overlayTrackId: string | null = null;
+  let overlayClipIds: string[] = [];
+  return {
+    label: "Add Captions + B-roll",
+    execute: async () => {
+      let subtitleOrder: number | undefined;
+      if (captionClipInputs.length > 0) {
+        const { track } = await deps.addTrack({ kind: "SUBTITLE" });
+        subtitleTrackId = track.id;
+        subtitleOrder = track.order;
+        const clipIds: string[] = [];
+        for (const clipInput of captionClipInputs) {
+          const { clip } = await deps.addClip({ ...clipInput, trackId: track.id });
+          clipIds.push(clip.id);
+        }
+        subtitleClipIds = clipIds;
+      }
+      if (overlayClipInputs.length > 0) {
+        const { track } = await deps.addTrack({ kind: "OVERLAY", insertBelowOrder: subtitleOrder });
+        overlayTrackId = track.id;
+        const clipIds: string[] = [];
+        for (const clipInput of overlayClipInputs) {
+          const { clip } = await deps.addClip({ ...clipInput, trackId: track.id });
+          clipIds.push(clip.id);
+        }
+        overlayClipIds = clipIds;
+      }
+    },
+    undo: async () => {
+      await Promise.all([...subtitleClipIds, ...overlayClipIds].map((id) => deps.deleteClip(id)));
+      subtitleClipIds = [];
+      overlayClipIds = [];
+      await Promise.all([subtitleTrackId, overlayTrackId].filter((id): id is string => !!id).map((id) => deps.removeTrack(id)));
+      subtitleTrackId = null;
+      overlayTrackId = null;
+    },
+  };
+}
+
+// Phase 12 Module 1 (AI Auto-Editor) — same "genuinely dependent creates"
+// reasoning as createAddTrackAndClipCommand above (the clip needs the
+// track's real id; ducking needs the SAME track's real id), extended by
+// one more sequential step: apply the ducking fields the AI Auto-Editor's
+// music-planning step decided on to the track its own clip just landed on.
+// Reuses createUpdateTrackCommand's own dependency (TrackCommandDeps) and
+// the exact same duckingEnabled/duckingAmountDb/duckingFadeMs/
+// duckingVoiceTrackIds fields the manual Audio Ducking feature already
+// added — nothing new on the ducking side, only the "create track + clip
+// + ducking in one atomic step" composition is new.
+export interface AddMusicTrackDeps extends AddTrackAndClipDeps, TrackCommandDeps {}
+
+export interface MusicDuckingPatch {
+  duckingEnabled: boolean;
+  duckingAmountDb: number;
+  duckingFadeMs: number;
+  duckingVoiceTrackIds: string[];
+}
+
+export function createAddMusicTrackCommand(
+  deps: AddMusicTrackDeps,
+  clipInput: Omit<AddClipPatch, "trackId">,
+  ducking: MusicDuckingPatch
+): EditorCommand {
+  let createdTrackId: string | null = null;
+  let createdClipId: string | null = null;
+  return {
+    label: "AI Add Music Track",
+    execute: async () => {
+      const { track } = await deps.addTrack({ kind: "AUDIO", audioSubtype: "MUSIC" });
+      createdTrackId = track.id;
+      const { clip } = await deps.addClip({ ...clipInput, trackId: track.id });
+      createdClipId = clip.id;
+      await deps.updateTrack({ trackId: track.id, patch: ducking });
+    },
+    undo: async () => {
+      if (createdClipId) await deps.deleteClip(createdClipId);
+      if (createdTrackId) await deps.removeTrack(createdTrackId);
+      createdClipId = null;
+      createdTrackId = null;
     },
   };
 }

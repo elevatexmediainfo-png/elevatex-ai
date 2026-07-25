@@ -14,6 +14,8 @@ import {
   useCreateExportPresetMutation,
   useCurrentUserTierQuery,
   useDeleteExportPresetMutation,
+  useEditorAssetsQuery,
+  useEditorProjectQuery,
   useExportDownloadUrlMutation,
   useExportPresetsQuery,
   useExportsQuery,
@@ -80,6 +82,24 @@ export function ExportPanel({
   // toggle that then locks).
   const tierQuery = useCurrentUserTierQuery();
   const canRemove = tierQuery.data !== undefined && canRemoveWatermark(tierQuery.data);
+
+  // Local-instant-preview (2026-07-24) — a clip can now legally reference a
+  // still-uploading/normalizing asset (see createExport's own matching
+  // server-side guard, lib/video-editor/exports.ts) while manual editing
+  // continues off a local blob preview. Export renders server-side off the
+  // real file, so the button is disabled with an explicit reason here
+  // rather than letting the user hit the server's rejection blind.
+  const projectQuery = useEditorProjectQuery(projectId);
+  const assetsQuery = useEditorAssetsQuery();
+  const notReadyAssetCount = React.useMemo(() => {
+    const assetStatusById = new Map((assetsQuery.data ?? []).map((a) => [a.id, a.status]));
+    const notReadyIds = new Set<string>();
+    for (const clip of projectQuery.data?.clips ?? []) {
+      if (!clip.assetId || notReadyIds.has(clip.assetId)) continue;
+      if (assetStatusById.get(clip.assetId) !== "READY") notReadyIds.add(clip.assetId);
+    }
+    return notReadyIds.size;
+  }, [projectQuery.data?.clips, assetsQuery.data]);
 
   const [format, setFormat] = React.useState<ExportFormat>("MP4");
   const [resolution, setResolution] = React.useState<ExportResolution>("R1080P");
@@ -388,7 +408,22 @@ export function ExportPanel({
             )}
           </div>
 
-          <MotionPrimaryButton type="button" className="w-full" loading={createMutation.isPending} onClick={() => void handleExport()}>
+          {notReadyAssetCount > 0 && (
+            <p className="flex items-start gap-1 text-micro text-amber-400">
+              <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+              {notReadyAssetCount === 1
+                ? "One clip's file is still uploading."
+                : `${notReadyAssetCount} clips' files are still uploading.`}{" "}
+              Export is disabled until upload finishes.
+            </p>
+          )}
+          <MotionPrimaryButton
+            type="button"
+            className="w-full"
+            loading={createMutation.isPending}
+            disabled={notReadyAssetCount > 0}
+            onClick={() => void handleExport()}
+          >
             <Film className="size-4" />
             Start Export
           </MotionPrimaryButton>

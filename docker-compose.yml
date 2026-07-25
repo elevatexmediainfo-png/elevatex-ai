@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: elevatex-ai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: elevatex
+      POSTGRES_PASSWORD: elevatex_dev_password
+      POSTGRES_DB: elevatex_ai
+    ports:
+      - "5432:5432"
+    volumes:
+      - elevatex_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U elevatex -d elevatex_ai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Milestone 12 — optional cache + rate-limit layer (lib/cache/cache.ts).
+  # The app works without this service too (falls back to in-process
+  # caching / DB-row rate-limit counting); include it for any multi-instance
+  # production deployment so those counters are actually shared.
+  redis:
+    image: redis:7-alpine
+    container_name: elevatex-ai-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - elevatex_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Production app container. Not used by `npm run dev` — local development
+  # runs the Next.js dev server directly against the postgres service above.
+  # Build/run this service for a self-hosted VPS deployment; see
+  # PRODUCTION_DEPLOYMENT.md.
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: elevatex-ai-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # .env.local supplies AUTH_SECRET/NEXTAUTH_URL/provider keys; the two
+    # below are deliberately overridden here (not left to .env.local's
+    # localhost-pointing values) since inside this network Postgres/Redis
+    # are reachable by service name, not localhost. `environment:` always
+    # wins over `env_file:` for the same key, which is exactly what's wanted.
+    env_file:
+      - .env.local
+    environment:
+      DATABASE_URL: postgresql://elevatex:elevatex_dev_password@postgres:5432/elevatex_ai?schema=public
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "3000:3000"
+    # Applies any pending migrations, then starts the server — the standard
+    # "migrate on deploy" pattern, safe to run on every container start
+    # since `prisma migrate deploy` is a no-op when nothing's pending.
+    command: sh -c "node_modules/.bin/prisma migrate deploy && node server.js"
+
+volumes:
+  elevatex_postgres_data:
+  elevatex_redis_data:

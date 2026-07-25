@@ -144,6 +144,43 @@ export function computeSurvivingSegments(clip: ClipView, removalWindows: { start
   return segments;
 }
 
+// Real bug found live (2026-07-20, launch-readiness audit) — a full AI
+// Auto-Edit run that included both sceneRemoval AND music produced a
+// project with real, correctly gap-free video (0 -> 2726 -> 2918 -> 3015
+// -> 6412ms, exactly matching computeSurvivingSegments' own repacking)
+// sitting inside a timeline that stayed at its PRE-removal length
+// (14808ms) — because translateMusic (below) sized the music clip from
+// `project.durationMs`, which is the Apply-time SNAPSHOT taken before
+// scene removal executes, not the real post-removal length. Every
+// download/preview second past the real content's end (6412ms here) was
+// solid black with the music still playing underneath — confirmed via a
+// real export's ffprobe (14.8s) and frame-by-frame check (frames at 7s
+// and 12s both fully black; only content within the correct 0-6412ms
+// range rendered). recomputeProjectDuration (server-side, runs after
+// every clip mutation) wasn't the bug — it correctly takes the max
+// across every clip's real end time, but MAX is only correct if every
+// clip's own length is already correct, and music's never was. Fixed by
+// computing the REAL effective duration (every untouched clip's own end,
+// but the scene-removed clip's NEW post-removal end instead of its old
+// one) and using that instead of the stale snapshot value, but only for
+// music — every other translateAITimelinePlan section already reasons in
+// SOURCE-relative or post-removal-mapped time, this was the one place
+// still reading the raw pre-removal snapshot number.
+function computeEffectiveDurationMs(
+  project: AITimelineProjectSnapshot,
+  removalTarget: { clip: ClipView; segments: SceneRemovalSegment[] } | null
+): number {
+  if (!removalTarget) return project.durationMs;
+  const lastSegment = removalTarget.segments[removalTarget.segments.length - 1];
+  const removedClipNewEndMs = lastSegment ? lastSegment.startMs + lastSegment.durationMs : removalTarget.clip.startMs;
+  let maxEndMs = 0;
+  for (const c of project.clips) {
+    const endMs = c.id === removalTarget.clip.id ? removedClipNewEndMs : c.startMs + c.durationMs;
+    maxEndMs = Math.max(maxEndMs, endMs);
+  }
+  return maxEndMs;
+}
+
 // Maps a caption's "top"/"center"/"bottom" preset onto ClipContent's own
 // 0..1 fraction-of-frame `y` convention — the AI reasons about a position
 // PRESET (something a text-only planning step can pick confidently), the
@@ -388,6 +425,7 @@ function buildCaptionClipInputs(items: AICaption[]): Omit<AddClipPatch, "trackId
       text: caption.text,
       fontFamily: caption.style?.fontFamily,
       fontSize: caption.style?.fontSize,
+      fontWeight: caption.style?.fontWeight,
       color: caption.style?.color,
       y: resolveCaptionY(caption.style?.position),
       reveal,
@@ -730,6 +768,7 @@ export function translateAITimelinePlan(
   // nothing (removalTarget is null) — every item passes through
   // unchanged, exactly like before this fix.
   const { removalTarget } = sceneRemovalResult;
+  const effectiveDurationMs = computeEffectiveDurationMs(project, removalTarget);
   function remapAgainstSceneRemoval(startMs: number, endMs: number, describe: () => string): { startMs: number; endMs: number } | null {
     if (!removalTarget) return { startMs, endMs };
     const mapped = mapWindowToSurvivingSegments(removalTarget.clip, removalTarget.segments, startMs, endMs);
@@ -784,7 +823,13 @@ export function translateAITimelinePlan(
     ),
     ...translateZoom(independentZoomItems, project, deps.clip, warnings),
     ...translateSfx(remappedSfx, sfxTrack, { clip: deps.clip, addTrackAndClip: deps.addTrackAndClip }, unresolvedAssets),
-    ...translateMusic(plan.music, project, musicTrack, { clip: deps.clip, track: deps.track, addMusicTrack: deps.addMusicTrack }, unresolvedAssets),
+    ...translateMusic(
+      plan.music,
+      { ...project, durationMs: effectiveDurationMs },
+      musicTrack,
+      { clip: deps.clip, track: deps.track, addMusicTrack: deps.addMusicTrack },
+      unresolvedAssets
+    ),
     ...translateTransitions(independentTransitionItems, project, deps.transition, warnings),
   ];
 
