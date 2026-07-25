@@ -40,8 +40,26 @@ export async function register() {
     // (headless Chromium + FFmpeg), kept separate from the AI-generation
     // render queue above — see export-worker.ts's drainExportQueue doc
     // comment.
-    const { startExportQueueWorker } = await import("@/lib/video-editor/export-queue-worker");
-    startExportQueueWorker();
+    //
+    // Fail SOFT here, unlike the PAYMENT check above (2026-07-25) — this
+    // worker's module chain has a static top-level `import { chromium } from
+    // "playwright"` (export-worker.ts), which throws at import time if the
+    // runtime image is missing Playwright's Chromium build (confirmed live:
+    // a Docker image built without it crashed the entire server on boot,
+    // taking down every other feature — auth, dashboard, every other
+    // queue — over one broken export path). PAYMENT failing open was a real
+    // exploit; video export failing open just means renders don't process
+    // while everything else keeps serving, so a misconfigured/incomplete
+    // deploy degrades instead of going fully dark.
+    try {
+      const { startExportQueueWorker } = await import("@/lib/video-editor/export-queue-worker");
+      startExportQueueWorker();
+    } catch (err) {
+      console.error(
+        "[startup] Export queue worker failed to start — video exports/renders will not process until this is fixed, but the rest of the app will continue serving normally:",
+        err
+      );
+    }
 
     // Phase 12 Module 2 — a third, independently-tuned poll loop for
     // AI Auto-Editor jobs (transcription + scene-removal planning), same
