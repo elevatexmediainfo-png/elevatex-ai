@@ -89,10 +89,13 @@ RUN ls -la ./node_modules/playwright-core
 RUN node -p "require.resolve('playwright/package.json')"
 RUN node -e "console.log(require('./node_modules/playwright/package.json'))"
 RUN which npx && which node && node --version && npm --version
-RUN ./node_modules/.bin/playwright --version
-RUN npx playwright install --with-deps chromium \
-  && test -f ./node_modules/playwright-core/browsers.json \
-  && chown -R nextjs:nodejs ./node_modules/playwright-core
+RUN node -e "console.log(require('./node_modules/playwright/package.json').bin)"
+RUN ls -la ./node_modules/playwright/bin
+RUN node ./node_modules/playwright/cli.js --version
+RUN node ./node_modules/playwright/cli.js install --with-deps chromium
+#RUN npx playwright install --with-deps chromium \
+  #&& test -f ./node_modules/playwright-core/browsers.json \
+  #&& chown -R nextjs:nodejs ./node_modules/playwright-core
 
 USER nextjs
 EXPOSE 3000
