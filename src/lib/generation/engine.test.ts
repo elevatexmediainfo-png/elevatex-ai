@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { reorderProvidersByPreference, runGeneration } from "./engine";
-import { AllProvidersFailedError, type GenerationProvider } from "./types";
+import { AllProvidersFailedError, NonRetryableProviderError, type GenerationProvider } from "./types";
 
 interface FakeProvider extends GenerationProvider {
   category: "LLM";
@@ -283,6 +283,46 @@ describe("runGeneration", () => {
       runGeneration({ category: "LLM", operation: "script", providers: [a], invoke, ...deps })
     ).rejects.toThrow(AllProvidersFailedError);
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  // Real bug fix (2026-07-25) — a deterministic failure (e.g. gemini_images'
+  // content-policy block) used to be retried identically to a transient one,
+  // wasting a real attempt and wrongly counting toward the provider's health.
+  it("stops retrying a provider immediately on NonRetryableProviderError and excludes it from health tracking", async () => {
+    const deps = baseDeps();
+    const a = provider("a");
+    const b = provider("b");
+    const invoke = vi.fn().mockImplementation(async (p: FakeProvider) => {
+      if (p.id === "a") throw new NonRetryableProviderError("blocked");
+      return "ok-from-b";
+    });
+
+    const result = await runGeneration({
+      category: "LLM",
+      operation: "script",
+      providers: [a, b],
+      invoke,
+      ...deps,
+    });
+
+    expect(result).toBe("ok-from-b");
+    // Only 1 attempt against "a" (not FAST_POLICY.retryMaxAttempts=2), then 1 against "b".
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(deps.recordOutcome).not.toHaveBeenCalledWith("LLM", "a", "failure", expect.anything());
+    expect(deps.logEvent).toHaveBeenCalledWith(expect.objectContaining({ providerId: "a", status: "FAILURE", attempt: 1 }));
+  });
+
+  it("throws AllProvidersFailedError after a single attempt when the last provider fails with NonRetryableProviderError", async () => {
+    const deps = baseDeps();
+    const a = provider("a");
+    const invoke = vi.fn().mockRejectedValue(new NonRetryableProviderError("blocked"));
+
+    await expect(
+      runGeneration({ category: "LLM", operation: "script", providers: [a], invoke, ...deps })
+    ).rejects.toThrow(AllProvidersFailedError);
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(deps.recordOutcome).not.toHaveBeenCalled();
   });
 });
 

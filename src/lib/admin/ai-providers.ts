@@ -186,30 +186,57 @@ export async function listProviderConfigs(): Promise<ProviderConfigSummary[]> {
   const rowByKey = new Map(rows.map((r) => [`${r.category}:${r.providerId}`, r]));
 
   return PROVIDER_CATALOGUE.map((entry) => {
-    const row = rowByKey.get(`${entry.category}:${entry.providerId}`);
-    return {
-      category: entry.category,
-      providerId: entry.providerId,
-      label: entry.label,
-      enabled: row?.enabled ?? false,
-      hasApiKey: !!row?.apiKeyEncrypted,
-      apiKeyMasked: row?.apiKeyEncrypted ? maskSecret(decryptSecret(row.apiKeyEncrypted)) : null,
-      hasApiSecret: !!row?.apiSecretEncrypted,
-      apiSecretMasked: row?.apiSecretEncrypted ? maskSecret(decryptSecret(row.apiSecretEncrypted)) : null,
-      hasExtraSecret: !!row?.extraSecretEncrypted,
-      model: row?.model ?? null,
-      defaultQuality: row?.defaultQuality ?? null,
-      priority: row?.priority ?? 0,
-      monthlyBudgetUsd: row?.monthlyBudgetUsd ?? null,
-      dailyBudgetUsd: row?.dailyBudgetUsd ?? null,
-      rateLimitPerMinute: row?.rateLimitPerMinute ?? null,
-      timeoutMs: row?.timeoutMs ?? null,
-      retryCount: row?.retryCount ?? null,
-      extraConfig: (row?.extraConfig as Record<string, string> | null) ?? null,
-      keyExpiresAt: row?.keyExpiresAt ?? null,
-      lastTestedAt: row?.lastTestedAt ?? null,
-      lastTestResult: row?.lastTestResult ?? null,
-      lastTestError: row?.lastTestError ?? null,
+  const row = rowByKey.get(`${entry.category}:${entry.providerId}`);
+
+  let apiKeyMasked: string | null = null;
+  if (row?.apiKeyEncrypted) {
+    try {
+      apiKeyMasked = maskSecret(decryptSecret(row.apiKeyEncrypted));
+    } catch (err) {
+      console.error(
+        `[ProviderConfig] Failed to decrypt API key for ${row.category}/${row.providerId}`,
+        err
+      );
+    }
+  }
+
+  let apiSecretMasked: string | null = null;
+  if (row?.apiSecretEncrypted) {
+    try {
+      apiSecretMasked = maskSecret(decryptSecret(row.apiSecretEncrypted));
+    } catch (err) {
+      console.error(
+        `[ProviderConfig] Failed to decrypt API secret for ${row.category}/${row.providerId}`,
+        err
+      );
+    }
+  }
+
+  return {
+    category: entry.category,
+    providerId: entry.providerId,
+    label: entry.label,
+    enabled: row?.enabled ?? false,
+    hasApiKey: !!row?.apiKeyEncrypted,
+    apiKeyMasked,
+    hasApiSecret: !!row?.apiSecretEncrypted,
+    apiSecretMasked,
+    hasExtraSecret: !!row?.extraSecretEncrypted,
+    model: row?.model ?? null,
+    defaultQuality: row?.defaultQuality ?? null,
+    priority: row?.priority ?? 0,
+    monthlyBudgetUsd: row?.monthlyBudgetUsd ?? null,
+    dailyBudgetUsd: row?.dailyBudgetUsd ?? null,
+    rateLimitPerMinute: row?.rateLimitPerMinute ?? null,
+    timeoutMs: row?.timeoutMs ?? null,
+    retryCount: row?.retryCount ?? null,
+    extraConfig: (row?.extraConfig as Record<string, string> | null) ?? null,
+    keyExpiresAt: row?.keyExpiresAt ?? null,
+    lastTestedAt: row?.lastTestedAt ?? null,
+    lastTestResult: row?.lastTestResult ?? null,
+    lastTestError: row?.lastTestError ?? null,
+  };
+});
     };
   });
 }

@@ -1,5 +1,6 @@
 import type { ProviderRuntimeConfig } from "../credentials";
 import type { ImageGenerateRequest, ImageGenerateResult, ImageProvider } from "./types";
+import { NonRetryableProviderError } from "@/lib/generation/types";
 
 // Gemini has no separate width/height parameter for image generation (unlike
 // OpenAI) — aspect ratio is steered via prompt phrasing, folded in below.
@@ -145,7 +146,28 @@ export class GeminiImagesProvider implements ImageProvider {
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      throw new Error(`Gemini Images request failed (${res.status}): ${body.slice(0, 300)}`);
+      const message = `Gemini Images request failed (${res.status}): ${body.slice(0, 300)}`;
+
+      // Real bug fix (2026-07-25) — a deterministic rejection (a 400, or a
+      // content-policy block regardless of status) was being retried a
+      // second time anyway and coming back byte-for-byte identical, 4 real
+      // times in one day — wasted latency, and it wrongly counted toward
+      // this provider's health/circuit-breaker as if it were an
+      // availability problem. Classify and throw NonRetryableProviderError
+      // for these so runGeneration() (engine.ts) stops after one attempt and
+      // excludes it from health tracking; genuine transient failures (5xx,
+      // network errors, timeouts) are untouched and keep retrying as before.
+      let errorCode: unknown;
+      try {
+        errorCode = JSON.parse(body)?.error?.code;
+      } catch {
+        // Non-JSON body (e.g. an HTML error page from a proxy/gateway) —
+        // fall through, the status-only check below still applies.
+      }
+      const isDeterministic =
+        res.status === 400 || (typeof errorCode === "string" && errorCode.startsWith("prompt_feedback.block_reason"));
+
+      throw isDeterministic ? new NonRetryableProviderError(message) : new Error(message);
     }
 
     const json: InteractionResponse = await res.json();

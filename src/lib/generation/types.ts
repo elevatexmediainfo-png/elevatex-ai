@@ -67,6 +67,27 @@ export class AllProvidersFailedError extends Error {
   }
 }
 
+// A provider adapter throws this instead of a plain Error when a failure is
+// deterministic — retrying the exact same request cannot succeed (e.g. a 4xx
+// content-policy/validation rejection) — as opposed to the default every
+// plain thrown Error gets in runGeneration(): retry up to the category's max
+// attempts, and count every attempt toward ProviderHealth.consecutiveFailures.
+// Adapters opt in per-error by throwing this specific type; anything that
+// keeps throwing a plain Error is completely unaffected.
+//
+// Real, confirmed-live motivation (2026-07-25) — gemini_images returning a
+// deterministic 400 "prompt_feedback.block_reason:OTHER" content-policy
+// block got retried anyway (byte-for-byte identical error, 2 attempts, 4
+// separate real requests same day) — wasting ~15-30s of wall-clock time per
+// request AND inflating ProviderHealth.consecutiveFailures with failures
+// that say nothing about whether the provider itself is actually up/down.
+export class NonRetryableProviderError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NonRetryableProviderError";
+  }
+}
+
 // Real incident (2026-07-24) — "Couldn't enhance your prompt" turned out to
 // be a genuine simultaneous outage of BOTH configured LLM providers
 // (Gemini: real 503 "high demand"/transient; OpenAI: real 429

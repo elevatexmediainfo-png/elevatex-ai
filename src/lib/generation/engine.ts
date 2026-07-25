@@ -9,6 +9,7 @@ import { logGenerationEvent, type LogEntryInput } from "./usage-log";
 import { estimateCost as estimateCostDefault } from "./cost";
 import {
   AllProvidersFailedError,
+  NonRetryableProviderError,
   type GenerationCategory,
   type GenerationContext,
   type GenerationPolicy,
@@ -298,14 +299,16 @@ export async function runGeneration<P extends GenerationProvider, R>(
           : (result as R & { providerId: string; costUsd?: number });
       } catch (err) {
         const latencyMs = Date.now() - startedAt;
+        const isNonRetryable = err instanceof NonRetryableProviderError;
         lastError = err instanceof Error ? err.message : String(err);
 
-        await Promise.all([
-          recordOutcome(category, provider.id, "failure", {
-            threshold: policy.healthFailureThreshold,
-            cooldownMs: policy.healthCooldownMs,
-            error: lastError,
-          }),
+        // A deterministic failure (e.g. a content-policy block) is not
+        // evidence THIS provider is unhealthy — an unmodified retry can
+        // never turn a 400 into a 200 — so it's excluded from the
+        // circuit-breaker signal entirely. Still logged to GenerationLog
+        // below for observability; only the health/consecutiveFailures
+        // side is skipped.
+        const tasks: Promise<unknown>[] = [
           logEvent({
             category,
             providerId: provider.id,
@@ -320,7 +323,17 @@ export async function runGeneration<P extends GenerationProvider, R>(
             creativeProjectId: context.creativeProjectId,
             model: provider.model,
           }),
-        ]);
+        ];
+        if (!isNonRetryable) {
+          tasks.push(
+            recordOutcome(category, provider.id, "failure", {
+              threshold: policy.healthFailureThreshold,
+              cooldownMs: policy.healthCooldownMs,
+              error: lastError,
+            })
+          );
+        }
+        await Promise.all(tasks);
 
         await safeProgress(onProgress, {
           providerId: provider.id,
@@ -329,6 +342,14 @@ export async function runGeneration<P extends GenerationProvider, R>(
           phase: "attempt_failed",
           error: lastError,
         });
+
+        // Deterministic failure — stop retrying THIS provider immediately,
+        // no backoff sleep. The outer provider loop naturally moves to the
+        // next provider in the chain (or falls through to
+        // AllProvidersFailedError below if this was the last one).
+        if (isNonRetryable) {
+          break;
+        }
 
         if (attempt < retryMaxAttempts) {
           await sleep(policy.retryBackoffMs * attempt);
