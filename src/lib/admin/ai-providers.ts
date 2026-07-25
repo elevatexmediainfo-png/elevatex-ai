@@ -237,6 +237,7 @@ export async function listProviderConfigs(): Promise<ProviderConfigSummary[]> {
     lastTestError: row?.lastTestError ?? null,
   };
 });
+}
 export function findCatalogueEntry(category: ProviderCategory, providerId: string): ProviderCatalogueEntry | undefined {
   return PROVIDER_CATALOGUE.find((e) => e.category === category && e.providerId === providerId);
 }
