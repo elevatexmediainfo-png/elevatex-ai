@@ -15,6 +15,7 @@
 # `sharp` ships separate glibc/musl prebuilts) — mixing bases would silently
 # install the wrong variant into the final image.
 FROM node:22-bookworm-slim AS deps
+# CACHE_BUSTER_20260725_01
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
