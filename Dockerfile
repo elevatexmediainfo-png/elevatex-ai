@@ -98,7 +98,10 @@ RUN npx playwright install --with-deps chromium \
 
 USER nextjs
 EXPOSE 3000
-ENV PORT=3000
+# PORT intentionally not hardcoded here — Railway injects its own PORT at
+# runtime and this app's server.js reads process.env.PORT directly; a
+# hardcoded ENV PORT=3000 in the image is unnecessary and was deliberately
+# removed previously.
 # Migrations run on every container start (a no-op when nothing's pending) —
 # invokes Prisma's real entry file directly, NOT node_modules/.bin/prisma
 # (see the COPY comment above for why that shim is unsafe in this image).
