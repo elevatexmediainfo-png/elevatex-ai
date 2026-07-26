@@ -45,6 +45,20 @@ COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --from=builder /app/prisma ./prisma
+# prisma.config.ts (2026-07-26 fix) — a ROOT-LEVEL file, a sibling of
+# package.json, NOT part of the /app/prisma directory copied above. Prisma 7
+# moved the datasource connection string out of schema.prisma entirely
+# (this project's datasource db {} block has no `url` field at all — see
+# schema.prisma) and into this file's `datasource: { url: env("DATABASE_URL") } }`.
+# It was never copied into the runner stage by any COPY line here, and
+# .next/standalone's tracer has no reason to include it either — the
+# Next.js app itself never imports it; only the separate Prisma CLI process
+# does. Reproduced locally: temporarily removing just this file (env()'s own
+# implementation and DATABASE_URL both left untouched) produces the exact
+# reported error verbatim — "Error: The datasource.url property is required
+# in your Prisma config file when using prisma migrate status." — proving
+# the file's absence, not env resolution, was the cause.
+COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
 
 # Full node_modules copy (2026-07-26 fix — supersedes selectively copying
 # node_modules/prisma + node_modules/@prisma + node_modules/playwright* by
@@ -72,10 +86,17 @@ COPY --from=builder /app/prisma ./prisma
 COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 
 # Build-time tripwires — fail the BUILD loudly, not the container at boot.
-# The version check is the authoritative one: it exercises Prisma's CLI
-# through its ENTIRE real module-resolution chain (prisma -> @prisma/config
-# -> effect -> fast-check, plus c12/deepmerge-ts/empathic/dotenv), the exact
-# path `migrate deploy` takes, without needing a live database connection.
+# The version check exercises the CLI's module-resolution chain (prisma ->
+# @prisma/config -> effect -> fast-check, plus c12/deepmerge-ts/empathic/
+# dotenv) without a live database — but it does NOT validate datasource.url
+# (confirmed: `--version` and `validate` both succeed even with
+# prisma.config.ts entirely missing, since neither needs a connection
+# string). That's exactly why the explicit `test -f ./prisma.config.ts`
+# check above exists as its own separate assertion — `migrate deploy` is the
+# only command that actually requires datasource.url to resolve, and it
+# can't be run here since there's no live database at build time.
+RUN test -f ./prisma.config.ts || \
+  (echo "FATAL: prisma.config.ts missing after COPY — migrate deploy has no datasource.url source (schema.prisma intentionally has none)." && exit 1)
 RUN test -f ./node_modules/prisma/build/prisma_schema_build_bg.wasm || \
   (echo "FATAL: node_modules/prisma/build/prisma_schema_build_bg.wasm missing after COPY." && exit 1)
 RUN test -f ./node_modules/playwright-core/browsers.json || \
