@@ -85,16 +85,34 @@ COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
 # package at a time.
 COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 
+# Build-time-only placeholder (2026-07-26 fix) — NOT the production
+# DATABASE_URL, never will be: real deployments (docker-compose's
+# `environment:`, Railway's variable reference) always set a real
+# DATABASE_URL at container *runtime*, which overrides this baked-in image
+# ENV the same way `docker run -e` always wins over a Dockerfile's ENV.
+# Needed here because prisma.config.ts (copied above) now exists in this
+# stage: its top-level `datasource: { url: env("DATABASE_URL") } }` calls
+# @prisma/config's `env()` helper eagerly — `process.env[name]`, throwing
+# `PrismaConfigEnvError` if unset — the MOMENT the config module loads,
+# which happens for every CLI invocation uniformly, not just ones that need
+# a live connection. Reproduced locally: with no .env files and no
+# DATABASE_URL present (matching this stage exactly), even `prisma
+# --version` fails with `PrismaConfigEnvError: Cannot resolve environment
+# variable: DATABASE_URL` — before this fix, that same command had
+# succeeded, only because prisma.config.ts hadn't been copied into this
+# stage yet, so there was no config module to evaluate at all. Setting any
+# non-empty value here — real or not — is sufficient to let the module load
+# without throwing; nothing at build time ever connects to it.
+ENV DATABASE_URL="postgresql://placeholder:placeholder@placeholder:5432/placeholder"
+
 # Build-time tripwires — fail the BUILD loudly, not the container at boot.
 # The version check exercises the CLI's module-resolution chain (prisma ->
 # @prisma/config -> effect -> fast-check, plus c12/deepmerge-ts/empathic/
-# dotenv) without a live database — but it does NOT validate datasource.url
-# (confirmed: `--version` and `validate` both succeed even with
-# prisma.config.ts entirely missing, since neither needs a connection
-# string). That's exactly why the explicit `test -f ./prisma.config.ts`
-# check above exists as its own separate assertion — `migrate deploy` is the
-# only command that actually requires datasource.url to resolve, and it
-# can't be run here since there's no live database at build time.
+# dotenv) AND confirms prisma.config.ts's datasource.url resolves without
+# throwing (using the placeholder above) — but it does NOT validate that the
+# resulting URL actually connects to anything: `migrate deploy` is the only
+# command that attempts a real connection, and it can't run here since
+# there's no live database at build time.
 RUN test -f ./prisma.config.ts || \
   (echo "FATAL: prisma.config.ts missing after COPY — migrate deploy has no datasource.url source (schema.prisma intentionally has none)." && exit 1)
 RUN test -f ./node_modules/prisma/build/prisma_schema_build_bg.wasm || \
