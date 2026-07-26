@@ -44,45 +44,44 @@ RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 nextjs
 COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
-
-# Prisma 7 CLI (2026-07-26 fix) — whole-directory copies only, no `.bin`
-# shim. `prisma/build/index.js` loads its schema-engine WASM via
-# `${__dirname}/prisma_schema_build_bg.wasm` — a path computed from wherever
-# the executing file actually lives on disk. `node_modules/.bin/prisma` is
-# npm's shim/symlink to `../prisma/build/index.js`; Docker's COPY
-# *dereferences* a symlink when the source is a single file, copying the
-# resolved target's bytes as a plain file at the destination path instead of
-# preserving the symlink. The result: a full copy of index.js's bundled code
-# physically relocated to node_modules/.bin/prisma, whose __dirname is now
-# genuinely node_modules/.bin — so it looks for the wasm file right beside
-# itself, where it never existed (confirmed live: exactly this ENOENT at
-# runtime). Fix is to never invoke through that shim in this image at all —
-# run the real entry file directly (see CMD below and docker-compose.yml),
-# which only needs the plain directory copies below, both of which preserve
-# internal relative structure correctly since they're whole-directory
-# copies, not single-file ones.
 COPY --from=builder /app/prisma ./prisma
-COPY --from=builder /app/node_modules/prisma ./node_modules/prisma
-COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 
-# Playwright must be a full, explicit directory copy here — not left to
-# `.next/standalone`'s own file-tracing. Next's tracer (@vercel/nft) only
-# copies files it can statically resolve via require()/path.join with
-# literal segments; playwright-core resolves several of its own supporting
-# files (browsers.json among them) dynamically, so a standalone-only build
-# silently drops them — exactly the same class of bug already hit with
-# ffmpeg-static's binary (see next.config.ts's outputFileTracingIncludes
-# comment). Copying the whole package from the builder stage sidesteps the
-# tracer entirely, the same fix already applied to prisma above.
-COPY --from=builder /app/node_modules/playwright ./node_modules/playwright
-COPY --from=builder /app/node_modules/playwright-core ./node_modules/playwright-core
+# Full node_modules copy (2026-07-26 fix — supersedes selectively copying
+# node_modules/prisma + node_modules/@prisma + node_modules/playwright* by
+# name). Two real, separate incidents proved per-package copying doesn't
+# work for Prisma 7's CLI: (1) node_modules/.bin/prisma is a symlink Docker's
+# COPY dereferences into a broken relocated file when copied individually —
+# fixed by invoking the real entry file directly instead (see CMD below);
+# (2) Prisma 7's CLI depends on @prisma/config, which depends on c12,
+# deepmerge-ts, effect, and empathic — effect itself depends on fast-check —
+# and npm hoists ALL FIVE of those to the true root node_modules/, entirely
+# outside both the node_modules/prisma and node_modules/@prisma trees
+# (confirmed by inspecting effect's and @prisma/config's own package.json
+# dependencies, and by locating each package's actual installed path).
+# Enumerating that transitive closure by hand is exactly what caused both
+# incidents — every Prisma minor version can add another dependency outside
+# @prisma/ scope with no reliable way to predict which. `.next/standalone`'s
+# own node_modules (copied above) is Next's file-tracing output for the
+# APP's runtime code only; it was never meant to, and doesn't, cover the
+# separate CLI tool's dependency graph. Copying the builder stage's complete
+# node_modules here (already produced by a real `npm ci` against
+# package-lock.json — nothing is installed inside this image) guarantees
+# every current and future transitive dependency the CLI needs is present,
+# permanently closing this class of bug rather than patching it one missing
+# package at a time.
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 
-# Build-time tripwire — fail the BUILD loudly if either whole-directory copy
-# above is somehow incomplete, instead of finding out at container boot.
+# Build-time tripwires — fail the BUILD loudly, not the container at boot.
+# The version check is the authoritative one: it exercises Prisma's CLI
+# through its ENTIRE real module-resolution chain (prisma -> @prisma/config
+# -> effect -> fast-check, plus c12/deepmerge-ts/empathic/dotenv), the exact
+# path `migrate deploy` takes, without needing a live database connection.
 RUN test -f ./node_modules/prisma/build/prisma_schema_build_bg.wasm || \
   (echo "FATAL: node_modules/prisma/build/prisma_schema_build_bg.wasm missing after COPY." && exit 1)
 RUN test -f ./node_modules/playwright-core/browsers.json || \
   (echo "FATAL: node_modules/playwright-core/browsers.json missing after COPY." && exit 1)
+RUN node node_modules/prisma/build/index.js --version || \
+  (echo "FATAL: Prisma CLI failed to load its full module graph in the runtime image." && exit 1)
 
 # Installs Chromium (only — not the other Playwright browsers this app never
 # uses, to keep the image reasonably sized) directly into THIS final image.
