@@ -10,28 +10,16 @@ export async function register() {
     const { validateEnv } = await import("@/lib/env");
     validateEnv();
 
-    // PAYMENT hard-boot-block (2026-07-23, explicit founder decision after
-    // the free-credits exploit fix) — every other misconfiguration only
-    // gets the loud-but-non-fatal warning below, but PAYMENT is the one
-    // category where "silently degraded" was a real, live exploit (any
-    // signed-in user could get free credits/subscriptions). Per-request
-    // enforcement already exists independently (getPaymentProvider() throws
-    // regardless of this check) — this is real defense-in-depth: a
-    // production deployment with no real PAYMENT provider configured now
-    // refuses to finish booting at all, rather than serving traffic in a
-    // state where every checkout silently 503s. Runs BEFORE the queue
-    // workers start so a doomed boot exits as early as possible.
-    if (process.env.NODE_ENV === "production") {
-      const { isPaymentCheckoutAvailable } = await import("@/lib/providers/payment");
-      const paymentReady = await isPaymentCheckoutAvailable();
-      if (!paymentReady) {
-        const border = "=".repeat(78);
-        console.error(
-          `\n${border}\n🛑 BOOT REFUSED — no real PAYMENT provider is enabled in production.\n   Every checkout would silently 503 for real users. This is a hard\n   stop, not a warning — enable Razorpay in Admin -> AI Providers (or\n   set NODE_ENV back to a non-production value for local dev/demo)\n   before this server can start. See PROJECT_STATUS.md's 2026-07-23\n   PAYMENT exploit fix for the full incident writeup.\n${border}\n`
-        );
-        process.exit(1);
-      }
-    }
+    // PAYMENT hard-boot-block removed (2026-07-26, explicit request — dev/
+    // test VPS deployment must never refuse to boot over payment config).
+    // Per-request enforcement is untouched and remains the real
+    // protection: getPaymentProvider()/isPaymentCheckoutAvailable()
+    // (src/lib/providers/payment/index.ts) still throw
+    // PaymentProviderUnavailableError for every checkout/order/subscription
+    // route when no real provider is enabled in production — this file no
+    // longer duplicates that check at startup to crash the whole server
+    // over it. See PROJECT_STATUS.md's 2026-07-23 PAYMENT exploit fix for
+    // why that per-request check exists and must never be relaxed.
 
     const { startQueueWorker } = await import("@/lib/queue/worker");
     startQueueWorker();
