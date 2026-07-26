@@ -38,6 +38,13 @@ model User {
   emailVerified DateTime?
   image         String?
 
+  // MVP install-flow password login (2026-07-27) — nullable: only accounts
+  // created via the Installation Wizard's admin-creation step (and anyone
+  // who later logs in through the "password" Credentials provider) ever set
+  // this. Phone-OTP and Google accounts leave it null and are unaffected.
+  // Stored as "saltHex:hashHex" (scrypt) — see lib/security/password.ts.
+  passwordHash String?
+
   // FR-AU-010 — Indian mobile number, +91 implied, stored in E.164 (+91XXXXXXXXXX).
   phone         String?   @unique
   phoneVerified DateTime?

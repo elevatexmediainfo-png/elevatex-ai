@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { useRouter } from "next/navigation";
-import { signIn, useSession } from "next-auth/react";
+import { signIn } from "next-auth/react";
 import { Loader2, Check } from "lucide-react";
 import { toast } from "sonner";
 
@@ -81,52 +81,52 @@ function StepShell({
   );
 }
 
+// MVP install-flow (2026-07-27) — replaces phone-OTP verification for the
+// Installation Wizard's Super Admin step. A fresh install has no OTP vendor
+// configured and no existing admin to authenticate against, so requiring
+// phone verification here was a real bootstrap blocker, not a security
+// requirement — see POST /api/install/create-admin's own comment. Phone-OTP
+// remains fully intact for every regular user; this step alone no longer
+// uses it.
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MIN_PASSWORD_LENGTH = 8;
+
 function AdminStep({ onDone }: { onDone: () => void }) {
-  const { update } = useSession();
-  const [phase, setPhase] = React.useState<"phone" | "otp" | "done">("phone");
-  const [phone, setPhone] = React.useState("");
-  const [otp, setOtp] = React.useState("");
-  const [devOtp, setDevOtp] = React.useState<string | null>(null);
+  const [email, setEmail] = React.useState("");
+  const [password, setPassword] = React.useState("");
+  const [confirmPassword, setConfirmPassword] = React.useState("");
+  const [done, setDone] = React.useState(false);
   const [loading, setLoading] = React.useState(false);
 
-  async function sendOtp() {
+  const emailValid = EMAIL_REGEX.test(email);
+  const passwordValid = password.length >= MIN_PASSWORD_LENGTH;
+  const confirmValid = confirmPassword.length > 0 && confirmPassword === password;
+
+  async function createAndSignIn() {
     setLoading(true);
     try {
-      const res = await fetch("/api/auth/otp/send", {
+      const res = await fetch("/api/install/create-admin", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone }),
+        body: JSON.stringify({ email, password, confirmPassword }),
       });
       const json = await res.json();
       if (!json.success) {
-        toast.error(json.error?.message ?? "Couldn't send OTP.");
+        toast.error(json.error?.message ?? "Couldn't create the Super Admin account.");
         return;
       }
-      setDevOtp(json.data.devOtp ?? null);
-      setPhase("otp");
-    } catch {
-      toast.error("Network error. Please try again.");
-    } finally {
-      setLoading(false);
-    }
-  }
 
-  async function verifyAndPromote() {
-    setLoading(true);
-    try {
-      const res = await signIn("otp", { phone, otp, redirect: false });
-      if (res?.error) {
-        toast.error("Incorrect or expired code.");
+      // Auto-login (requirement) — the account was just created with
+      // role: "ADMIN" directly, so this sign-in's JWT already carries that
+      // role from the start; unlike the old OTP flow there's no separate
+      // promote/update() step needed.
+      const signInRes = await signIn("password", { email, password, redirect: false });
+      if (signInRes?.error) {
+        toast.error("Account created, but automatic sign-in failed — please log in manually.");
         return;
       }
-      const promoteRes = await fetch("/api/install/promote-admin", { method: "POST" });
-      const promoteJson = await promoteRes.json();
-      if (!promoteJson.success) {
-        toast.error(promoteJson.error?.message ?? "Couldn't create the Super Admin account.");
-        return;
-      }
-      await update({ role: "ADMIN" });
-      setPhase("done");
+
+      setDone(true);
       toast.success("Super Admin account created.");
       onDone();
     } catch {
@@ -139,58 +139,50 @@ function AdminStep({ onDone }: { onDone: () => void }) {
   return (
     <StepShell
       title="Create your Super Admin account"
-      description="This will be the first account on this installation, with full Admin access. Verify your phone number to create it."
+      description="This will be the first account on this installation, with full Admin access."
       showBack={false}
-      onNext={
-        phase === "phone"
-          ? sendOtp
-          : phase === "otp"
-            ? verifyAndPromote
-            : undefined
-      }
-      nextLabel={phase === "phone" ? "Send code" : "Verify & create account"}
-      nextDisabled={phase === "phone" ? phone.length !== 10 : otp.length !== 6}
+      onNext={done ? undefined : createAndSignIn}
+      nextLabel="Create account"
+      nextDisabled={!emailValid || !passwordValid || !confirmValid}
       nextLoading={loading}
     >
-      {phase !== "done" && (
-        <div>
-          <Label className="text-label-sm text-neutral-700">Mobile number</Label>
-          <div className="mt-1 flex items-center gap-2">
-            <span className="flex h-11 items-center rounded-md border border-neutral-300 px-3 text-body-md text-neutral-500">
-              +91
-            </span>
+      {!done && (
+        <>
+          <div>
+            <Label className="text-label-sm text-neutral-700">Admin email</Label>
             <Input
-              inputMode="numeric"
-              maxLength={10}
-              placeholder="98765 43210"
-              value={phone}
-              disabled={phase === "otp"}
-              onChange={(e) => setPhone(e.target.value.replace(/\D/g, "").slice(0, 10))}
-              className="h-11"
+              type="email"
+              placeholder="you@company.com"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className="mt-1 h-11"
             />
           </div>
-        </div>
+          <div>
+            <Label className="text-label-sm text-neutral-700">Password</Label>
+            <Input
+              type="password"
+              placeholder={`At least ${MIN_PASSWORD_LENGTH} characters`}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="mt-1 h-11"
+            />
+          </div>
+          <div>
+            <Label className="text-label-sm text-neutral-700">Confirm password</Label>
+            <Input
+              type="password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              className="mt-1 h-11"
+            />
+            {confirmPassword.length > 0 && !confirmValid && (
+              <p className="mt-1 text-body-sm text-error">Passwords do not match.</p>
+            )}
+          </div>
+        </>
       )}
-      {phase === "otp" && (
-        <div>
-          {devOtp && (
-            <div className="mb-3 rounded-lg bg-warning-light px-3 py-2 text-body-sm text-warning">
-              Dev mode — no SMS gateway configured. Your code is{" "}
-              <span className="font-mono font-semibold">{devOtp}</span>.
-            </div>
-          )}
-          <Label className="text-label-sm text-neutral-700">6-digit code</Label>
-          <Input
-            inputMode="numeric"
-            maxLength={6}
-            placeholder="123456"
-            value={otp}
-            onChange={(e) => setOtp(e.target.value.replace(/\D/g, "").slice(0, 6))}
-            className="mt-1 h-11 text-center font-mono tracking-[0.3em]"
-          />
-        </div>
-      )}
-      {phase === "done" && (
+      {done && (
         <p className="flex items-center gap-2 text-body-md text-success">
           <Check className="size-4" /> Super Admin account ready.
         </p>

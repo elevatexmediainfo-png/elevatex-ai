@@ -6,7 +6,8 @@ import crypto from "crypto";
 
 import { prisma } from "@/lib/prisma";
 import { authConfig } from "./config";
-import { verifyOtpSchema, sendOtpSchema, toE164Phone } from "@/lib/validations/auth";
+import { verifyOtpSchema, sendOtpSchema, toE164Phone, passwordLoginSchema } from "@/lib/validations/auth";
+import { verifyPassword } from "@/lib/security/password";
 import { grantCredits } from "@/lib/credits/engine";
 import { getConfig } from "@/lib/admin/config";
 
@@ -114,6 +115,45 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
           phone: created.phone,
           onboardingCompleted: false,
           role: created.role,
+        };
+      },
+    }),
+    // MVP install-flow password login (2026-07-27) — the Installation
+    // Wizard's Super Admin step creates the account directly (email +
+    // password, no OTP vendor needed for a fresh install) via
+    // POST /api/install/create-admin, then signs in through this provider.
+    // Also reachable from the main /login page for any account this
+    // creates, so a password-based admin always has a durable way back in —
+    // unrelated accounts (phone-OTP, Google) have no passwordHash and can
+    // never authenticate through here.
+    Credentials({
+      id: "password",
+      name: "Email & Password",
+      credentials: {
+        email: { label: "Email", type: "email" },
+        password: { label: "Password", type: "password" },
+      },
+      async authorize(raw) {
+        const parsed = passwordLoginSchema.safeParse(raw);
+        if (!parsed.success) return null;
+        const { email, password } = parsed.data;
+
+        const user = await prisma.user.findUnique({
+          where: { email },
+          include: { profile: true },
+        });
+        if (!user?.passwordHash) return null;
+
+        const valid = await verifyPassword(password, user.passwordHash);
+        if (!valid) return null;
+
+        return {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          phone: user.phone,
+          onboardingCompleted: !!user.profile?.onboardingCompletedAt,
+          role: user.role,
         };
       },
     }),

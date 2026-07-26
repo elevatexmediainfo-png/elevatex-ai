@@ -12,7 +12,7 @@ import { Container } from "@/components/shared/container";
 import { LanguageToggle } from "@/components/shared/language-toggle";
 import { ForceSceneTheme } from "@/components/shared/force-scene-theme";
 
-type Step = "phone" | "otp";
+type Step = "phone" | "otp" | "password";
 
 const RESEND_COOLDOWN_SECONDS = 60;
 
@@ -56,6 +56,13 @@ function LoginForm() {
   const [googleLoading, setGoogleLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [cooldown, setCooldown] = React.useState(0);
+  // MVP install-flow password login (2026-07-27) — see lib/auth/index.ts's
+  // "password" Credentials provider comment. Additive only: phone-OTP above
+  // is completely unchanged, this is a second, independent path for
+  // accounts that have a password set (currently: Installation Wizard
+  // admins).
+  const [loginEmail, setLoginEmail] = React.useState("");
+  const [loginPassword, setLoginPassword] = React.useState("");
 
   React.useEffect(() => {
     if (cooldown <= 0) return;
@@ -110,6 +117,24 @@ function LoginForm() {
     await signIn("google", { redirectTo: callbackUrl });
   }
 
+  async function loginWithPassword() {
+    setError(null);
+    setLoading(true);
+    try {
+      const res = await signIn("password", { email: loginEmail, password: loginPassword, redirect: false });
+      if (res?.error) {
+        setError("Incorrect email or password.");
+        return;
+      }
+      router.push(callbackUrl);
+      router.refresh();
+    } catch {
+      setError("Network error. Please check your connection and try again.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     // bg-[#0B0F19] matches the 3D canvas background exactly — fallback for
     // pre-hydration. BackgroundEngine (root layout) renders the live 3D world
@@ -158,12 +183,14 @@ function LoginForm() {
           }}
         >
           <h1 className="text-heading-1 text-white">
-            {step === "phone" ? "Log in or sign up" : "Enter the code"}
+            {step === "phone" ? "Log in or sign up" : step === "otp" ? "Enter the code" : "Log in with email"}
           </h1>
           <p className="mt-2 text-body-md text-white/50">
             {step === "phone"
               ? "Continue with Google or your phone number."
-              : `We sent a 6-digit code to +91 ${phone}.`}
+              : step === "otp"
+                ? `We sent a 6-digit code to +91 ${phone}.`
+                : "Enter your email and password."}
           </p>
 
           {error && (
@@ -236,6 +263,70 @@ function LoginForm() {
                 {loading && <Loader2 className="size-4 animate-spin" />}
                 Send OTP
               </Button>
+
+              <button
+                type="button"
+                className="text-center text-body-sm text-white/40 hover:text-white/75 transition-colors duration-150"
+                onClick={() => { setStep("password"); setError(null); }}
+              >
+                Log in with email &amp; password instead
+              </button>
+            </div>
+          )}
+
+          {step === "password" && (
+            <div className="mt-6 flex flex-col gap-4">
+              <div>
+                <label htmlFor="login-email" className="mb-1.5 block text-label-md text-white/65">
+                  Email
+                </label>
+                <Input
+                  id="login-email"
+                  type="email"
+                  placeholder="you@company.com"
+                  value={loginEmail}
+                  onChange={(e) => setLoginEmail(e.target.value)}
+                  className="h-11 text-body-md"
+                />
+              </div>
+              <div>
+                <label htmlFor="login-password" className="mb-1.5 block text-label-md text-white/65">
+                  Password
+                </label>
+                <Input
+                  id="login-password"
+                  type="password"
+                  value={loginPassword}
+                  onChange={(e) => setLoginPassword(e.target.value)}
+                  className="h-11 text-body-md"
+                />
+              </div>
+
+              <Button
+                type="button"
+                variant="primary"
+                size="lg"
+                className="w-full"
+                disabled={!loginEmail || !loginPassword || loading}
+                onClick={loginWithPassword}
+                style={{
+                  background: "linear-gradient(155deg, #8B5CF6 0%, #6D28D9 40%, #2563EB 100%)",
+                  boxShadow:
+                    "0 4px 20px rgba(124,58,237,0.42), 0 2px 8px rgba(37,99,235,0.28), inset 0 1px 0 rgba(255,255,255,0.18)",
+                  color: "white",
+                }}
+              >
+                {loading && <Loader2 className="size-4 animate-spin" />}
+                Log in
+              </Button>
+
+              <button
+                type="button"
+                className="text-center text-body-sm text-white/40 hover:text-white/75 transition-colors duration-150"
+                onClick={() => { setStep("phone"); setError(null); }}
+              >
+                Back to phone &amp; Google login
+              </button>
             </div>
           )}
 
