@@ -16,10 +16,23 @@ const INSTALLATION_FLAG_KEY = "INSTALLATION_COMPLETED";
 let cachedInstalled = false;
 
 export async function isInstalled(): Promise<boolean> {
-  if (cachedInstalled) return true;
-  const row = await prisma.systemConfig.findUnique({ where: { key: INSTALLATION_FLAG_KEY } });
-  cachedInstalled = row?.value === true;
-  return cachedInstalled;
+  try {
+    if (cachedInstalled) return true;
+
+    console.log("[INSTALL] Checking installation status...");
+
+    const row = await prisma.systemConfig.findUnique({
+      where: { key: INSTALLATION_FLAG_KEY },
+    });
+
+    console.log("[INSTALL] Database Result:", row);
+
+    cachedInstalled = row?.value === true;
+    return cachedInstalled;
+  } catch (err) {
+    console.error("[INSTALL] isInstalled() failed:", err);
+    throw err;
+  }
 }
 
 export async function markInstallationComplete(performedBy?: string): Promise<void> {
