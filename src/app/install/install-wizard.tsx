@@ -515,7 +515,7 @@ export function InstallWizard() {
   }
 
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-brand-navy-light px-4 py-12">
+    <div className="relative flex min-h-screen flex-col items-center justify-center bg-brand-navy-light px-4 py-12">
       <div className="mb-6 flex w-full max-w-2xl items-center justify-between">
         {STEPS.map((s, i) => (
           <div key={s.id} className="flex flex-1 items-center">
