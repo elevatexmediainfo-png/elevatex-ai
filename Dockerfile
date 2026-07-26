@@ -99,5 +99,4 @@ RUN node ./node_modules/playwright/cli.js install chromium --with-deps
 
 USER nextjs
 EXPOSE 3000
-ENV PORT=3000
 CMD ["node", "server.js"]
