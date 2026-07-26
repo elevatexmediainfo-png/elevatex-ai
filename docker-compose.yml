@@ -65,7 +65,12 @@ services:
     # Applies any pending migrations, then starts the server — the standard
     # "migrate on deploy" pattern, safe to run on every container start
     # since `prisma migrate deploy` is a no-op when nothing's pending.
-    command: sh -c "node_modules/.bin/prisma migrate deploy && node server.js"
+    # Invokes Prisma's real entry file directly, NOT node_modules/.bin/prisma
+    # (2026-07-26 fix — that shim gets dereferenced into a broken, relocated
+    # copy by Docker's COPY; see the Dockerfile's own comment on this for the
+    # full root cause). Matches the Dockerfile's own CMD, kept explicit here
+    # too since `command:` always overrides the image's CMD anyway.
+    command: sh -c "node node_modules/prisma/build/index.js migrate deploy && node server.js"
 
 volumes:
   elevatex_postgres_data:

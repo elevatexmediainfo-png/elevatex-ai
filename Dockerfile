@@ -15,7 +15,6 @@
 # `sharp` ships separate glibc/musl prebuilts) — mixing bases would silently
 # install the wrong variant into the final image.
 FROM node:22-bookworm-slim AS deps
-# CACHE_BUSTER_20260725_01
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -45,11 +44,24 @@ RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 nextjs
 COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
-# Migrations run at container startup (see docker-compose.yml's command),
-# not at build time — they need a live DATABASE_URL, which the build stage
-# only has a placeholder for.
+
+# Prisma 7 CLI (2026-07-26 fix) — whole-directory copies only, no `.bin`
+# shim. `prisma/build/index.js` loads its schema-engine WASM via
+# `${__dirname}/prisma_schema_build_bg.wasm` — a path computed from wherever
+# the executing file actually lives on disk. `node_modules/.bin/prisma` is
+# npm's shim/symlink to `../prisma/build/index.js`; Docker's COPY
+# *dereferences* a symlink when the source is a single file, copying the
+# resolved target's bytes as a plain file at the destination path instead of
+# preserving the symlink. The result: a full copy of index.js's bundled code
+# physically relocated to node_modules/.bin/prisma, whose __dirname is now
+# genuinely node_modules/.bin — so it looks for the wasm file right beside
+# itself, where it never existed (confirmed live: exactly this ENOENT at
+# runtime). Fix is to never invoke through that shim in this image at all —
+# run the real entry file directly (see CMD below and docker-compose.yml),
+# which only needs the plain directory copies below, both of which preserve
+# internal relative structure correctly since they're whole-directory
+# copies, not single-file ones.
 COPY --from=builder /app/prisma ./prisma
-COPY --from=builder /app/node_modules/.bin/prisma ./node_modules/.bin/prisma
 COPY --from=builder /app/node_modules/prisma ./node_modules/prisma
 COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 
@@ -65,15 +77,12 @@ COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 COPY --from=builder /app/node_modules/playwright ./node_modules/playwright
 COPY --from=builder /app/node_modules/playwright-core ./node_modules/playwright-core
 
-# Build-time tripwire (2026-07-25) — a previous deploy shipped without this
-# file present at runtime despite this exact COPY line existing, which
-# turned out to be a broken assumption about which build path Railway was
-# actually running, not this Dockerfile itself. Fail the BUILD loudly here
-# instead of finding out at container boot: if this file is genuinely
-# missing right after the COPY above, every later step (install, chown) is
-# working with a broken source anyway.
+# Build-time tripwire — fail the BUILD loudly if either whole-directory copy
+# above is somehow incomplete, instead of finding out at container boot.
+RUN test -f ./node_modules/prisma/build/prisma_schema_build_bg.wasm || \
+  (echo "FATAL: node_modules/prisma/build/prisma_schema_build_bg.wasm missing after COPY." && exit 1)
 RUN test -f ./node_modules/playwright-core/browsers.json || \
-  (echo "FATAL: node_modules/playwright-core/browsers.json missing immediately after COPY — the builder stage's node_modules is incomplete, or this Dockerfile isn't the one actually being built. Aborting build." && exit 1)
+  (echo "FATAL: node_modules/playwright-core/browsers.json missing after COPY." && exit 1)
 
 # Installs Chromium (only — not the other Playwright browsers this app never
 # uses, to keep the image reasonably sized) directly into THIS final image.
@@ -83,20 +92,14 @@ RUN test -f ./node_modules/playwright-core/browsers.json || \
 # --with-deps additionally apt-get-installs the shared libraries (fonts,
 # libnss3, libatk, etc.) Chromium needs to actually launch — this is the
 # step that requires a Debian base (see top-of-file note).
-RUN ls -la ./node_modules/.bin
-RUN ls -la ./node_modules/playwright
-RUN ls -la ./node_modules/playwright-core
-RUN node -p "require.resolve('playwright/package.json')"
-RUN node -e "console.log(require('./node_modules/playwright/package.json'))"
-RUN which npx && which node && node --version && npm --version
-RUN node -e "console.log(require('./node_modules/playwright/package.json').bin)"
-RUN node ./node_modules/playwright/cli.js --version
-RUN node ./node_modules/playwright/cli.js --help
-RUN node ./node_modules/playwright/cli.js install chromium --with-deps
-#RUN npx playwright install --with-deps chromium \
-  #&& test -f ./node_modules/playwright-core/browsers.json \
-  #&& chown -R nextjs:nodejs ./node_modules/playwright-core
+RUN npx playwright install --with-deps chromium \
+  && test -f ./node_modules/playwright-core/browsers.json \
+  && chown -R nextjs:nodejs ./node_modules/playwright-core
 
 USER nextjs
 EXPOSE 3000
-CMD ["node", "server.js"]
+ENV PORT=3000
+# Migrations run on every container start (a no-op when nothing's pending) —
+# invokes Prisma's real entry file directly, NOT node_modules/.bin/prisma
+# (see the COPY comment above for why that shim is unsafe in this image).
+CMD ["sh", "-c", "node node_modules/prisma/build/index.js migrate deploy && node server.js"]
