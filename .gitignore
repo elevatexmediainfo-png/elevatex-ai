@@ -37,6 +37,9 @@ yarn-error.log*
 # losing it just means re-entering Admin Panel credentials, but committing it
 # would defeat the encryption entirely.
 .encryption-key
+# Fix (2026-07-27) — same key, new writable-in-Docker location; see
+# lib/security/master-key.ts.
+/.data
 
 # vercel
 .vercel

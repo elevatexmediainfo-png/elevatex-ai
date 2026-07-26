@@ -41,6 +41,16 @@ ENV NODE_ENV=production
 ENV PLAYWRIGHT_BROWSERS_PATH=0
 RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 nextjs
 
+# Writable runtime-state directory (2026-07-27 fix) — /app itself is
+# root-owned from the COPY steps below, and this image runs as the
+# non-root `nextjs` user, so it can't create new top-level files here (a
+# real, live crash: `EACCES: permission denied, open
+# '/app/.encryption-key'`, the auto-generated credential-encryption key
+# lib/security/master-key.ts falls back to when CREDENTIAL_ENCRYPTION_KEY
+# isn't set). Explicitly owned by that same user, real permissions (0700 on
+# the dir, 0600 on the key file itself — never chmod 777).
+RUN mkdir -p /app/.data && chown nextjs:nodejs /app/.data && chmod 700 /app/.data
+
 COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
