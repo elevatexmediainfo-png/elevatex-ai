@@ -49,11 +49,24 @@ export async function getInstallationChecklist(): Promise<InstallationChecklist>
     const rows = configs.filter((c) => c.category === category);
     const active = rows.find((r) => r.enabled);
     if (!active) {
+      // STORAGE and PAYMENT hard-refuse in production instead of falling
+      // back to Mock (lib/providers/storage/index.ts, lib/providers/
+      // payment/index.ts — both 2026-07-23 security fixes: a silent Mock
+      // fallback for either was a real data-loss/free-checkout exploit
+      // risk). The generic "falling back to the mock provider" wording
+      // below was factually wrong for these two specifically — confirmed
+      // live, a real upload attempt in production threw
+      // StorageProviderUnavailableError, not a silent Mock write — which
+      // understated the real, immediate consequence of leaving either
+      // unconfigured.
+      const hardRefusesInProduction = category === "STORAGE" || category === "PAYMENT";
       items.push({
         key: `provider:${category}`,
         label: CATEGORY_LABELS[category] ?? category,
         status: "ACTION_NEEDED",
-        detail: "No provider enabled — falling back to the mock provider. Enable a real one in AI Providers before going live.",
+        detail: hardRefusesInProduction
+          ? "No provider enabled — every request will fail outright in production (no mock fallback, by design). Enable a real one in AI Providers before going live."
+          : "No provider enabled — falling back to the mock provider. Enable a real one in AI Providers before going live.",
       });
     } else if (!active.hasApiKey) {
       items.push({

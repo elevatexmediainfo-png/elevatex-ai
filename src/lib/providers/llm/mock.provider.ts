@@ -80,6 +80,47 @@ function extractIdea(prompt: string): string | null {
   return match ? match[1].trim() : null;
 }
 
+// lib/creative/scene-split.ts requests responseFormat: "json" with a
+// `Script:\n<script>` prompt and expects exactly
+// `{ scenes: [{ sceneNumber, visualPrompt, durationSeconds }], textOverlays: [...] }`
+// (sceneSplitSchema) — a different JSON shape from the two below
+// (asset-analysis, universal-prompt-builder). Missing this branch meant
+// every scene-split call against Mock fell through to
+// simulateUniversalPromptJson()'s unrelated shape (no `scenes` field at
+// all), failing sceneSplitSchema validation for every founder using Mock —
+// the default for anyone without a real LLM provider configured. Confirmed
+// live: this is exactly what broke video-project creation end-to-end.
+function extractScript(prompt: string): string | null {
+  const match = prompt.match(/^Script:\s*\n([\s\S]+)/i);
+  return match ? match[1].trim() : null;
+}
+
+function simulateSceneSplitJson(script: string): string {
+  const sentences = script
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const midpoint = Math.max(1, Math.ceil(sentences.length / 2));
+  const hookText = sentences.slice(0, midpoint).join(" ") || script;
+  const closeText = sentences.slice(midpoint).join(" ") || "A clear call-to-action closes the ad.";
+
+  return JSON.stringify({
+    scenes: [
+      {
+        sceneNumber: 1,
+        visualPrompt: `An Indian host delivers the opening hook in a natural, energetic setting matching this beat: ${hookText}`,
+        durationSeconds: 8,
+      },
+      {
+        sceneNumber: 2,
+        visualPrompt: `An Indian host delivers the closing call-to-action in a warm, inviting setting matching this beat: ${closeText}`,
+        durationSeconds: 8,
+      },
+    ],
+    textOverlays: [],
+  });
+}
+
 function extractCreativeKind(prompt: string): string {
   const match = prompt.match(/^Creative kind:\s*(.+)$/im);
   return match ? match[1].trim() : "AI_IMAGE";
@@ -187,6 +228,10 @@ export class MockLLMProvider implements LLMProvider {
     if (req.responseFormat === "json") {
       if (req.imageUrl) {
         return { text: simulateAssetAnalysisJson(), providerRef: `mock-llm-${Date.now()}` };
+      }
+      const script = extractScript(req.prompt);
+      if (script) {
+        return { text: simulateSceneSplitJson(script), providerRef: `mock-llm-${Date.now()}` };
       }
       const idea = extractIdea(req.prompt) ?? "a professional creative image";
       const kind = extractCreativeKind(req.prompt);
