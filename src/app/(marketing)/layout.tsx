@@ -25,7 +25,7 @@ export default async function MarketingLayout({
     // dashboard), which would otherwise show through here and drop several
     // of these static text colors below WCAG AA contrast (caught by a
     // Lighthouse accessibility pass — see PROJECT_STATUS.md Milestone 12).
-    <div className="flex min-h-screen flex-col bg-white">
+    <div className="relative flex min-h-screen flex-col bg-white">
       <Navbar />
       <main className="flex-1">{children}</main>
       <Footer />

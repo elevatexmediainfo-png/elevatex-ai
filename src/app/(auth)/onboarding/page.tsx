@@ -93,7 +93,7 @@ export default function OnboardingPage() {
   }
 
   return (
-    <div className="min-h-screen bg-neutral-50">
+    <div className="relative min-h-screen bg-neutral-50">
       <Container as="main" className="flex max-w-2xl flex-col py-12">
         <div className="mb-8 flex items-center gap-2">
           {[1, 2].map((s) => (
