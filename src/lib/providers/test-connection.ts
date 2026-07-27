@@ -1,5 +1,6 @@
 import { ListObjectsV2Command, S3Client } from "@aws-sdk/client-s3";
 import Razorpay from "razorpay";
+import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 
 import type { ProviderCategory } from "@/generated/prisma/client";
 import type { ProviderRuntimeConfig } from "./credentials";
@@ -71,7 +72,7 @@ export async function testProviderConnection(
       if (providerId === "gemini_images" && result.ok) {
         return {
           ok: true,
-          message: "API key is valid for the Gemini API (gemini-3-pro-image access not separately verifiable — requires a billing-enabled project).",
+          message: "Connection successful. The API key is valid. Image model access will be verified automatically during the first real image generation request.",
         };
       }
       if (providerId === "imagen" && result.ok) {
@@ -98,6 +99,38 @@ export async function testProviderConnection(
         { headers: { authorization: config.apiKey } },
         "AssemblyAI API key is valid."
       );
+
+    case "gpt4o_transcribe":
+      // Fix (2026-07-27) — credential-slot-only, no adapter built yet (see
+      // lib/admin/ai-providers.ts's PROVIDER_CATALOGUE) — was falling
+      // through to the generic default message. Same honest, non-error
+      // shape as gemini_omni/omnihuman/icons8/lottiefiles below.
+      return {
+        ok: true,
+        message: "Credentials saved successfully. This provider is reserved for future implementation.",
+      };
+
+    case "edge_tts": {
+      // Fix (2026-07-27) — real, actively-used adapter (voice/edge-tts.
+      // provider.ts, the real free fallback when ElevenLabs is
+      // unavailable), but needs no API key at all, so it was falling
+      // through to the generic default message despite genuinely working.
+      // No HTTP endpoint exists to test (it's a WebSocket protocol, not
+      // REST) — reuses the exact same MsEdgeTTS.setMetadata() call the
+      // real adapter's own generate() makes, the same "call the real
+      // underlying request, just the cheapest slice of it" pattern this
+      // file already uses elsewhere (Coverr reuses its own real search
+      // endpoint) — but stops before toStream()/synthesis, so no audio is
+      // actually generated or uploaded.
+      try {
+        const tts = new MsEdgeTTS();
+        await tts.setMetadata("en-US-AriaNeural", OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+        tts.close();
+        return { ok: true, message: "Edge TTS is reachable (no API key required)." };
+      } catch (err) {
+        return { ok: false, message: err instanceof Error ? err.message : String(err) };
+      }
+    }
 
     case "flux":
     case "replicate":
@@ -163,6 +196,19 @@ export async function testProviderConnection(
         "API key is valid for the OpenAI API (Sora-specific access not separately verifiable)."
       );
 
+    case "gpt5":
+      // Fix (2026-07-27) — gpt5 (REASONING) has a real, actively-used adapter
+      // (reasoning/gpt5.provider.ts) and shares OpenAI's general API key,
+      // but had no case here at all, so it was falling through to the
+      // generic default message despite being a genuinely working
+      // provider. Same shared-key/documented-limitation shape as sora above.
+      if (!config.apiKey) return { ok: false, message: "No API key configured." };
+      return testWithFetch(
+        "https://api.openai.com/v1/models",
+        { headers: { Authorization: `Bearer ${config.apiKey}` } },
+        "API key is valid for the OpenAI API (GPT-5.x reasoning access not separately verifiable)."
+      );
+
     case "seedance2":
       // Real bug fix (2026-07-24) — this message previously said
       // "Volcengine Ark", the wrong vendor entirely (see
@@ -177,6 +223,25 @@ export async function testProviderConnection(
       return {
         ok: true,
         message: "API key is present (Seedance2.ai has no documented cheap verification endpoint — not a live-tested connection).",
+      };
+
+    case "gemini_omni":
+    case "omnihuman":
+      // Fix (2026-07-27) — both credential-slot-only, no adapter built yet
+      // (see lib/admin/ai-providers.ts's PROVIDER_CATALOGUE comment: "all
+      // new catalogue entries are credential-slot-only, no adapter,
+      // matching the IconScout precedent") — but unlike icons8/lottiefiles,
+      // these two never got a matching case here, so they fell through to
+      // the generic default message. gemini_omni shares the Gemini API key
+      // (same vendor as gemini/veo/gemini_images/imagen above) and
+      // omnihuman shares no key with any other tested provider here, but
+      // deliberately NOT merged into the Gemini group above: with no real
+      // adapter to consume it, a "the key works" result would be more
+      // presumptuous than useful — same reasoning icons8/lottiefiles
+      // already established for this exact situation.
+      return {
+        ok: true,
+        message: "Credentials saved successfully. This provider is reserved for future implementation.",
       };
 
     case "s3": {
