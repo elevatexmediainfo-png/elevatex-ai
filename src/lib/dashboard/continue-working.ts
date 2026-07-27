@@ -26,7 +26,24 @@ export interface ContinueWorking {
 }
 
 export async function getContinueWorking(userId: string, limitPerKind = 5): Promise<ContinueWorking> {
-  const storage = await getStorageProvider();
+  // RELIABILITY (2026-07-27) — getStorageProvider() can throw for real,
+  // recoverable reasons unrelated to this function's actual job (a
+  // ProviderConfig row with ciphertext that can't decrypt under the
+  // current CREDENTIAL_ENCRYPTION_KEY, or the deliberate
+  // StorageProviderUnavailableError when no real provider is configured in
+  // production — see lib/providers/storage/index.ts). Confirmed live: this
+  // crashed the entire Dashboard for every user, unconditionally, on every
+  // load — storage is only actually needed below to resolve a thumbnail
+  // URL for CreativeProject results; VideoProject thumbnails already come
+  // from a stored URL, no storage call needed. Losing thumbnails for one
+  // broken/unconfigured provider is an acceptable, visible degradation;
+  // losing the whole Dashboard for it is not.
+  let storage: Awaited<ReturnType<typeof getStorageProvider>> | null = null;
+  try {
+    storage = await getStorageProvider();
+  } catch (err) {
+    console.error("[Dashboard] Storage provider unavailable — thumbnails will be omitted:", err);
+  }
 
   const [videoProjects, creativeProjects] = await Promise.all([
     prisma.videoProject.findMany({
@@ -47,7 +64,7 @@ export async function getContinueWorking(userId: string, limitPerKind = 5): Prom
   const assets = assetIds.length
     ? await prisma.asset.findMany({ where: { id: { in: assetIds } }, select: { id: true, storageKey: true } })
     : [];
-  const assetUrlById = new Map(assets.map((a) => [a.id, storage.getPublicUrl(a.storageKey)]));
+  const assetUrlById = new Map(assets.map((a) => [a.id, storage ? storage.getPublicUrl(a.storageKey) : null]));
 
   const videos: ContinueWorkingItem[] = [];
   const talkingHeads: ContinueWorkingItem[] = [];

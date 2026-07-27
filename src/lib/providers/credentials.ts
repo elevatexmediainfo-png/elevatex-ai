@@ -74,6 +74,34 @@ function mergeExtraConfig(
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
+// SECURITY/RELIABILITY (2026-07-27) — decryptSecret() throws (a raw Node
+// `crypto` "Unsupported state or unable to authenticate data" GCM
+// auth-tag error) whenever a row's ciphertext was encrypted under a
+// DIFFERENT CREDENTIAL_ENCRYPTION_KEY than the one this process currently
+// has (a key rotation, a row copied from another environment, or genuinely
+// corrupted ciphertext) — confirmed live: this crashed the entire
+// Dashboard render, since getContinueWorking() calls getStorageProvider()
+// unconditionally on every load, which resolves credentials through this
+// exact function with no error handling anywhere in between. One bad
+// row must never take down every caller of this shared function — same
+// "log and treat as absent" pattern already used by
+// lib/admin/ai-providers.ts's listProviderConfigs() for the same failure
+// mode, just applied here too, at the one place that was missing it.
+function safeDecrypt(
+  payload: string | null | undefined,
+  category: ProviderCategory,
+  providerId: string,
+  field: "apiKey" | "apiSecret" | "extraSecret"
+): string | undefined {
+  if (!payload) return undefined;
+  try {
+    return decryptSecret(payload);
+  } catch (err) {
+    console.error(`[ProviderConfig] Failed to decrypt ${field} for ${category}/${providerId}:`, err);
+    return undefined;
+  }
+}
+
 // Resolves one provider's credentials/config: DB row first, legacy env vars
 // only for whatever the DB row leaves unset.
 export async function resolveProviderCredentials(
@@ -86,13 +114,13 @@ export async function resolveProviderCredentials(
   const fallback = LEGACY_ENV_FALLBACK[providerId];
 
   const apiKey =
-    (row?.apiKeyEncrypted ? decryptSecret(row.apiKeyEncrypted) : undefined) ||
+    safeDecrypt(row?.apiKeyEncrypted, category, providerId, "apiKey") ||
     (fallback?.apiKeyVar ? process.env[fallback.apiKeyVar] : undefined);
   const apiSecret =
-    (row?.apiSecretEncrypted ? decryptSecret(row.apiSecretEncrypted) : undefined) ||
+    safeDecrypt(row?.apiSecretEncrypted, category, providerId, "apiSecret") ||
     (fallback?.apiSecretVar ? process.env[fallback.apiSecretVar] : undefined);
   const extraSecret =
-    (row?.extraSecretEncrypted ? decryptSecret(row.extraSecretEncrypted) : undefined) ||
+    safeDecrypt(row?.extraSecretEncrypted, category, providerId, "extraSecret") ||
     (fallback?.extraSecretVar ? process.env[fallback.extraSecretVar] : undefined);
   const model = row?.model || (fallback?.modelVar ? process.env[fallback.modelVar] : undefined);
 
