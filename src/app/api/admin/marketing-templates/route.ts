@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { apiError, apiSuccess } from "@/lib/api-response";
 import { requireAdminSession } from "@/lib/admin/guard";
 import { ASPECT_RATIOS_BY_OUTPUT_TYPE } from "@/lib/marketing-templates/aspect-ratios";
+import { getStorageProvider } from "@/lib/providers/storage";
 import { logger } from "@/lib/observability/logger";
 
 // TEMP_DEBUG (2026-08-03) — request-lifecycle logging added solely to
@@ -74,13 +75,29 @@ export async function GET() {
       _count: { select: { generations: true } },
     },
   });
+
+  // New admin UI (2026-08-03) — reference assets need a real preview, not
+  // just a mimeType label; resolves each one's public URL server-side
+  // (storageKey alone isn't a fetchable URL client-side — same pattern
+  // the user-facing gallery/detail pages already use via
+  // storage.getPublicUrl()). Additive field only, existing consumers of
+  // this response are unaffected.
+  const storage = await getStorageProvider();
+  const templatesWithUrls = templates.map((t) => ({
+    ...t,
+    referenceAssets: t.referenceAssets.map((ref) => ({
+      ...ref,
+      asset: { ...ref.asset, url: storage.getPublicUrl(ref.asset.storageKey) },
+    })),
+  }));
+
   logger.info(
     { tempDebug: true, count: templates.length, ids: templates.map((t) => t.id) },
     "TEMP_DEBUG: templates returned"
   );
 
   logger.info({ tempDebug: true, status: 200 }, "TEMP_DEBUG: response status");
-  return apiSuccess({ templates });
+  return apiSuccess({ templates: templatesWithUrls });
 }
 
 export async function POST(req: NextRequest) {
