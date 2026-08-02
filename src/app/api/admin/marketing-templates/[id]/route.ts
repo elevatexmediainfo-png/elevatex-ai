@@ -24,27 +24,6 @@ const patchSchema = z.object({
   sortOrder: z.number().int().optional(),
 });
 
-// GET — added for the dedicated template editor page (2026-08-04); the list
-// route already returns every template with its referenceAssets included,
-// this is the same shape for exactly one, so the editor doesn't have to
-// fetch/filter the entire list just to load one template.
-export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const session = await requireAdminSession();
-  if (!session) return apiError("ERR_FORBIDDEN", "Admin access required.", 403);
-
-  const { id } = await params;
-  const template = await prisma.marketingTemplate.findUnique({
-    where: { id },
-    include: {
-      referenceAssets: { include: { asset: { select: { id: true, storageKey: true, mimeType: true } } }, orderBy: { position: "asc" } },
-      _count: { select: { generations: true } },
-    },
-  });
-  if (!template) return apiError("ERR_NOT_FOUND", "Marketing template not found.", 404);
-
-  return apiSuccess({ template });
-}
-
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireAdminSession();
   if (!session) return apiError("ERR_FORBIDDEN", "Admin access required.", 403);
