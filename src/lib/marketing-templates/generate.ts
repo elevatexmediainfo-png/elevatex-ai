@@ -5,90 +5,118 @@ import { generateImage } from "@/lib/generation/image";
 import { renderVideo } from "@/lib/generation/video";
 import { MOCK_PROVIDER_ID } from "@/lib/generation/types";
 import { toBuffer } from "@/lib/image/fetch-bytes";
-import { getCreditBalance, consumeCredits, InsufficientCreditsError } from "@/lib/credits/engine";
-import { resolveVideoProviderCredits } from "@/lib/credits/video-actions";
-import { fillPromptTemplate, MissingPlaceholderValuesError } from "./placeholders";
 import { EDITOR_DIMENSIONS_BY_ASPECT } from "@/lib/video-editor/aspect-dimensions";
 
 export class MarketingTemplateNotReadyError extends Error {}
 export class MarketingTemplateMockFallbackError extends Error {}
+export class MissingUserAssetError extends Error {}
 
 export interface GenerateFromMarketingTemplateInput {
   userId: string;
   templateId: string;
-  filledFields: Record<string, string>;
-  /** The user's own uploaded logo/image — a real, ownership-checked Asset id (same upload path AI Film's character photos use). */
-  logoAssetId?: string;
-  /** User-facing video-provider selector (VIDEO output type only) — takes precedence over the template's own admin-set preferredProviderId when both are given. */
-  preferredProviderId?: string;
+  /** The user's own uploaded asset — a real, ownership-checked Asset id (same upload path AI Film's character photos use). Required whenever the template's own userAssetRequired is true. */
+  userAssetId?: string;
 }
 
 export interface GenerateFromMarketingTemplateResult {
   generationId: string;
   editorAssetId: string;
-  /** The provider that actually rendered this — VIDEO output only, undefined for IMAGE. Compare against the caller's own requested preferredProviderId to detect a real fallback happened. */
+  /** The provider that actually rendered this — VIDEO output only, undefined for IMAGE. */
   providerId?: string;
 }
 
-// Marketing Templates (2026-07-24) — the real generation orchestration:
-// resolve template -> substitute {{placeholders}} -> real provider call
-// (image or video, per the template's own outputType) conditioned on BOTH
-// the template's curated reference media AND the user's own uploaded logo
-// -> real EditorAsset (not a generic Asset — see schema comment for why).
-// Deliberately NOT built on generateCreativeImage()/CreativeProject (the
-// existing "Universal Creative Workflow") — that engine AI-enhances/
-// rewrites the prompt and has no named-placeholder substitution, and is
-// image-only; this needs literal substitution and image-or-video output.
-// Reuses its proven PRIMITIVES instead: generateImage()'s referenceImage(s)
-// conditioning, renderVideo()'s startImage conditioning, compositeLogo-
-// adjacent multi-image conditioning, createReadyEditorAsset().
+// Marketing Templates (2026-07-24, simplified in Migration v3 on 2026-08-02)
+// — the real generation orchestration: resolve template -> send the Master
+// Prompt verbatim (no placeholder substitution — removed in v3) -> real
+// provider call (image or video, per the template's own outputType)
+// conditioned on the template's own ordered reference assets AND the user's
+// own uploaded asset -> real EditorAsset (not a generic Asset — see schema
+// comment for why). Deliberately NOT built on generateCreativeImage()/
+// CreativeProject (the existing "Universal Creative Workflow") — that
+// engine AI-enhances/rewrites the prompt, and is image-only; this needs a
+// literal, admin-authored prompt and image-or-video output. Reuses its
+// proven PRIMITIVES instead: generateImage()'s multi-image referenceImages
+// conditioning, renderVideo()'s startImage conditioning,
+// createReadyEditorAsset().
 export async function generateFromMarketingTemplate(
   input: GenerateFromMarketingTemplateInput
 ): Promise<GenerateFromMarketingTemplateResult> {
   const template = await prisma.marketingTemplate.findUnique({
     where: { id: input.templateId },
-    include: { referenceMediaAsset: true },
+    include: { referenceAssets: { include: { asset: true }, orderBy: { position: "asc" } } },
   });
   if (!template || !template.isActive) {
     throw new MarketingTemplateNotReadyError("This template is not available.");
   }
   // Same "no fake UI" gate the gallery query applies — re-checked here too,
   // since a direct API call could otherwise bypass the gallery's own filter.
-  if (!template.referenceMediaAssetId || !template.referenceMediaAsset || template.promptTemplate.trim().length === 0) {
-    throw new MarketingTemplateNotReadyError("This template has no reference media or prompt configured yet.");
+  // Reference assets are optional (per the founder's own spec) — only the
+  // Master Prompt and a real, admin-locked Primary Provider are required.
+  if (template.promptTemplate.trim().length === 0 || !template.primaryProviderId) {
+    throw new MarketingTemplateNotReadyError("This template has no prompt or provider configured yet.");
   }
 
-  const finalPrompt = fillPromptTemplate(template.promptTemplate, input.filledFields); // throws MissingPlaceholderValuesError
-
-  const logoAsset = input.logoAssetId
-    ? await prisma.asset.findFirst({ where: { id: input.logoAssetId, userId: input.userId } })
+  const userAsset = input.userAssetId
+    ? await prisma.asset.findFirst({ where: { id: input.userAssetId, userId: input.userId } })
     : null;
 
-  const amount = template.creditCost;
-  if (amount > 0) {
-    const balance = await getCreditBalance(input.userId);
-    if (balance < amount) throw new InsufficientCreditsError(amount, balance);
+  // Migration v3 (2026-08-02) — validated here too, not just client-side
+  // (generate-form.tsx's own upload gate) — never trust the client alone.
+  if (template.userAssetRequired && !userAsset) {
+    throw new MissingUserAssetError("This template requires you to upload your own image or video first.");
   }
+
+  // Permanent free tier (2026-08-02) — Marketing Templates bypass the
+  // credit system completely: no balance precheck, and (below) no real
+  // charge, regardless of this template's own configured creditCost or
+  // any admin-set VIDEO_PROVIDER_CREDIT_COSTS override a video-output
+  // template's chosen provider might otherwise resolve to. `amount` is
+  // still recorded on the generation row for history/analytics — it was
+  // never a real deduction from this line, only informational.
+  const amount = template.creditCost;
 
   const generation = await prisma.marketingTemplateGeneration.create({
     data: {
       userId: input.userId,
       templateId: template.id,
-      filledFields: input.filledFields,
-      logoAssetId: logoAsset?.id,
+      // Migration v3 (2026-08-02) — the exact Master Prompt as it existed
+      // at this moment, independent of any later admin edit to the
+      // template. See schema.prisma's own comment on this column.
+      masterPromptSnapshot: template.promptTemplate,
+      userAssetId: userAsset?.id,
       status: "DRAFT",
       creditCost: amount,
     },
   });
 
+  // Migration v3 (2026-08-02) — the user never chooses a provider.
+  // allowedProviderIds restricts generateImage()/renderVideo() to EXACTLY
+  // these, in this order — Primary, then Fallback if set, then a real
+  // error. Never the old preferredProviderId's "reorder, then silently
+  // cascade through every other enabled provider in the category" behavior.
+  const allowedProviderIds = [template.primaryProviderId, template.fallbackProviderId].filter(
+    (id): id is string => Boolean(id)
+  );
+
+  // Production Hardening (2026-08-03) — set the instant storage.upload()
+  // below succeeds, so the catch block can compensate-delete it if
+  // anything AFTER the upload (the $transaction) fails. Declared outside
+  // the try so it survives into the catch's scope.
+  let uploadedStorageKey: string | undefined;
+
   try {
     const storage = await getStorageProvider();
-    const [referenceBytes, logoBytes] = await Promise.all([
-      storage.download(template.referenceMediaAsset.storageKey),
-      logoAsset ? storage.download(logoAsset.storageKey) : Promise.resolve(null),
+    const [referenceImages, userImage] = await Promise.all([
+      Promise.all(
+        template.referenceAssets.map(async (ref) => {
+          const bytes = await storage.download(ref.asset.storageKey);
+          return { mimeType: ref.asset.mimeType ?? "image/jpeg", data: bytes.toString("base64") };
+        })
+      ),
+      userAsset
+        ? storage.download(userAsset.storageKey).then((bytes) => ({ mimeType: userAsset.mimeType ?? "image/jpeg", data: bytes.toString("base64") }))
+        : Promise.resolve(null),
     ]);
-    const referenceImage = { mimeType: template.referenceMediaAsset.mimeType ?? "image/jpeg", data: referenceBytes.toString("base64") };
-    const logoImage = logoBytes && logoAsset ? { mimeType: logoAsset.mimeType ?? "image/jpeg", data: logoBytes.toString("base64") } : null;
 
     let outputBuffer: Buffer;
     let contentType: string;
@@ -96,26 +124,22 @@ export async function generateFromMarketingTemplate(
     let widthPx: number | undefined;
     let heightPx: number | undefined;
     let durationSeconds: number | undefined;
-    // Real charge — starts as the precheck estimate, replaced with the
-    // provider-resolved amount once the VIDEO branch knows which provider
-    // actually served the request. IMAGE never touches this (provider-cost
-    // overrides are VIDEO-only scope) — stays the template's own flat cost.
-    let finalAmount = amount;
     let resultProviderId: string | undefined;
 
     if (template.outputType === "IMAGE") {
-      // Both conditioning images together — template style AND the user's
-      // real logo — via the multi-image referenceImages extension (2026-07-24).
-      const referenceImages = logoImage ? [referenceImage, logoImage] : [referenceImage];
+      // Every curated reference asset, in admin-set order, plus the user's
+      // own upload last — multi-image conditioning (2026-07-24 extension).
+      const allImages = userImage ? [...referenceImages, userImage] : referenceImages;
       const result = await generateImage(
-        { prompt: finalPrompt, aspectRatio: template.aspectRatio, referenceImages },
+        { prompt: template.promptTemplate, aspectRatio: template.aspectRatio, referenceImages: allImages },
         "creative_image",
         { userId: input.userId },
-        template.preferredProviderId ?? undefined
+        template.primaryProviderId,
+        allowedProviderIds
       );
       if (result.providerId === MOCK_PROVIDER_ID) {
         throw new MarketingTemplateMockFallbackError(
-          "Generation used the placeholder provider, not a real one — no IMAGE provider is currently enabled and reachable."
+          "Generation used the placeholder provider, not a real one — neither the Primary nor Fallback provider is currently enabled and reachable."
         );
       }
       ({ buffer: outputBuffer, contentType } = await toBuffer(result.imageUrl));
@@ -125,33 +149,27 @@ export async function generateFromMarketingTemplate(
       heightPx = dims.heightPx;
     } else {
       // Video conditioning only supports one startImage — the template's
-      // own curated reference takes priority (keeps the template's visual
-      // style/scene intact); the user's logo is used only when the
-      // template has somehow lost its own reference (shouldn't happen,
-      // isReady already gates on it), never silently dropped either way.
-      //
-      // Provider preference (2026-07-24): the user's own explicit choice
-      // (input.preferredProviderId) takes precedence over the template's
-      // admin-set default (template.preferredProviderId) when both exist —
-      // also the real fix for a pre-existing gap found during investigation:
-      // template.preferredProviderId was already a real schema field and
-      // admin-editable, but was NEVER passed into renderVideo() at all (only
-      // the IMAGE branch above ever read it) — a dead knob until now.
+      // own first curated reference (admin-set order) takes priority
+      // (keeps the template's visual style/scene intact); the user's own
+      // upload is used only when the template has no reference asset at
+      // all, never silently dropped either way.
       const result = await renderVideo(
         {
-          script: finalPrompt,
+          script: template.promptTemplate,
           aspectRatio: template.aspectRatio,
           durationSeconds: 8,
           quality: "1080p",
-          startImage: referenceImage ?? logoImage ?? undefined,
+          startImage: referenceImages[0] ?? userImage ?? undefined,
         },
         "creative_video",
         { userId: input.userId },
-        input.preferredProviderId ?? template.preferredProviderId ?? undefined
+        template.primaryProviderId,
+        undefined,
+        allowedProviderIds
       );
       if (result.providerId === MOCK_PROVIDER_ID) {
         throw new MarketingTemplateMockFallbackError(
-          "Generation used the placeholder provider, not a real one — no VIDEO provider is currently enabled and reachable."
+          "Generation used the placeholder provider, not a real one — neither the Primary nor Fallback provider is currently enabled and reachable."
         );
       }
       const { buffer, contentType: videoContentType } = await toBuffer(result.videoUrl);
@@ -162,10 +180,6 @@ export async function generateFromMarketingTemplate(
       const dims = EDITOR_DIMENSIONS_BY_ASPECT[template.aspectRatio];
       widthPx = dims.widthPx;
       heightPx = dims.heightPx;
-      // Charged for whichever provider actually rendered this
-      // (result.providerId), not necessarily the one requested — see
-      // veo-lite-video.ts's identical comment/reasoning.
-      finalAmount = await resolveVideoProviderCredits(amount, result.providerId);
       resultProviderId = result.providerId;
     }
 
@@ -174,6 +188,7 @@ export async function generateFromMarketingTemplate(
       data: outputBuffer,
       contentType,
     });
+    uploadedStorageKey = uploaded.key;
 
     const { editorAsset } = await prisma.$transaction(async (tx) => {
       const editorAsset = await createReadyEditorAsset(
@@ -190,12 +205,9 @@ export async function generateFromMarketingTemplate(
         },
         tx
       );
-      if (finalAmount > 0) {
-        await consumeCredits(
-          { userId: input.userId, amount: finalAmount, type: "AI_GENERATION", description: `Marketing template: ${template.name}` },
-          tx
-        );
-      }
+      // Permanent free tier (2026-08-02) — no consumeCredits() call here,
+      // ever, regardless of the template's own configured creditCost —
+      // Marketing Templates never actually charge.
       await tx.marketingTemplateGeneration.update({
         where: { id: generation.id },
         data: { status: "COMPLETED", resultEditorAssetId: editorAsset.id },
@@ -205,10 +217,19 @@ export async function generateFromMarketingTemplate(
 
     return { generationId: generation.id, editorAssetId: editorAsset.id, providerId: resultProviderId };
   } catch (err) {
+    // Production Hardening (2026-08-03) — the upload above can succeed and
+    // then the $transaction (EditorAsset creation / credit charge / status
+    // update) can still fail — without this, that real, already-billed
+    // storage object would be orphaned forever (nothing in the DB ever
+    // points at it, since the generation row below only gets marked
+    // FAILED, never given a resultEditorAssetId). Best-effort: a cleanup
+    // failure must never replace or hide the original error.
+    if (uploadedStorageKey) {
+      const storage = await getStorageProvider();
+      await storage.delete(uploadedStorageKey);
+    }
     const message = err instanceof Error ? err.message : "Generation failed for an unknown reason.";
     await prisma.marketingTemplateGeneration.update({ where: { id: generation.id }, data: { status: "FAILED", errorMessage: message } });
     throw err;
   }
 }
-
-export { MissingPlaceholderValuesError };

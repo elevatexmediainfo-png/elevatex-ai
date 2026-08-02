@@ -49,4 +49,15 @@ export interface StorageProvider {
    * that a completed PUT request means the full file arrived intact.
    */
   getObjectSize(key: string): Promise<number | null>;
+
+  /**
+   * Production Hardening (2026-08-03) — compensating delete for a
+   * successful upload whose LATER step (a DB write/transaction) failed,
+   * so the caller isn't left with a real, billed storage object nothing
+   * in the database ever points to. Best-effort by design: deleting an
+   * already-gone or never-existed key must never throw — a cleanup
+   * failure must never mask or replace the original error that triggered
+   * it (see generateFromMarketingTemplate's own catch block).
+   */
+  delete(key: string): Promise<void>;
 }

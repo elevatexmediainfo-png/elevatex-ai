@@ -10,21 +10,24 @@ import {
   generateFromMarketingTemplate,
   MarketingTemplateNotReadyError,
   MarketingTemplateMockFallbackError,
-  MissingPlaceholderValuesError,
+  MissingUserAssetError,
 } from "@/lib/marketing-templates/generate";
 
+// Migration v3 (2026-08-02) — no more filledFields/preferredProviderId. The
+// Master Prompt is never user-editable, and the provider is always
+// admin-locked to the template (Primary -> Fallback -> Error, resolved
+// entirely server-side) — the user only ever supplies their own asset.
 const generateSchema = z.object({
-  filledFields: z.record(z.string(), z.string().trim().max(500)),
-  logoAssetId: z.string().trim().min(1).optional(),
-  preferredProviderId: z.string().trim().min(1).optional(),
+  userAssetId: z.string().trim().min(1).optional(),
 });
 
-// POST /api/marketing-templates/[id]/generate — real generation: fills the
-// template's own {{placeholders}} with the user's real input, conditions on
-// the template's reference media + the user's own uploaded logo, calls the
-// real generation provider, lands the output as a real EditorAsset. Hard-
-// fails on a mock-fallback result (same standard as VIDEO/VOICE/FILM this
-// session) rather than silently persisting placeholder content.
+// POST /api/marketing-templates/[id]/generate — real generation: sends the
+// template's own Master Prompt verbatim, conditions on the template's
+// ordered reference assets + the user's own uploaded asset, calls the
+// real generation provider (Primary, then Fallback), lands the output as a
+// real EditorAsset. Hard-fails on a mock-fallback result (same standard as
+// VIDEO/VOICE/FILM this session) rather than silently persisting
+// placeholder content.
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireSession();
   if (!session) return apiError("ERR_UNAUTHENTICATED", "You must be signed in.", 401);
@@ -33,16 +36,14 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   const body = await req.json().catch(() => ({}));
   const parsed = generateSchema.safeParse(body);
   if (!parsed.success) {
-    return apiError("ERR_VALIDATION", "Please fill in every field.", 400, { issues: parsed.error.issues });
+    return apiError("ERR_VALIDATION", "Invalid request.", 400, { issues: parsed.error.issues });
   }
 
   try {
     const result = await generateFromMarketingTemplate({
       userId: session.user.id,
       templateId: id,
-      filledFields: parsed.data.filledFields,
-      logoAssetId: parsed.data.logoAssetId,
-      preferredProviderId: parsed.data.preferredProviderId,
+      userAssetId: parsed.data.userAssetId,
     });
 
     // Resolved here (not inside generateFromMarketingTemplate() itself) —
@@ -57,8 +58,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     if (err instanceof MarketingTemplateNotReadyError) {
       return apiError("ERR_NOT_FOUND", err.message, 404);
     }
-    if (err instanceof MissingPlaceholderValuesError) {
-      return apiError("ERR_VALIDATION", err.message, 400, { missing: err.missing });
+    if (err instanceof MissingUserAssetError) {
+      return apiError("ERR_VALIDATION", err.message, 400);
     }
     if (err instanceof InsufficientCreditsError) {
       return apiError("ERR_INSUFFICIENT_CREDITS", err.message, 402);

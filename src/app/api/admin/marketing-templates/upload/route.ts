@@ -65,6 +65,7 @@ export async function POST(req: NextRequest) {
     return apiSuccess({ asset }, 201);
   } catch (err) {
     console.error("POST /api/admin/marketing-templates/upload failed", err);
-    return apiError("ERR_INTERNAL", "Something went wrong. Please try again.", 500);
+    const message = err instanceof Error ? err.message : "Something went wrong. Please try again.";
+    return apiError("ERR_INTERNAL", message, 500);
   }
 }

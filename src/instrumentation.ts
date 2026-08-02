@@ -73,6 +73,14 @@ export async function register() {
     const { startFilmSceneReaper } = await import("@/lib/film/scene-reaper");
     startFilmSceneReaper();
 
+    // Marketing Template generation reaper (2026-08-03) — a sixth,
+    // independently-tuned poll loop, same "recover a status a killed/
+    // restarted process orphaned" reasoning as the film scene reaper
+    // above, for generateFromMarketingTemplate() specifically (also a
+    // synchronous HTTP call, not a queued job).
+    const { startMarketingTemplateGenerationReaper } = await import("@/lib/marketing-templates/generation-reaper");
+    startMarketingTemplateGenerationReaper();
+
     // Launch-readiness startup warning (2026-07-23) — getInstallationChecklist()
     // was already correctly computed but only ever visible to an admin who
     // opened Command Center/the admin layout's own banner; a real config

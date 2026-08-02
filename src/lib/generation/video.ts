@@ -46,7 +46,15 @@ export async function renderVideo(
   context?: GenerationContext,
   preferredProviderId?: string,
   /** Real progress feedback (2026-07-25) — see GenerationProgressEvent's own comment. Optional; every existing caller that doesn't pass one is unaffected. */
-  onProgress?: (event: GenerationProgressEvent) => void | Promise<void>
+  onProgress?: (event: GenerationProgressEvent) => void | Promise<void>,
+  /**
+   * Marketing Templates' admin-locked Primary/Fallback (2026-08-02) —
+   * mirrors generateImage()'s identical param exactly: restricts the chain
+   * to EXACTLY these ids, in this order, instead of preferredProviderId's
+   * reorder-then-cascade-through-everything-else behavior. Every other
+   * existing caller omits it and is unaffected.
+   */
+  allowedProviderIds?: string[]
 ): Promise<VideoRenderResultWithProvider> {
   // Hard cap (2026-07-24) — enforced here so every real caller (Quick
   // Video, GENERATED, FILM, Marketing Templates, AI Auto-Editor b-roll)
@@ -57,7 +65,8 @@ export async function renderVideo(
   assertWithinVideoDurationCap(req.durationSeconds);
 
   const priority = await listEnabledProviderConfigs("VIDEO");
-  const providers = await Promise.all(priority.map((id) => instantiateVideoProvider(id as VideoProviderId)));
+  const scoped = allowedProviderIds ? priority.filter((id) => allowedProviderIds.includes(id)) : priority;
+  const providers = await Promise.all(scoped.map((id) => instantiateVideoProvider(id as VideoProviderId)));
 
   // Real bug fix (2026-07-25) — a provider with a confirmed, fixed set of
   // supported durations (e.g. Sora's 4/8/12s only) is a guaranteed, wasted

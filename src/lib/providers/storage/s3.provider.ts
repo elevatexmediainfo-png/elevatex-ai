@@ -1,4 +1,4 @@
-import { GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 import type { ProviderRuntimeConfig } from "../credentials";
@@ -164,6 +164,18 @@ export class S3StorageProvider implements StorageProvider {
       const name = (err as { name?: string })?.name;
       if (name === "NotFound" || name === "NoSuchKey") return null;
       throw err;
+    }
+  }
+
+  // Best-effort — S3's DeleteObject is already idempotent (no error on a
+  // missing key), and any other failure here must never propagate: this is
+  // always called from a caller's own cleanup path, never one a user is
+  // waiting on the result of.
+  async delete(key: string): Promise<void> {
+    try {
+      await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
+    } catch (err) {
+      console.error(`[S3StorageProvider] compensating delete failed for key ${key}`, err);
     }
   }
 }

@@ -16,6 +16,15 @@ import { ASPECT_RATIOS_BY_OUTPUT_TYPE } from "@/lib/marketing-templates/aspect-r
 // ASPECT_RATIOS_BY_OUTPUT_TYPE's real Veo constraint (see that file's own
 // comment) — the admin manager's Select already filters this client-side,
 // but a direct API call must be rejected too, never trusted client-only.
+// Migration v3 (2026-08-02) — preferredProviderId replaced by
+// primaryProviderId/fallbackProviderId (the user never picks a provider —
+// it's always admin-locked). Both stay optional at CREATE time, same as
+// promptTemplate — the founder's own established two-step workflow
+// (create a bare shell, fill in the rest on the card that appears) applies
+// here too; a template with no primaryProviderId is simply not "ready"
+// (see isReady/generateFromMarketingTemplate's own gate), same as a
+// missing prompt today. fallbackProviderId, if given, must differ from
+// primaryProviderId — otherwise "Primary -> Fallback" is a no-op.
 const createSchema = z
   .object({
     name: z.string().trim().min(1).max(150),
@@ -24,7 +33,9 @@ const createSchema = z
     outputType: z.enum(["IMAGE", "VIDEO"]),
     aspectRatio: z.enum(["RATIO_9_16", "RATIO_1_1", "RATIO_16_9"]),
     promptTemplate: z.string().trim().max(4000).default(""),
-    preferredProviderId: z.string().trim().max(60).nullable().optional(),
+    primaryProviderId: z.string().trim().min(1).max(60).nullable().optional(),
+    fallbackProviderId: z.string().trim().min(1).max(60).nullable().optional(),
+    userAssetRequired: z.boolean().default(false),
     creditCost: z.number().int().min(0).default(1),
     isActive: z.boolean().default(true),
     isFeatured: z.boolean().default(false),
@@ -33,6 +44,10 @@ const createSchema = z
   .refine((data) => ASPECT_RATIOS_BY_OUTPUT_TYPE[data.outputType].includes(data.aspectRatio), {
     message: "This aspect ratio isn't supported for this output type (Veo doesn't support 1:1 video).",
     path: ["aspectRatio"],
+  })
+  .refine((data) => !data.fallbackProviderId || data.fallbackProviderId !== data.primaryProviderId, {
+    message: "Fallback Provider must be different from Primary Provider.",
+    path: ["fallbackProviderId"],
   });
 
 export async function GET() {
@@ -41,7 +56,10 @@ export async function GET() {
 
   const templates = await prisma.marketingTemplate.findMany({
     orderBy: [{ sortOrder: "asc" }, { createdAt: "desc" }],
-    include: { referenceMediaAsset: { select: { id: true, storageKey: true, mimeType: true } }, _count: { select: { generations: true } } },
+    include: {
+      referenceAssets: { include: { asset: { select: { id: true, storageKey: true, mimeType: true } } }, orderBy: { position: "asc" } },
+      _count: { select: { generations: true } },
+    },
   });
   return apiSuccess({ templates });
 }

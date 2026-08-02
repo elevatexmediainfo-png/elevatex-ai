@@ -375,19 +375,34 @@ enum MarketingTemplateOutputType {
   VIDEO
 }
 
-// Admin-managed prompt+reference templates (2026-07-24) — distinct from the
-// Template model above, which is structurally tied to GENERATED's
-// script-ad wizard (vertical/platform/duration/voiceover/scene-split, and
-// promptTemplate is an LLM script-writing SEED, never substituted
-// directly). This model's promptTemplate is a literal string with named
-// {{placeholders}} (lib/marketing-templates/placeholders.ts), substituted
-// directly and sent as-is to a real image/video generation provider
-// alongside referenceMediaAsset (the admin's own curated style/reference)
-// and the user's own uploaded logo (MarketingTemplateGeneration.logoAsset)
-// — a fundamentally different, simpler mechanism than either Template or
-// CreativeProject's "Universal Creative Workflow" (AI-enhanced/rewritten
-// prompts, no named placeholders) — see PROJECT_STATUS.md's 2026-07-24
-// investigation entry for the full reasoning against reusing either.
+// Migration v3 (2026-08-02) — Reference Assets get an optional descriptive
+// role. Purely metadata for now ("the provider MAY use these roles in
+// future" per the founder's own spec) — generation logic does not branch on
+// this yet. Enum (not a free string) to match this schema's own convention
+// for fixed vocabularies (AspectRatio, BillingModel, etc.) — the tradeoff,
+// confirmed with the founder, is a small migration if a 7th role is ever
+// added, versus zero validation with a free string.
+enum MarketingTemplateAssetRole {
+  STYLE
+  COMPOSITION
+  LIGHTING
+  COLOR
+  TYPOGRAPHY
+  BRANDING
+}
+
+// Admin-managed prompt+reference templates (2026-07-24, simplified in
+// Migration v3 on 2026-08-02) — distinct from the Template model above,
+// which is structurally tied to GENERATED's script-ad wizard
+// (vertical/platform/duration/voiceover/scene-split, and promptTemplate is
+// an LLM script-writing SEED, never substituted directly). This model's
+// promptTemplate ("Master Prompt") is sent to the generation provider
+// verbatim — no placeholder substitution (removed in v3), no AI rewriting —
+// alongside referenceAssets (the admin's own curated, ordered style
+// references) and the user's own uploaded asset
+// (MarketingTemplateGeneration.userAsset) — a fundamentally different,
+// simpler mechanism than either Template or CreativeProject's "Universal
+// Creative Workflow".
 model MarketingTemplate {
   id          String  @id @default(cuid())
   name        String
@@ -397,25 +412,54 @@ model MarketingTemplate {
   outputType  MarketingTemplateOutputType
   aspectRatio AspectRatio
 
-  // The admin's own curated reference image/video for this template's
-  // style — reused as a generation-conditioning input for EVERY user who
-  // generates from this template (not the user's own uploaded logo below,
-  // which is per-generation). Nullable — a template with no reference
-  // media set is not "ready" (see the isReady computation in
-  // lib/marketing-templates/queries.ts).
+  // Legacy single reference (pre-migration-v3) — kept read-only for
+  // backward compatibility with templates created before multi-asset
+  // support (MarketingTemplateAsset below). New templates use the join
+  // table exclusively; a pre-existing template's single reference was
+  // backfilled into that table too (see the v3 migration), so this field
+  // is no longer read by generation — only kept so the column isn't lost.
   referenceMediaAssetId String?
   referenceMediaAsset   Asset?  @relation("MarketingTemplateReferenceAsset", fields: [referenceMediaAssetId], references: [id], onDelete: SetNull)
 
-  // Literal prompt text with named {{placeholder}} tokens, substituted
-  // directly (never wrapped/prefixed/LLM-rewritten) before being sent to
-  // the generation provider — see lib/marketing-templates/placeholders.ts.
+  // Ordered, multi-asset replacement for referenceMediaAsset above
+  // (Migration v3, 2026-08-02) — an admin-curated style/reference asset
+  // list reused as generation-conditioning input for every user who
+  // generates from this template. A template with zero reference assets
+  // is still valid (they're optional) — the "ready" gate
+  // (generateFromMarketingTemplate, the gallery/detail page queries) only
+  // requires a non-empty promptTemplate and a primaryProviderId.
+  referenceAssets MarketingTemplateAsset[]
+
+  // Master Prompt — a complete, production-quality prompt written by the
+  // admin. Users never see or edit it (Migration v3, 2026-08-02 — replaces
+  // the earlier {{placeholder}} substitution model entirely; see
+  // MarketingTemplateGeneration.masterPromptSnapshot for why past
+  // generations remain provably unaffected by later edits here).
   promptTemplate String @default("") @db.Text
 
-  // Reorders the existing priority-filtered provider list for this
-  // template's outputType category (IMAGE or VIDEO) — same
-  // CreativeTool.defaultProviderId convention: never a hard requirement,
-  // failover to another enabled provider is unaffected if unset/unhealthy.
-  preferredProviderId String?
+  // Migration v3 (2026-08-02) — the user never chooses a provider; it's
+  // always admin-locked to the template. Generation always tries Primary,
+  // then Fallback (if set), then surfaces a real error — never silently
+  // cascades through every other enabled provider in the category the way
+  // the old single preferredProviderId's reorder-then-cascade behavior
+  // did. Both validated against the real provider catalogue for this
+  // template's outputType category; fallbackProviderId must differ from
+  // primaryProviderId when set (enforced at the API layer, not the DB).
+  // Nullable at the DB level for backward compatibility with templates
+  // that predate this migration and never had one set — such a template
+  // is treated as not "ready" (see isReady) until an admin sets one,
+  // exactly like a missing prompt or reference media already gates
+  // browseability today.
+  primaryProviderId   String?
+  fallbackProviderId  String?
+
+  // Migration v3 (2026-08-02) — independent admin toggle (not derived from
+  // a template "type", which the founder explicitly decided against
+  // keeping). Validated both client-side (Generate button stays disabled
+  // until an asset is uploaded) and server-side (generateFromMarketingTemplate
+  // rejects a missing asset when this is true) — never trust the client
+  // check alone.
+  userAssetRequired Boolean @default(false)
 
   creditCost Int @default(1)
 
@@ -432,13 +476,33 @@ model MarketingTemplate {
   @@map("marketing_templates")
 }
 
+// Migration v3 (2026-08-02) — ordered join table replacing
+// MarketingTemplate.referenceMediaAssetId's single-asset limit. Same
+// established many-to-many convention as EditorCollectionAsset (composite
+// key, no synthetic id needed). `position` uses gapped integers (1000,
+// 2000, 3000...) rather than gapless 0,1,2 — a future drag-and-drop
+// reorder only needs to renumber the two rows straddling the drop point
+// (or insert at (a+b)/2), never the entire list.
+model MarketingTemplateAsset {
+  templateId String
+  template   MarketingTemplate          @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  assetId    String
+  asset      Asset                      @relation("MarketingTemplateAssetAsset", fields: [assetId], references: [id], onDelete: Cascade)
+  position   Int
+  role       MarketingTemplateAssetRole?
+  addedAt    DateTime                   @default(now())
+
+  @@id([templateId, assetId])
+  @@index([templateId, position])
+  @@map("marketing_template_assets")
+}
+
 // One row per real, user-triggered generation from a MarketingTemplate —
 // mirrors CreativeProject's own resultAssetId/status/errorMessage shape,
 // but the result lands as a real EditorAsset (not a generic Asset) per the
-// explicit "everything lands in the real editor" requirement, and
-// filledFields is the real placeholder->value map the user actually typed
-// (kept for a real generation history, not just the final substituted
-// prompt string).
+// explicit "everything lands in the real editor" requirement.
+// masterPromptSnapshot (Migration v3) is the real record of what was
+// actually sent, independent of any later edit to the template.
 model MarketingTemplateGeneration {
   id         String            @id @default(cuid())
   userId     String
@@ -446,10 +510,26 @@ model MarketingTemplateGeneration {
   templateId String
   template   MarketingTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
 
-  filledFields Json
+  // Legacy (pre-migration-v3) — the placeholder->value map the user
+  // actually typed. No longer written for new generations (there are no
+  // more user-fillable placeholders), kept nullable so historical rows
+  // stay exactly as they were recorded.
+  filledFields Json?
 
-  logoAssetId String?
-  logoAsset   Asset?  @relation("MarketingTemplateGenerationLogoAsset", fields: [logoAssetId], references: [id], onDelete: SetNull)
+  // Migration v3 (2026-08-02) — the exact promptTemplate value at the
+  // moment of THIS generation, copied in before the provider is called.
+  // Makes "Master Prompt is immutable during generation" a recorded,
+  // auditable fact rather than an implicit property of the architecture —
+  // an admin editing the template later can never change what this row
+  // says was actually sent. Nullable only because historical
+  // (pre-migration) rows have no recorded snapshot.
+  masterPromptSnapshot String? @db.Text
+
+  // Renamed from logoAssetId (pre-migration-v3) — the user's own uploaded
+  // asset is no longer specifically "a logo", it's whatever this
+  // template's outputType/userAssetRequired calls for.
+  userAssetId String?
+  userAsset   Asset?  @relation("MarketingTemplateGenerationUserAsset", fields: [userAssetId], references: [id], onDelete: SetNull)
 
   status       CreativeProjectStatus @default(DRAFT)
   creditCost   Int                   @default(0)
@@ -1581,7 +1661,8 @@ model Asset {
   logoForCreativeProjects      CreativeProject[] @relation("CreativeProjectLogoAsset")
   analysis                     AssetAnalysis?
   referenceForMarketingTemplates    MarketingTemplate[]           @relation("MarketingTemplateReferenceAsset")
-  logoForMarketingGenerations       MarketingTemplateGeneration[] @relation("MarketingTemplateGenerationLogoAsset")
+  referenceItemForMarketingTemplates MarketingTemplateAsset[]     @relation("MarketingTemplateAssetAsset")
+  userAssetForMarketingGenerations  MarketingTemplateGeneration[] @relation("MarketingTemplateGenerationUserAsset")
 
   createdAt DateTime @default(now())
 

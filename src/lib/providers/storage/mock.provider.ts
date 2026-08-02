@@ -155,4 +155,14 @@ export class MockStorageProvider implements StorageProvider {
       return null;
     }
   }
+
+  // Best-effort, same contract as S3StorageProvider.delete(). A no-op for
+  // an external (passthrough) key — mock mode never owns that object, only
+  // points at it.
+  async delete(key: string): Promise<void> {
+    if (isExternalUrl(key)) return;
+    await rm(path.join(UPLOAD_ROOT, key), { force: true }).catch((err) => {
+      console.error(`[MockStorageProvider] compensating delete failed for key ${key}`, err);
+    });
+  }
 }

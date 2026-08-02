@@ -18,10 +18,21 @@ export async function generateImage(
   req: ImageGenerateRequest,
   operation: "thumbnail" | "scene_image" | "creative_image" | "film_character" | "ai_broll_image" | "film_scene_preview" = "thumbnail",
   context?: GenerationContext,
-  preferredProviderId?: string
+  preferredProviderId?: string,
+  /**
+   * Marketing Templates' admin-locked Primary/Fallback (2026-08-02) — unlike
+   * preferredProviderId (which only reorders, leaving the rest of the
+   * enabled category as a silent extended cascade), this restricts the
+   * chain to EXACTLY these ids, in this order. Every other existing caller
+   * omits it and is completely unaffected — runGeneration() already throws
+   * AllProvidersFailedError on an empty chain, so "Primary -> Fallback ->
+   * Error" falls out of this filter with no engine changes.
+   */
+  allowedProviderIds?: string[]
 ): Promise<ImageGenerateResultWithProvider> {
   const priority = await listEnabledProviderConfigs("IMAGE");
-  const providers = await Promise.all(priority.map((id) => instantiateImageProvider(id as ImageProviderId)));
+  const scoped = allowedProviderIds ? priority.filter((id) => allowedProviderIds.includes(id)) : priority;
+  const providers = await Promise.all(scoped.map((id) => instantiateImageProvider(id as ImageProviderId)));
   const ordered = reorderProvidersByPreference(providers, preferredProviderId);
 
   return runGeneration({
