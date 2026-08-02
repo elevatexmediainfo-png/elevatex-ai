@@ -96,11 +96,26 @@ export function MarketingTemplatesManager() {
   // navigation anywhere, the card is already on this same page.
   const pendingFocusId = React.useRef<string | null>(null);
 
+  // Real bug fix (2026-08-04) — this used to have no error handling at
+  // all: a failed refresh (a transient error, a non-JSON/HTML error
+  // response, `json.success === false`) simply did nothing — no toast, no
+  // retry, and `templates` state was left exactly as it was. Since this
+  // is called again after every create/patch/delete, a silently-failed
+  // post-create refresh looked identical to "nothing was created" (the
+  // page stays on whatever `templates` already held, which right after a
+  // fresh empty page load is `[]`) even though the POST itself succeeded.
   const load = React.useCallback(() => {
     fetch("/api/admin/marketing-templates")
-      .then((res) => res.json())
-      .then((json) => {
-        if (json.success) setTemplates(json.data.templates);
+      .then(async (res) => {
+        const json = await res.json().catch(() => null);
+        if (!json || !json.success) {
+          toast.error(json?.error?.message ?? "Couldn't load marketing templates. Please refresh the page.");
+          return;
+        }
+        setTemplates(json.data.templates);
+      })
+      .catch(() => {
+        toast.error("Network error while loading marketing templates. Please refresh the page.");
       });
   }, []);
 
