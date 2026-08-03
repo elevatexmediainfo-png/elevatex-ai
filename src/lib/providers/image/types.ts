@@ -4,7 +4,18 @@ export interface ImageGenerateRequest {
   prompt: string;
   /** Things to steer the image away from. Supported by some adapters (e.g. Flux on Replicate); silently ignored where the vendor API has no such parameter. */
   negativePrompt?: string;
-  aspectRatio: "RATIO_9_16" | "RATIO_1_1" | "RATIO_16_9";
+  // Widened (2026-08-03) for Marketing Templates' expanded IMAGE layout set
+  // — video/types.ts's own aspectRatio union stays at the original 3 on
+  // purpose (VIDEO output wasn't widened; see aspect-ratios.ts's comment).
+  aspectRatio:
+    | "RATIO_9_16"
+    | "RATIO_1_1"
+    | "RATIO_16_9"
+    | "RATIO_4_5"
+    | "RATIO_3_4"
+    | "RATIO_2_3"
+    | "RATIO_3_2"
+    | "RATIO_4_3";
   /**
    * AI Film character variations (2026-07-12) — an existing image to condition
    * generation on (Gemini's multimodal "text-and-image-to-image" editing input,

@@ -5,9 +5,14 @@ import { NonRetryableProviderError } from "@/lib/generation/types";
 // Gemini has no separate width/height parameter for image generation (unlike
 // OpenAI) — aspect ratio is steered via prompt phrasing, folded in below.
 const ASPECT_HINT: Record<ImageGenerateRequest["aspectRatio"], string> = {
-  RATIO_9_16: "a vertical 9:16 portrait image",
   RATIO_1_1: "a square 1:1 image",
+  RATIO_4_5: "a vertical 4:5 portrait image",
+  RATIO_3_4: "a vertical 3:4 portrait image",
+  RATIO_2_3: "a vertical 2:3 portrait image",
+  RATIO_9_16: "a vertical 9:16 portrait image",
   RATIO_16_9: "a horizontal 16:9 landscape image",
+  RATIO_3_2: "a horizontal 3:2 landscape image",
+  RATIO_4_3: "a horizontal 4:3 landscape image",
 };
 
 // "Nano Banana Pro" — Google's current image-generation model (as of this

@@ -148,6 +148,22 @@ export async function generateFromMarketingTemplate(
       widthPx = dims.widthPx;
       heightPx = dims.heightPx;
     } else {
+      // Real narrowing, not a cast — AspectRatio was widened to 8 values
+      // for the IMAGE output type (2026-08-03), but VIDEO output was
+      // deliberately kept at the original 2 (ASPECT_RATIOS_BY_OUTPUT_TYPE.
+      // VIDEO, enforced by the admin API's own validation). A VIDEO
+      // template can never actually carry one of the 5 new values, but
+      // TypeScript can't know that from the DB row's type alone — this
+      // guard makes the video provider call's narrower aspectRatio type
+      // correct without a cast, and fails loudly (not silently) in the
+      // impossible case of a template that somehow got misconfigured.
+      const { aspectRatio } = template;
+      if (aspectRatio !== "RATIO_9_16" && aspectRatio !== "RATIO_16_9") {
+        throw new MarketingTemplateNotReadyError(
+          `This template's aspect ratio (${aspectRatio}) isn't supported for video output.`
+        );
+      }
+
       // Video conditioning only supports one startImage — the template's
       // own first curated reference (admin-set order) takes priority
       // (keeps the template's visual style/scene intact); the user's own
@@ -156,7 +172,7 @@ export async function generateFromMarketingTemplate(
       const result = await renderVideo(
         {
           script: template.promptTemplate,
-          aspectRatio: template.aspectRatio,
+          aspectRatio,
           durationSeconds: 8,
           quality: "1080p",
           startImage: referenceImages[0] ?? userImage ?? undefined,

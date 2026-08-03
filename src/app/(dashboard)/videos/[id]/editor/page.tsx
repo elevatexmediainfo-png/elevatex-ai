@@ -35,6 +35,17 @@ export default async function EditorPage({
 
   const scenes = await prisma.scene.findMany({ where: { videoProjectId: id }, orderBy: { order: "asc" } });
 
+  // Real narrowing, not a cast — the shared Prisma AspectRatio enum was
+  // widened to 8 values for Marketing Templates' IMAGE output type
+  // (2026-08-03); VideoProject's own creation flow never offers any of the
+  // 5 new values (its own form has its own independent 3-option list), so
+  // this is a type-level ripple only, never an actual runtime case — but it
+  // fails loudly rather than silently mis-rendering if that ever changes.
+  const { aspectRatio } = project;
+  if (aspectRatio !== "RATIO_9_16" && aspectRatio !== "RATIO_1_1" && aspectRatio !== "RATIO_16_9") {
+    throw new Error(`VideoProject ${project.id} has an unsupported aspect ratio for the legacy editor: ${aspectRatio}`);
+  }
+
   await ensureTimeline(id);
   const { tracks, clips } = await listTimeline(id);
 
@@ -54,7 +65,7 @@ export default async function EditorPage({
         id: project.id,
         title: project.title,
         status: project.status,
-        aspectRatio: project.aspectRatio,
+        aspectRatio,
         durationSeconds: project.durationSeconds,
       }}
       initialScenes={scenes.map((s) => ({

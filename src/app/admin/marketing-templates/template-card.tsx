@@ -11,7 +11,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { ASPECT_RATIOS_BY_OUTPUT_TYPE } from "@/lib/marketing-templates/aspect-ratios";
+import { ASPECT_RATIO_LABELS, ASPECT_RATIOS_BY_OUTPUT_TYPE } from "@/lib/marketing-templates/aspect-ratios";
 import { cn } from "@/lib/utils";
 import {
   ASSET_ROLE_LABELS,
@@ -233,7 +233,7 @@ export function TemplateCard({
               <SelectContent>
                 {ASPECT_RATIOS_BY_OUTPUT_TYPE[form.outputType].map((a) => (
                   <SelectItem key={a} value={a}>
-                    {a}
+                    {ASPECT_RATIO_LABELS[a]}
                   </SelectItem>
                 ))}
               </SelectContent>

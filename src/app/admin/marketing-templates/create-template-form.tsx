@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { ASPECT_RATIOS_BY_OUTPUT_TYPE } from "@/lib/marketing-templates/aspect-ratios";
+import { ASPECT_RATIO_LABELS, ASPECT_RATIOS_BY_OUTPUT_TYPE } from "@/lib/marketing-templates/aspect-ratios";
 import { OUTPUT_TYPE_OPTIONS, type AspectRatio, type OutputType } from "./types";
 
 interface NewTemplateInput {
@@ -101,7 +101,7 @@ export function CreateTemplateForm({ onCreate }: { onCreate: (input: NewTemplate
             <SelectContent>
               {ASPECT_RATIOS_BY_OUTPUT_TYPE[form.outputType].map((a) => (
                 <SelectItem key={a} value={a}>
-                  {a}
+                  {ASPECT_RATIO_LABELS[a]}
                 </SelectItem>
               ))}
             </SelectContent>

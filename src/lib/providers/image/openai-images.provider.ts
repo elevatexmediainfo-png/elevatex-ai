@@ -1,10 +1,21 @@
 import type { ProviderRuntimeConfig } from "../credentials";
 import type { ImageGenerateRequest, ImageGenerateResult, ImageProvider } from "./types";
 
+// gpt-image-1/1.5's `size` param only accepts these 3 fixed values (no
+// arbitrary aspect ratio) — every ratio buckets to whichever of the 3 is
+// closest by orientation, same approximation the original 9:16/16:9 entries
+// already relied on (1024x1536 is actually 2:3, not exactly 9:16; 1536x1024
+// is actually 3:2, not exactly 16:9 — there is no exact OpenAI size for
+// either, and never was).
 const SIZE_BY_RATIO: Record<ImageGenerateRequest["aspectRatio"], string> = {
-  RATIO_9_16: "1024x1536",
   RATIO_1_1: "1024x1024",
+  RATIO_4_5: "1024x1536",
+  RATIO_3_4: "1024x1536",
+  RATIO_2_3: "1024x1536",
+  RATIO_9_16: "1024x1536",
   RATIO_16_9: "1536x1024",
+  RATIO_3_2: "1536x1024",
+  RATIO_4_3: "1536x1024",
 };
 
 // gpt-image-1.5 has stronger instruction following than gpt-image-1 —

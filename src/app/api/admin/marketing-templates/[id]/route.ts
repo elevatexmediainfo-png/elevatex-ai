@@ -11,7 +11,9 @@ const patchSchema = z.object({
   description: z.string().trim().max(500).nullable().optional(),
   category: z.string().trim().max(60).nullable().optional(),
   outputType: z.enum(["IMAGE", "VIDEO"]).optional(),
-  aspectRatio: z.enum(["RATIO_9_16", "RATIO_1_1", "RATIO_16_9"]).optional(),
+  aspectRatio: z
+    .enum(["RATIO_1_1", "RATIO_4_5", "RATIO_3_4", "RATIO_2_3", "RATIO_9_16", "RATIO_16_9", "RATIO_3_2", "RATIO_4_3"])
+    .optional(),
   promptTemplate: z.string().trim().max(4000).optional(),
   // Migration v3 (2026-08-02) — preferredProviderId replaced; see
   // route.ts's own comment for why both stay optional/nullable.

@@ -4,10 +4,18 @@ import type { ImageGenerateRequest, ImageGenerateResult, ImageProvider } from ".
 const POLL_INTERVAL_MS = 2000;
 const MAX_POLL_ATTEMPTS = 30; // ~1 minute
 
+// Flux's aspect_ratio param natively accepts all of these as literal "W:H"
+// strings (a richer preset set than OpenAI/Imagen/Ideogram) — no bucketing
+// needed, every ratio maps exactly.
 const ASPECT_RATIO_MAP: Record<ImageGenerateRequest["aspectRatio"], string> = {
-  RATIO_9_16: "9:16",
   RATIO_1_1: "1:1",
+  RATIO_4_5: "4:5",
+  RATIO_3_4: "3:4",
+  RATIO_2_3: "2:3",
+  RATIO_9_16: "9:16",
   RATIO_16_9: "16:9",
+  RATIO_3_2: "3:2",
+  RATIO_4_3: "4:3",
 };
 
 // Real adapter — Flux (Black Forest Labs) hosted via Replicate's prediction

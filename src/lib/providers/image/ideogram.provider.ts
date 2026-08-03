@@ -1,10 +1,19 @@
 import type { ProviderRuntimeConfig } from "../credentials";
 import type { ImageGenerateRequest, ImageGenerateResult, ImageProvider } from "./types";
 
+// Ideogram's aspect_ratio enum natively covers 1:1/3:4/4:3/9:16/16:9/3:2/2:3
+// — every new ratio here has a real, exact preset except 4:5, which has no
+// documented Ideogram preset and buckets to the closest one (3:4, 0.75 vs
+// 4:5's 0.8) rather than guessing at an enum value that might not exist.
 const ASPECT_RATIO_MAP: Record<ImageGenerateRequest["aspectRatio"], string> = {
-  RATIO_9_16: "ASPECT_9_16",
   RATIO_1_1: "ASPECT_1_1",
+  RATIO_4_5: "ASPECT_3_4",
+  RATIO_3_4: "ASPECT_3_4",
+  RATIO_2_3: "ASPECT_2_3",
+  RATIO_9_16: "ASPECT_9_16",
   RATIO_16_9: "ASPECT_16_9",
+  RATIO_3_2: "ASPECT_3_2",
+  RATIO_4_3: "ASPECT_4_3",
 };
 
 const DEFAULT_MODEL = "V_2";

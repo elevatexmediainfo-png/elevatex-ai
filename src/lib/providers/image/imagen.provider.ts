@@ -1,10 +1,19 @@
 import type { ProviderRuntimeConfig } from "../credentials";
 import type { ImageGenerateRequest, ImageGenerateResult, ImageProvider } from "./types";
 
+// Imagen's aspectRatio parameter only accepts exactly "1:1", "3:4", "4:3",
+// "9:16", "16:9" (Google's documented set, no arbitrary ratio) — 4:5 and
+// 2:3 have no exact match and bucket to the closest supported value (3:4),
+// 3:2 buckets to the closest supported value (4:3).
 const ASPECT_RATIO_BY_REQUEST: Record<ImageGenerateRequest["aspectRatio"], string> = {
-  RATIO_9_16: "9:16",
   RATIO_1_1: "1:1",
+  RATIO_4_5: "3:4",
+  RATIO_3_4: "3:4",
+  RATIO_2_3: "3:4",
+  RATIO_9_16: "9:16",
   RATIO_16_9: "16:9",
+  RATIO_3_2: "4:3",
+  RATIO_4_3: "4:3",
 };
 
 // Google's Imagen line — a different model family and a different REST

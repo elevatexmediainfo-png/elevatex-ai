@@ -3,7 +3,15 @@
 // backend APIs — nothing here changes what the server sends or accepts.
 
 export type OutputType = "IMAGE" | "VIDEO";
-export type AspectRatio = "RATIO_9_16" | "RATIO_1_1" | "RATIO_16_9";
+export type AspectRatio =
+  | "RATIO_1_1"
+  | "RATIO_4_5"
+  | "RATIO_3_4"
+  | "RATIO_2_3"
+  | "RATIO_9_16"
+  | "RATIO_16_9"
+  | "RATIO_3_2"
+  | "RATIO_4_3";
 export type AssetRole = "STYLE" | "COMPOSITION" | "LIGHTING" | "COLOR" | "TYPOGRAPHY" | "BRANDING";
 
 export const ASSET_ROLE_OPTIONS: AssetRole[] = ["STYLE", "COMPOSITION", "LIGHTING", "COLOR", "TYPOGRAPHY", "BRANDING"];
