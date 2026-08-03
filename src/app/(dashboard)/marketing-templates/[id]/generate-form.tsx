@@ -70,8 +70,17 @@ export function GenerateForm({
       }
       setUserAssetId(urlJson.data.assetId);
       setUserAssetPreviewUrl(URL.createObjectURL(file));
-    } catch {
-      toast.error("Network error during upload. Please try again.");
+    } catch (err) {
+      // Real bug fix (2026-08-03) — this used to always show the same
+      // opaque "Network error during upload." regardless of what actually
+      // failed, which is exactly what hid a real R2 bucket CORS
+      // misconfiguration (the production origin was missing from the
+      // bucket's AllowedOrigins) behind an unhelpful generic message.
+      // putWithProgress() now includes the real HTTP status (or 0 for a
+      // network/CORS-level failure) in its own error — surface that
+      // instead of discarding it.
+      const detail = err instanceof Error && err.message ? err.message : null;
+      toast.error(detail ? `Upload failed: ${detail}` : "Network error during upload. Please try again.");
     } finally {
       setUploadingAsset(false);
     }

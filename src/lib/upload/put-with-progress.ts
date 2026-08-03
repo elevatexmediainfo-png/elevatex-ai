@@ -10,8 +10,16 @@ export function putWithProgress(url: string, file: File, onProgress: (pct: numbe
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
     };
-    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`Upload failed (${xhr.status})`)));
-    xhr.onerror = () => reject(new Error("Upload failed."));
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`Upload failed (HTTP ${xhr.status})`)));
+    // Real root cause found live (2026-08-03) — a cross-origin PUT blocked
+    // by the storage bucket's own CORS policy (missing AllowedOrigins entry
+    // for the real deployed origin) fires onerror with xhr.status === 0 and
+    // no readable response at all — a genuine browser security restriction,
+    // not something more detail could be extracted from client-side. Still
+    // surface the status so this reads as "HTTP 0" (a real, actionable
+    // signature of a network/CORS-level failure) instead of a bare, opaque
+    // "Upload failed." with zero diagnostic value.
+    xhr.onerror = () => reject(new Error(`Upload failed (HTTP ${xhr.status}) — network or CORS error.`));
     xhr.send(file);
   });
 }
