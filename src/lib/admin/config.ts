@@ -98,7 +98,17 @@ export const CONFIG_REGISTRY = {
   },
   GENERATION_TIMEOUT_MS_LLM: {
     schema: z.number().int().min(1000).max(600_000),
-    default: 20_000,
+    // Real bug, confirmed live (2026-08-03) — the Universal Prompt pipeline's
+    // structured-JSON LLM calls (creative_direction/prompt_engineering) hit
+    // this exact 20s ceiling on BOTH configured providers (gemini AND
+    // openai, 2 attempts each) on real, non-outage attempts, throwing
+    // AllProvidersFailedError and surfacing as "Couldn't complete this AI
+    // request right now" on /create/image's Enhance step — the same class
+    // of "coded default too short for this app's real-world latency" issue
+    // GENERATION_TIMEOUT_MS_IMAGE below was already raised for (30s default,
+    // admin-overridden to 90s). Raised 3x, matching that precedent; still
+    // fully admin-adjustable via /admin/generation.
+    default: 60_000,
     label: "LLM timeout (ms)",
     description: "How long the engine waits for a script-generation call before treating it as failed.",
     category: "generation_policy",
