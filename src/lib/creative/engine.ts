@@ -240,6 +240,7 @@ export async function generateCreativeImage(
 
       trace("6_PROVIDER_SELECTION", "PASS", 0, { preferredProviderId: tool.defaultProviderId });
       const providerCallStart = Date.now();
+      trace("7_PROVIDER_REQUEST", "PASS", 0, "request sent");
       let result;
       try {
         result = await generateImage(
@@ -248,11 +249,11 @@ export async function generateCreativeImage(
           { userId, creativeProjectId: project.id },
           tool.defaultProviderId ?? undefined
         );
-        trace("7_8_PROVIDER_REQUEST_RESPONSE", "PASS", Date.now() - providerCallStart, { providerId: result.providerId });
+        trace("8_PROVIDER_RESPONSE", "PASS", Date.now() - providerCallStart, { providerId: result.providerId });
       } catch (providerErr) {
         // Real, unsanitized error — never replaced with a generic message here.
         const detail = providerErr instanceof Error ? providerErr.message : String(providerErr);
-        trace("7_8_PROVIDER_REQUEST_RESPONSE", "FAIL", Date.now() - providerCallStart, detail);
+        trace("8_PROVIDER_RESPONSE", "FAIL", Date.now() - providerCallStart, detail);
         throw providerErr;
       }
 

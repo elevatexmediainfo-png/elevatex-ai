@@ -461,20 +461,22 @@ export async function POST(req: NextRequest) {
 
       // Phase L1 — Creative Brief (LLM call #1)
       const l1Start = Date.now();
+      traceStep(traceId, "7_PROVIDER_REQUEST_LLM1_creative_direction", "PASS", 0, "request sent");
       let creativeBrief;
       try {
         creativeBrief = await buildCreativeBrief(promptOsInput, session.user.id);
-        traceStep(traceId, "7_8_PROVIDER_REQUEST_RESPONSE_LLM1_creative_direction", "PASS", Date.now() - l1Start);
+        traceStep(traceId, "8_PROVIDER_RESPONSE_LLM1_creative_direction", "PASS", Date.now() - l1Start);
       } catch (llm1Err) {
         // Real, unsanitized error — the founder explicitly does not want
         // this replaced with "Couldn't complete AI request."
         const detail = llm1Err instanceof Error ? llm1Err.message : String(llm1Err);
-        traceStep(traceId, "7_8_PROVIDER_REQUEST_RESPONSE_LLM1_creative_direction", "FAIL", Date.now() - l1Start, detail);
+        traceStep(traceId, "8_PROVIDER_RESPONSE_LLM1_creative_direction", "FAIL", Date.now() - l1Start, detail);
         throw llm1Err;
       }
 
       // Phase L2 — Universal Prompt (LLM call #2)
       const l2Start = Date.now();
+      traceStep(traceId, "7_PROVIDER_REQUEST_LLM2_prompt_engineering", "PASS", 0, "request sent");
       let universalPrompt;
       try {
         universalPrompt = await buildUniversalPromptFromIdea(
@@ -489,10 +491,10 @@ export async function POST(req: NextRequest) {
           },
           session.user.id
         );
-        traceStep(traceId, "7_8_PROVIDER_REQUEST_RESPONSE_LLM2_prompt_engineering", "PASS", Date.now() - l2Start);
+        traceStep(traceId, "8_PROVIDER_RESPONSE_LLM2_prompt_engineering", "PASS", Date.now() - l2Start);
       } catch (llm2Err) {
         const detail = llm2Err instanceof Error ? llm2Err.message : String(llm2Err);
-        traceStep(traceId, "7_8_PROVIDER_REQUEST_RESPONSE_LLM2_prompt_engineering", "FAIL", Date.now() - l2Start, detail);
+        traceStep(traceId, "8_PROVIDER_RESPONSE_LLM2_prompt_engineering", "FAIL", Date.now() - l2Start, detail);
         throw llm2Err;
       }
 
