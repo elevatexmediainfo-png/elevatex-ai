@@ -18,10 +18,10 @@ const ALLOWED_MIME = [...ALLOWED_MIME_BY_KIND.IMAGE!, ...ALLOWED_MIME_BY_KIND.VI
 // CreativeProject's reference/logo already use), returned so the caller
 // can PATCH { referenceMediaAssetId } onto the template.
 export async function POST(req: NextRequest) {
-  const session = await requireAdminSession();
-  if (!session) return apiError("ERR_FORBIDDEN", "Admin access required.", 403);
-
   try {
+    const session = await requireAdminSession();
+    if (!session) return apiError("ERR_FORBIDDEN", "Admin access required.", 403);
+
     const form = await req.formData();
     const file = form.get("file");
     if (!(file instanceof Blob)) {

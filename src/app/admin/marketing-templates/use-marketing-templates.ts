@@ -125,7 +125,12 @@ export function useMarketingTemplates() {
     const res = await fetch("/api/admin/marketing-templates/upload", { method: "POST", body: form });
     const json = await res.json().catch(() => null);
     if (!json || !json.success) {
-      toast.error(json?.error?.message ?? "Couldn't upload reference asset.");
+      // Real gap found during investigation: the server-side route now
+      // guarantees a JSON error body on every failure, but a response that
+      // still isn't parseable JSON (a non-JSON error from something in
+      // front of this app) must never surface as a bare, undiagnosable
+      // string — include the actual HTTP status so a report is actionable.
+      toast.error(json?.error?.message ?? `Couldn't upload reference asset (HTTP ${res.status}).`);
       return false;
     }
     return replaceReferenceAssets(template, [...referenceAssetOrderList(template), { assetId: json.data.asset.id, role: null }]);
