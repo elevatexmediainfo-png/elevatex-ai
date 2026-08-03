@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 
+import { newTraceId, traceStep } from "@/lib/observability/production-trace";
 import { requireSession } from "@/lib/auth/guard";
 import { apiError, apiSuccess } from "@/lib/api-response";
 import { PRESETS_BY_KIND } from "@/lib/validations/creative";
@@ -88,14 +89,24 @@ function resolveLeadProviderId(priority: string[], preferred?: string | null): s
 // Response shape is backward-compatible: fields produced by the inactive path
 // are null rather than absent, so existing clients reading them do not break.
 export async function POST(req: NextRequest) {
+  // TEMPORARY — PRODUCTION_TRACE (2026-08-03). See
+  // src/lib/observability/production-trace.ts for removal instructions.
+  const traceId = newTraceId();
+  const reqStart = Date.now();
+  traceStep(traceId, "1_BROWSER", "PASS", 0, "request received");
+
+  const authStart = Date.now();
   const session = await requireSession();
   if (!session) {
+    traceStep(traceId, "3_AUTHENTICATION", "FAIL", Date.now() - authStart, "no session");
     return apiError("ERR_UNAUTHENTICATED", "You must be signed in.", 401);
   }
+  traceStep(traceId, "3_AUTHENTICATION", "PASS", Date.now() - authStart, { userId: session.user.id });
 
   try {
     const rawBody = await req.json().catch(() => ({}));
     const isVariation = rawBody?.variationMode === true;
+    traceStep(traceId, "2_API", "PASS", 0, { kind: rawBody?.kind, presetKey: rawBody?.presetKey, hasReferenceAsset: !!rawBody?.referenceAssetId });
 
     // ── AI Request Manager ────────────────────────────────────────────────
     const requestResult = await buildEnhancePromptRequest(rawBody, session.user.id);
@@ -440,23 +451,50 @@ export async function POST(req: NextRequest) {
           ? PRESETS_BY_KIND[creativeRequest.kind].find((p) => p.key === creativeRequest.presetKey)
           : undefined;
       const promptOsInput = buildPromptOsInput(creativeContext, preset?.label);
+      traceStep(traceId, "5_PROMPT_COMPILER", "PASS", 0, "promptOsInput built (legacy path)");
+
+      // TEMPORARY — real LLM provider chain about to be attempted, logged
+      // before the call so a hang is visible as "6 logged, 7/8 never
+      // logged" rather than silence.
+      const llmPriority = await listEnabledProviderConfigs("LLM");
+      traceStep(traceId, "6_PROVIDER_SELECTION", "PASS", 0, { configuredPriority: llmPriority });
 
       // Phase L1 — Creative Brief (LLM call #1)
-      const creativeBrief = await buildCreativeBrief(promptOsInput, session.user.id);
+      const l1Start = Date.now();
+      let creativeBrief;
+      try {
+        creativeBrief = await buildCreativeBrief(promptOsInput, session.user.id);
+        traceStep(traceId, "7_8_PROVIDER_REQUEST_RESPONSE_LLM1_creative_direction", "PASS", Date.now() - l1Start);
+      } catch (llm1Err) {
+        // Real, unsanitized error — the founder explicitly does not want
+        // this replaced with "Couldn't complete AI request."
+        const detail = llm1Err instanceof Error ? llm1Err.message : String(llm1Err);
+        traceStep(traceId, "7_8_PROVIDER_REQUEST_RESPONSE_LLM1_creative_direction", "FAIL", Date.now() - l1Start, detail);
+        throw llm1Err;
+      }
 
       // Phase L2 — Universal Prompt (LLM call #2)
-      const universalPrompt = await buildUniversalPromptFromIdea(
-        {
-          ...promptOsInput,
-          creativeBrief,
-          output: {
-            aspectRatio: preset?.aspectRatio,
-            targetWidth: preset?.targetWidth,
-            targetHeight: preset?.targetHeight,
+      const l2Start = Date.now();
+      let universalPrompt;
+      try {
+        universalPrompt = await buildUniversalPromptFromIdea(
+          {
+            ...promptOsInput,
+            creativeBrief,
+            output: {
+              aspectRatio: preset?.aspectRatio,
+              targetWidth: preset?.targetWidth,
+              targetHeight: preset?.targetHeight,
+            },
           },
-        },
-        session.user.id
-      );
+          session.user.id
+        );
+        traceStep(traceId, "7_8_PROVIDER_REQUEST_RESPONSE_LLM2_prompt_engineering", "PASS", Date.now() - l2Start);
+      } catch (llm2Err) {
+        const detail = llm2Err instanceof Error ? llm2Err.message : String(llm2Err);
+        traceStep(traceId, "7_8_PROVIDER_REQUEST_RESPONSE_LLM2_prompt_engineering", "FAIL", Date.now() - l2Start, detail);
+        throw llm2Err;
+      }
 
       // Kind resolution — uses universalPrompt fields (same as before 10.4F)
       const kindResult = creativeRequest.kind
@@ -478,6 +516,7 @@ export async function POST(req: NextRequest) {
       const tool = await prisma.creativeTool.findUnique({
         where: { key: TOOL_KEY_BY_KIND[resolvedKind] },
       });
+      traceStep(traceId, "4_DATABASE", tool ? "PASS" : "FAIL", 0, { toolKey: TOOL_KEY_BY_KIND[resolvedKind], found: !!tool, enabled: tool?.enabled });
       const priority     = await listEnabledProviderConfigs("IMAGE");
       const leadProviderId = resolveLeadProviderId(priority, tool?.defaultProviderId);
       translationTarget  = resolveProviderForTranslation(leadProviderId);
@@ -521,6 +560,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // No STORAGE/DATABASE_SAVE step — enhance-prompt never persists a
+    // CreativeProject or writes to storage (that only happens in the
+    // separate POST /api/creative-projects call).
+    traceStep(traceId, "9_STORAGE", "PASS", 0, "not applicable to this route");
+    traceStep(traceId, "10_DATABASE_SAVE", "PASS", 0, "not applicable to this route");
+    traceStep(traceId, "11_FINAL_RESPONSE", "PASS", Date.now() - reqStart, "200 success");
+
     return apiSuccess({
       // ── Production fields — always present ────────────────────────────
       enhancedPrompt,
@@ -553,6 +599,19 @@ export async function POST(req: NextRequest) {
       universalPrompt: expandedPrompt,
     });
   } catch (err) {
+    // TEMPORARY — the real, unsanitized error, always. This does NOT change
+    // what the client receives below (that's a separate, deliberate design
+    // decision — see describeAllProvidersFailure()'s own comment) — it only
+    // guarantees the real cause is visible in the server log for this
+    // investigation.
+    const realErrorDetail =
+      err instanceof AllProvidersFailedError
+        ? err.message // full per-provider detail, e.g. "gemini (2 attempt(s): <real vendor error>); openai (...)"
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    traceStep(traceId, "11_FINAL_RESPONSE", "FAIL", Date.now() - reqStart, realErrorDetail);
+
     if (err instanceof AssetNotFoundError) {
       return apiError("ERR_NOT_FOUND", "Reference image not found.", 404);
     }
@@ -567,6 +626,7 @@ export async function POST(req: NextRequest) {
     if (err instanceof AllProvidersFailedError) {
       return apiError("ERR_INTERNAL", describeAllProvidersFailure(err), 502);
     }
-    return apiError("ERR_INTERNAL", "Couldn't enhance your prompt. Please try again.", 500);
+    const message = err instanceof Error ? err.message : "Couldn't enhance your prompt. Please try again.";
+    return apiError("ERR_INTERNAL", message, 500);
   }
 }

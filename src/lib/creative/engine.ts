@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { traceStep } from "@/lib/observability/production-trace";
 import { generateImage } from "@/lib/generation/image";
 import { MOCK_PROVIDER_ID } from "@/lib/generation/types";
 import { getStorageProvider } from "@/lib/providers/storage";
@@ -50,17 +51,31 @@ export interface GenerateCreativeImageResult {
 
 export async function generateCreativeImage(
   userId: string,
-  input: CreateCreativeProjectInput
+  input: CreateCreativeProjectInput,
+  // TEMPORARY — PRODUCTION_TRACE (2026-08-03), optional so no other caller
+  // needs updating. See src/lib/observability/production-trace.ts.
+  traceId?: string
 ): Promise<GenerateCreativeImageResult> {
   const startTime = Date.now();
+  const trace = (step: string, status: "PASS" | "FAIL", durationMs: number, detail?: unknown) => {
+    if (traceId) traceStep(traceId, step, status, durationMs, detail);
+  };
   const universalPromptData = input.universalPrompt as { creative_type?: string } | undefined;
   const intent = detectIntent(input.prompt, universalPromptData?.creative_type);
 
   const toolKey = TOOL_KEY_BY_KIND[input.kind];
   const tool = await prisma.creativeTool.findUnique({ where: { key: toolKey } });
+  trace("4_DATABASE", tool?.enabled ? "PASS" : "FAIL", Date.now() - startTime, { toolKey, found: !!tool, enabled: tool?.enabled });
   if (!tool || !tool.enabled) throw new CreativeToolDisabledError(toolKey);
 
-  const amount = tool.creditCostEstimate;
+  // Permanent free tier (2026-08-02) — AI Image is free for every
+  // authenticated user, unconditionally, regardless of the ai_image
+  // CreativeTool row's own configured creditCostEstimate (an admin
+  // changing that field must never accidentally re-introduce a charge
+  // here). Social Media and Marketing Creative — the other two kinds this
+  // same shared engine serves — are completely unaffected; they still
+  // read their real cost from `tool.creditCostEstimate` below.
+  const amount = input.kind === "AI_IMAGE" ? 0 : tool.creditCostEstimate;
   if (amount > 0) {
     const balance = await getCreditBalance(userId);
     if (balance < amount) throw new InsufficientCreditsError(amount, balance);
@@ -136,6 +151,7 @@ export async function generateCreativeImage(
       : input.promptEnhanced
         ? input.prompt
         : [tool.promptTemplate, stylePrefix, safeUserPrompt].filter(Boolean).join(" ");
+  trace("5_PROMPT_COMPILER", "PASS", Date.now() - startTime, { finalPromptLength: finalPrompt.length, promptEnhanced: input.promptEnhanced });
 
   // Milestone 16 — Universal JSON Prompt's negative_constraints feed the
   // SAME structured negativePrompt channel generateImage() already exposes
@@ -222,12 +238,23 @@ export async function generateCreativeImage(
           }
         : undefined;
 
-      const result = await generateImage(
-        { prompt: finalPrompt, negativePrompt: mergedNegativePrompt, aspectRatio, referenceImage },
-        "creative_image",
-        { userId, creativeProjectId: project.id },
-        tool.defaultProviderId ?? undefined
-      );
+      trace("6_PROVIDER_SELECTION", "PASS", 0, { preferredProviderId: tool.defaultProviderId });
+      const providerCallStart = Date.now();
+      let result;
+      try {
+        result = await generateImage(
+          { prompt: finalPrompt, negativePrompt: mergedNegativePrompt, aspectRatio, referenceImage },
+          "creative_image",
+          { userId, creativeProjectId: project.id },
+          tool.defaultProviderId ?? undefined
+        );
+        trace("7_8_PROVIDER_REQUEST_RESPONSE", "PASS", Date.now() - providerCallStart, { providerId: result.providerId });
+      } catch (providerErr) {
+        // Real, unsanitized error — never replaced with a generic message here.
+        const detail = providerErr instanceof Error ? providerErr.message : String(providerErr);
+        trace("7_8_PROVIDER_REQUEST_RESPONSE", "FAIL", Date.now() - providerCallStart, detail);
+        throw providerErr;
+      }
 
       // Fixed (2026-07-24) — the Universal Creative Workflow (AI Image /
       // Social Media / Marketing Creative's non-compositor path) never
@@ -269,12 +296,15 @@ export async function generateCreativeImage(
       }
     }
 
+    const storageStart = Date.now();
     const uploaded = await storage.upload({
       key: `creative/${project.id}/image.jpg`,
       data: buffer,
       contentType,
     });
+    trace("9_STORAGE", "PASS", Date.now() - storageStart, { key: uploaded.key });
 
+    const dbSaveStart = Date.now();
     const { completed, assetId } = await prisma.$transaction(async (tx) => {
       const asset = await recordAsset(
         {
@@ -299,6 +329,7 @@ export async function generateCreativeImage(
       });
       return { completed, assetId: asset.id };
     });
+    trace("10_DATABASE_SAVE", "PASS", Date.now() - dbSaveStart, { creativeProjectId: completed.id, assetId });
 
     // M5 — quality evaluation: sharp pixel analysis, no API cost, non-blocking.
     const qualityResult = await evaluateImageQuality(buffer).catch(() => null);
@@ -318,6 +349,7 @@ export async function generateCreativeImage(
     return { project: completed, assetId, qualityResult };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Generation failed for an unknown reason.";
+    trace("11_FINAL_RESPONSE", "FAIL", Date.now() - startTime, message);
     await prisma.creativeProject.update({ where: { id: project.id }, data: { status: "FAILED", errorMessage: message } });
     throw err;
   }

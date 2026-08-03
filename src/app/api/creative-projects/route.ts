@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { ZodError } from "zod";
 
+import { newTraceId, traceStep } from "@/lib/observability/production-trace";
 import { requireSession } from "@/lib/auth/guard";
 import { prisma } from "@/lib/prisma";
 import type { CreativeProjectKind } from "@/generated/prisma/enums";
@@ -56,14 +57,24 @@ export async function GET(req: NextRequest) {
 // directly with no review step. Charge order: see lib/creative/engine.ts's
 // generateCreativeImage().
 export async function POST(req: NextRequest) {
+  // TEMPORARY — PRODUCTION_TRACE (2026-08-03). See
+  // src/lib/observability/production-trace.ts for removal instructions.
+  const traceId = newTraceId();
+  const reqStart = Date.now();
+  traceStep(traceId, "1_BROWSER", "PASS", 0, "request received");
+
+  const authStart = Date.now();
   const session = await requireSession();
   if (!session) {
+    traceStep(traceId, "3_AUTHENTICATION", "FAIL", Date.now() - authStart, "no session");
     return apiError("ERR_UNAUTHENTICATED", "You must be signed in.", 401);
   }
+  traceStep(traceId, "3_AUTHENTICATION", "PASS", Date.now() - authStart, { userId: session.user.id });
 
   try {
     const rateLimit = await checkRateLimit("creative_create", session.user.id);
     if (!rateLimit.allowed) {
+      traceStep(traceId, "4_DATABASE", "FAIL", 0, "rate limited");
       return apiError(
         "ERR_RATE_LIMIT",
         "You've hit the hourly limit for creative generation. Please try again later.",
@@ -74,11 +85,13 @@ export async function POST(req: NextRequest) {
 
     const body = await req.json().catch(() => ({}));
     const data = createCreativeProjectSchema.parse(body);
+    traceStep(traceId, "2_API", "PASS", 0, { kind: data.kind, presetKey: data.presetKey, promptEnhanced: data.promptEnhanced });
 
-    const { project, assetId, qualityResult } = await generateCreativeImage(session.user.id, data);
+    const { project, assetId, qualityResult } = await generateCreativeImage(session.user.id, data, traceId);
     const storage = await getStorageProvider();
     const asset = await prisma.asset.findUnique({ where: { id: assetId } });
 
+    traceStep(traceId, "11_FINAL_RESPONSE", "PASS", Date.now() - reqStart, "201 success");
     return apiSuccess(
       {
         project: { ...project, resultUrl: asset ? storage.getPublicUrl(asset.storageKey) : null },
@@ -87,6 +100,9 @@ export async function POST(req: NextRequest) {
       201
     );
   } catch (err) {
+    const realErrorDetail = err instanceof Error ? err.message : String(err);
+    traceStep(traceId, "11_FINAL_RESPONSE", "FAIL", Date.now() - reqStart, realErrorDetail);
+
     if (err instanceof ZodError) {
       return apiError("ERR_VALIDATION", "Please check the form and try again.", 400, { issues: err.issues });
     }
@@ -101,6 +117,7 @@ export async function POST(req: NextRequest) {
       );
     }
     console.error("POST /api/creative-projects failed", err);
-    return apiError("ERR_INTERNAL", "Something went wrong generating your creative.", 500);
+    const message = err instanceof Error ? err.message : "Something went wrong generating your creative.";
+    return apiError("ERR_INTERNAL", message, 500);
   }
 }
