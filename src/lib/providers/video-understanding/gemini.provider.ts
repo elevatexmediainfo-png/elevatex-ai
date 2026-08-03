@@ -15,7 +15,13 @@ import {
 // no-SDK convention — raw fetch, same as every other adapter here). Auth
 // is the header convention (x-goog-api-key), matching gemini-images.ts/
 // veo.provider.ts, not the older LLM adapter's ?key= query param.
-const DEFAULT_MODEL = "gemini-2.5-flash";
+// Real, confirmed-live incident (2026-08-03) — see the identical fix and
+// comment in ../llm/gemini.provider.ts: a version-pinned snapshot
+// ("gemini-2.5-flash") went stale (real 404, "no longer available to new
+// users"). "gemini-flash-latest" is Google's own documented always-current
+// alias — never needs a code change when Google retires a snapshot
+// underneath it.
+const DEFAULT_MODEL = "gemini-flash-latest";
 const UPLOAD_BASE = "https://generativelanguage.googleapis.com/upload/v1beta/files";
 const API_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -206,20 +212,38 @@ export class GeminiVideoUnderstandingProvider implements VideoUnderstandingProvi
     // Step 4: analyze — fileData references the uploaded file by URI,
     // structured JSON output constrained by RESPONSE_SCHEMA so the result
     // is parseable without prompt-engineering-fragile free text.
-    const analyzeRes = await fetch(`${API_BASE}/models/${this.model}:generateContent`, {
-      method: "POST",
-      headers: { ...authHeaders, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ fileData: { mimeType: file.mimeType, fileUri: file.uri } }, { text: PROMPT }] }],
-        generationConfig: { temperature: 0.2, responseMimeType: "application/json", responseSchema: RESPONSE_SCHEMA },
-      }),
-      signal,
-    });
-    if (!analyzeRes.ok) {
-      const body = await analyzeRes.text().catch(() => "");
-      throw new Error(`Gemini video analysis failed (${analyzeRes.status}): ${body.slice(0, 300)}`);
+    //
+    // Real resilience fix (2026-08-03) — retries only THIS step against the
+    // stable alias (DEFAULT_MODEL) if the resolved model 404s as
+    // unavailable; the already-uploaded file (steps 1-3 above) is reused
+    // as-is, never re-uploaded, since the model is only referenced here.
+    // No OpenAI-style fallback exists for VIDEO_UNDERSTANDING (no second
+    // configured provider in this category), so unlike the LLM adapter this
+    // only retries once and then surfaces the real error — there is
+    // nothing further to fail over to.
+    const analyzeModels = this.model === DEFAULT_MODEL ? [this.model] : [this.model, DEFAULT_MODEL];
+    let analyzeRes: Response | undefined;
+    for (let i = 0; i < analyzeModels.length; i++) {
+      const model = analyzeModels[i];
+      const attemptRes = await fetch(`${API_BASE}/models/${model}:generateContent`, {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ fileData: { mimeType: file.mimeType, fileUri: file.uri } }, { text: PROMPT }] }],
+          generationConfig: { temperature: 0.2, responseMimeType: "application/json", responseSchema: RESPONSE_SCHEMA },
+        }),
+        signal,
+      });
+      if (attemptRes.ok) {
+        analyzeRes = attemptRes;
+        break;
+      }
+      const isLastAttempt = i === analyzeModels.length - 1;
+      if (attemptRes.status === 404 && !isLastAttempt) continue; // retry with the stable alias
+      const body = await attemptRes.text().catch(() => "");
+      throw new Error(`Gemini video analysis failed (${attemptRes.status}) for model "${model}": ${body.slice(0, 300)}`);
     }
-    const analyzeJson = await analyzeRes.json();
+    const analyzeJson = await analyzeRes!.json();
     const text = analyzeJson.candidates?.[0]?.content?.parts?.[0]?.text;
     const usageTokens: number | undefined = analyzeJson.usageMetadata?.totalTokenCount;
     if (typeof text !== "string") {
