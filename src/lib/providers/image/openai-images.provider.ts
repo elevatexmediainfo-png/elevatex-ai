@@ -58,9 +58,12 @@ export class OpenAIImagesProvider implements ImageProvider {
         prompt,
         size: SIZE_BY_RATIO[req.aspectRatio],
         // defaultQuality is already resolved from the admin panel by
-        // credentials.ts into ProviderRuntimeConfig — default to "high"
-        // since every use case here is commercial advertising.
-        quality: this.config.defaultQuality ?? "high",
+        // credentials.ts into ProviderRuntimeConfig — an admin's own
+        // configured value always wins, unchanged. Temporary debug change
+        // (2026-08-04): fallback default lowered "high" -> "medium" while
+        // investigating real generation latency against the 30s/120s
+        // timeout — "high" quality is the slowest of the three tiers.
+        quality: this.config.defaultQuality ?? "medium",
         n: 1,
       }),
       signal,

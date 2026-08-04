@@ -140,11 +140,22 @@ export class GeminiImagesProvider implements ImageProvider {
     const res = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
       method: "POST",
       headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
+      // Real bug, confirmed live (2026-08-04) — this request shape was
+      // checked against the CURRENT official Interactions API reference
+      // (ai.google.dev/api/interactions-api, ai.google.dev/gemini-api/docs/
+      // image-generation, fetched live). generation_config's documented
+      // sub-fields are max_output_tokens/seed/stop_sequences/thinking_level/
+      // thinking_summaries/tool_choice — temperature and image_config are
+      // not among them. response_modalities does not appear in the current
+      // field list at all. The current documented example instead nests
+      // image output config under a top-level response_format object.
+      // Replaced with exactly that documented shape; aspectRatio is
+      // unchanged, still steered via the existing ASPECT_HINT text prompt
+      // (not a new capability, no unrelated logic touched).
       body: JSON.stringify({
         model: this.model.startsWith("models/") ? this.model : `models/${this.model}`,
         input,
-        generation_config: { temperature: 1, image_config: { image_size: "1K" } },
-        response_modalities: ["image", "text"],
+        response_format: { type: "image", mime_type: "image/jpeg", image_size: "1K" },
       }),
       signal,
     });

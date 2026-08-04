@@ -89,6 +89,19 @@ export const CONFIG_REGISTRY = {
     description: "How many times the Generation Engine retries a single provider before failing over to the next one.",
     category: "generation_policy",
   },
+  // Temporary debug override (2026-08-04) — IMAGE-only, so a 30s (now 120s)
+  // per-attempt timeout can't compound into a 2x wait while investigating
+  // the real provider-response latency. GENERATION_RETRY_MAX_ATTEMPTS above
+  // stays untouched and still governs LLM/VOICE/VIDEO exactly as before —
+  // see loadPolicy() in lib/generation/engine.ts, which only reads this key
+  // for category === "IMAGE".
+  GENERATION_RETRY_MAX_ATTEMPTS_IMAGE: {
+    schema: z.number().int().min(1).max(5),
+    default: 1,
+    label: "Max attempts per provider (IMAGE only, temporary debug override)",
+    description: "Temporary: how many times the Generation Engine retries a single IMAGE provider before failing over to the next one. Does not affect LLM/VOICE/VIDEO, which still use 'Max attempts per provider' above.",
+    category: "generation_policy",
+  },
   GENERATION_RETRY_BACKOFF_MS: {
     schema: z.number().int().min(0).max(10_000),
     default: 500,
@@ -115,7 +128,11 @@ export const CONFIG_REGISTRY = {
   },
   GENERATION_TIMEOUT_MS_IMAGE: {
     schema: z.number().int().min(1000).max(600_000),
-    default: 30_000,
+    // Real, first-party evidence (2026-08-03) — live gemini_images calls run
+    // earlier this same investigation completed successfully in 47s/52s/79s,
+    // all well past 30s under completely normal (non-error) conditions.
+    // Raised to leave real margin above the slowest of those.
+    default: 120_000,
     label: "Image timeout (ms)",
     description: "How long the engine waits for an image-generation call before treating it as failed.",
     category: "generation_policy",

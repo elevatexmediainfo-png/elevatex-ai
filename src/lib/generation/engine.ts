@@ -30,8 +30,13 @@ const TIMEOUT_CONFIG_KEY = {
 } as const satisfies Record<GenerationCategory, string>;
 
 async function loadPolicy(category: GenerationCategory): Promise<GenerationPolicy> {
+  // Temporary debug override (2026-08-04) — IMAGE reads its own, separate
+  // retry-attempts key so it can be turned down without touching
+  // LLM/VOICE/VIDEO, which all still read GENERATION_RETRY_MAX_ATTEMPTS
+  // exactly as before. See GENERATION_RETRY_MAX_ATTEMPTS_IMAGE's own
+  // comment in lib/admin/config.ts.
   const [retryMaxAttempts, retryBackoffMs, timeoutMs, healthFailureThreshold, healthCooldownMs] = await Promise.all([
-    getConfig("GENERATION_RETRY_MAX_ATTEMPTS"),
+    category === "IMAGE" ? getConfig("GENERATION_RETRY_MAX_ATTEMPTS_IMAGE") : getConfig("GENERATION_RETRY_MAX_ATTEMPTS"),
     getConfig("GENERATION_RETRY_BACKOFF_MS"),
     getConfig(TIMEOUT_CONFIG_KEY[category]),
     getConfig("GENERATION_HEALTH_FAILURE_THRESHOLD"),
