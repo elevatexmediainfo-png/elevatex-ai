@@ -1071,7 +1071,17 @@ enum BillingModel {
 // (cheap models in Basic, premium models in Pro/Premium). Ranked in
 // declaration order by lib/credits/video-actions.ts's PRICING_TIER_RANK,
 // not by any implicit enum ordering Prisma/Postgres provides.
+//
+// NO_PLAN (2026-08-04) — a real, rank-0 tier (below BASIC), not a nullable
+// sentinel. lib/credits/video-actions.ts's getUserTier() now returns
+// NO_PLAN instead of null whenever a user has no active subscription, or
+// their plan has no assigned tierLevel (e.g. Pay Per Download) — so a
+// video action whose minimumTier is admin-set to NO_PLAN is usable by
+// every signed-in user with zero subscription-related gating, while every
+// existing BASIC/PRO/PREMIUM-gated action still denies an unsubscribed
+// user exactly as before (rank 0 < rank 1/2/3).
 enum PricingTierLevel {
+  NO_PLAN
   BASIC
   PRO
   PREMIUM

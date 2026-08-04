@@ -606,7 +606,13 @@ export const CONFIG_REGISTRY = {
       z.string(),
       z.object({
         credits: z.number().int().min(0),
-        minimumTier: z.enum(["BASIC", "PRO", "PREMIUM"]),
+        // NO_PLAN (2026-08-04) — a real, admin-selectable rank-0 tier
+        // (see PRICING_TIER_RANK in lib/credits/video-actions.ts): an
+        // action set to NO_PLAN is usable by every signed-in user
+        // regardless of subscription status, with credits still charged
+        // normally if `credits` above is nonzero. Existing actions' own
+        // default minimumTier values below are untouched.
+        minimumTier: z.enum(["NO_PLAN", "BASIC", "PRO", "PREMIUM"]),
       })
     ),
     default: {

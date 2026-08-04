@@ -16,7 +16,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 // — that's our own internal USD vendor-cost tracking, a different concern
 // from what gets deducted from a user's balance.
 
-type MinimumTier = "BASIC" | "PRO" | "PREMIUM";
+type MinimumTier = "NO_PLAN" | "BASIC" | "PRO" | "PREMIUM";
 
 interface VideoActionCost {
   credits: number;
@@ -244,6 +244,7 @@ export function CreditRatesDashboard() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
+                    <SelectItem value="NO_PLAN">No Plan</SelectItem>
                     <SelectItem value="BASIC">Basic</SelectItem>
                     <SelectItem value="PRO">Pro</SelectItem>
                     <SelectItem value="PREMIUM">Premium</SelectItem>
