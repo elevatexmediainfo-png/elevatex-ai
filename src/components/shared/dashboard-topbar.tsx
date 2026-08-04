@@ -2,10 +2,10 @@
 
 import * as React from "react";
 import Link from "next/link";
+import Image from "next/image";
 import { useSession, signOut } from "next-auth/react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Sparkles,
   Zap,
   ChevronDown,
   LogOut,
@@ -196,17 +196,15 @@ export function DashboardTopbar() {
         {/* Logo */}
         <Link
           href="/dashboard"
-          className="flex items-center gap-2.5 flex-shrink-0 group"
+          className="flex items-center gap-3 flex-shrink-0 group"
         >
-          <div
-            className="flex size-8 items-center justify-center rounded-lg flex-shrink-0"
-            style={{
-              background: "linear-gradient(135deg, #7C3AED 0%, #2563EB 100%)",
-              boxShadow: "0 4px 14px rgba(124,58,237,0.35)",
-            }}
-          >
-            <Sparkles className="size-[15px] text-white" />
-          </div>
+          <Image
+            src="/logo.png"
+            alt="Elevatex AI"
+            width={36}
+            height={36}
+            className="h-9 w-9 object-contain shrink-0"
+          />
           <span className="text-[15px] font-semibold text-dash-ink tracking-[-0.2px] leading-none">
             Elevatex{" "}
             <span
