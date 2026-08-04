@@ -104,22 +104,30 @@ export class GeminiImagesProvider implements ImageProvider {
     // filter — every one of those 5 attempts came back a real 400 with
     // "prompt_feedback.block_reason:OTHER" instead of generating anything,
     // a hard regression from the pre-anchor behavior (which at least
-    // produced AN image, just not a well-conditioned one). Explicit "match
-    // this face/features closely" language pointed at an uploaded photo of
-    // a real, identifiable person reads as a likeness/identity-reproduction
-    // instruction, which is exactly the class of request these models'
-    // safety layers are strictest about — independent of whether the
-    // underlying use case (matching a template's style) had nothing to do
-    // with identity at all. Reworded to anchor the same "don't ignore the
-    // reference, don't invent an unrelated scene" fix around STYLE (mood,
-    // lighting, palette, composition, subject type) instead of identity/
-    // facial fidelity — keeps the original bug fixed without asking the
-    // model to do the one thing that gets requests blocked.
+    // produced AN image, just not a well-conditioned one). Reworded that day
+    // to anchor around STYLE instead of identity/facial fidelity, to avoid
+    // that exact block.
+    //
+    // Reverted back to explicit identity-preservation wording (2026-08-04,
+    // deliberate, founder-directed) — the style-only wording above was
+    // found live to cause Gemini to treat an uploaded person's photo as
+    // mood/composition guidance rather than the actual subject, sometimes
+    // rendering a different person entirely. This is a known, informed
+    // trade-off, not an oversight: this exact class of wording previously
+    // triggered the safety-filter regression documented above, and could do
+    // so again. Multi-image ordering note — req.referenceImages carries no
+    // metadata distinguishing "the user's own uploaded photo" from "an
+    // admin-curated style/background reference"; per
+    // lib/marketing-templates/generate.ts's own ordering
+    // (`[...referenceImages, userImage]`), the user's own upload is always
+    // the LAST image in the array, never the first — the instruction below
+    // is written to match that real ordering, not the reverse assumption
+    // the old wording made.
     const referenceInstruction =
       referenceImages.length > 1
-        ? "You are given reference image(s) below, after this text. Use the FIRST reference image as the primary visual/style basis for this render — match its overall mood, lighting, color palette, composition, and subject type, rendered according to the instructions below, rather than inventing an unrelated scene that ignores it. Treat any ADDITIONAL reference image(s) after the first (e.g. a logo or brand mark) as a graphic element to naturally incorporate into that same scene."
+        ? "You are given reference image(s) below, after this text. The LAST reference image shows a real person who is the exact subject of this generation. That person's identity must remain completely unchanged — preserve their facial structure, hairstyle, beard, skin tone, eye shape, nose, lips, and facial proportions exactly as shown. Never generate a different person. Only clothing, background, lighting, camera angle, pose, and accessories may change, according to the instructions below. Treat any reference image(s) BEFORE the last one (e.g. a background, style, or brand element) as style/composition guidance only, not as a person to depict."
         : referenceImages.length === 1
-          ? "A reference image is given below, after this text. Use it as the primary visual/style basis for this render — match its overall mood, lighting, color palette, composition, and subject type, rendered according to the instructions below, rather than inventing an unrelated scene that ignores it."
+          ? "A reference image is given below, after this text. It shows a real person who is the exact subject of this generation. That person's identity must remain completely unchanged — preserve their facial structure, hairstyle, beard, skin tone, eye shape, nose, lips, and facial proportions exactly as shown. Never generate a different person. Only clothing, background, lighting, camera angle, pose, and accessories may change, according to the instructions below."
           : null;
 
     const inputParts = [
