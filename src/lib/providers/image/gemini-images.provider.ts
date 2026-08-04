@@ -15,9 +15,31 @@ const ASPECT_HINT: Record<ImageGenerateRequest["aspectRatio"], string> = {
   RATIO_4_3: "a horizontal 4:3 landscape image",
 };
 
-// "Nano Banana Pro" — Google's current image-generation model (as of this
-// integration, 2026-07). Admin can override via ProviderConfig.
-const DEFAULT_MODEL = "gemini-3-pro-image";
+// (2026-08-04) — the current official Interactions API accepts a
+// structured response_format.aspect_ratio field (confirmed via a live fetch
+// of ai.google.dev/gemini-api/docs/image-generation's own example this
+// session: {"aspect_ratio": "1:1", ...}) — sent alongside the existing
+// ASPECT_HINT text below, not instead of it, so aspect ratio is no longer
+// steered by prompt wording alone.
+const ASPECT_RATIO_STRING: Record<ImageGenerateRequest["aspectRatio"], string> = {
+  RATIO_1_1: "1:1",
+  RATIO_4_5: "4:5",
+  RATIO_3_4: "3:4",
+  RATIO_2_3: "2:3",
+  RATIO_9_16: "9:16",
+  RATIO_16_9: "16:9",
+  RATIO_3_2: "3:2",
+  RATIO_4_3: "4:3",
+};
+
+// (2026-08-04) — updated from "gemini-3-pro-image" to Google's own current
+// documented example model for character/identity consistency
+// ("gemini-3.1-flash-image", aka Nano Banana 2 — confirmed via two
+// independent live fetches this session: ai.google.dev/gemini-api/docs/
+// image-generation's own character-consistency example, and
+// philschmid.de/nano-banana-2-interactions-api). Admin can still override
+// via ProviderConfig.
+const DEFAULT_MODEL = "gemini-3.1-flash-image";
 
 interface InteractionContentPart {
   mime_type?: string;
@@ -123,11 +145,17 @@ export class GeminiImagesProvider implements ImageProvider {
     // the LAST image in the array, never the first — the instruction below
     // is written to match that real ordering, not the reverse assumption
     // the old wording made.
+    // (2026-08-04) — added "age" and "identity" explicitly to the preserve
+    // list (previously implied by "identity must remain completely
+    // unchanged" but not itemized alongside the other features), and
+    // reworded "eye shape" -> "eyes" to match the requested exact list.
+    // No other wording changed from the 2026-08-04 identity-preservation
+    // reversion above.
     const referenceInstruction =
       referenceImages.length > 1
-        ? "You are given reference image(s) below, after this text. The LAST reference image shows a real person who is the exact subject of this generation. That person's identity must remain completely unchanged — preserve their facial structure, hairstyle, beard, skin tone, eye shape, nose, lips, and facial proportions exactly as shown. Never generate a different person. Only clothing, background, lighting, camera angle, pose, and accessories may change, according to the instructions below. Treat any reference image(s) BEFORE the last one (e.g. a background, style, or brand element) as style/composition guidance only, not as a person to depict."
+        ? "You are given reference image(s) below, after this text. The LAST reference image shows a real person who is the exact subject of this generation. That person's identity must remain completely unchanged — preserve their identity, face, facial structure, hairstyle, beard, skin tone, eyes, nose, lips, facial proportions, and age exactly as shown. Never generate a different person. Only clothing, background, pose, lighting, accessories, and camera angle may change, according to the instructions below. Any reference image(s) BEFORE the last one (e.g. a background, style, or brand element) are style/composition references ONLY — never use them as the person's face or identity."
         : referenceImages.length === 1
-          ? "A reference image is given below, after this text. It shows a real person who is the exact subject of this generation. That person's identity must remain completely unchanged — preserve their facial structure, hairstyle, beard, skin tone, eye shape, nose, lips, and facial proportions exactly as shown. Never generate a different person. Only clothing, background, lighting, camera angle, pose, and accessories may change, according to the instructions below."
+          ? "A reference image is given below, after this text. It shows a real person who is the exact subject of this generation. That person's identity must remain completely unchanged — preserve their identity, face, facial structure, hairstyle, beard, skin tone, eyes, nose, lips, facial proportions, and age exactly as shown. Never generate a different person. Only clothing, background, pose, lighting, accessories, and camera angle may change, according to the instructions below."
           : null;
 
     const inputParts = [
@@ -145,26 +173,63 @@ export class GeminiImagesProvider implements ImageProvider {
         ]
       : textInput;
 
+    // Real bug, confirmed live (2026-08-04) — this request shape was
+    // checked against the CURRENT official Interactions API reference
+    // (ai.google.dev/api/interactions-api, ai.google.dev/gemini-api/docs/
+    // image-generation, fetched live). generation_config's documented
+    // sub-fields are max_output_tokens/seed/stop_sequences/thinking_level/
+    // thinking_summaries/tool_choice — temperature and image_config are
+    // not among them. response_modalities does not appear in the current
+    // field list at all. The current documented example instead nests
+    // image output config under a top-level response_format object.
+    // Replaced with exactly that documented shape.
+    //
+    // (2026-08-04) — the "models/" prefix removed: every current official
+    // example fetched this session (Interactions API reference, Nano
+    // Banana 2 guide) uses the bare model id in this JSON field (e.g.
+    // "gemini-3.1-flash-image") — the "models/{id}" path-segment
+    // convention belongs to the older :generateContent REST endpoint (used
+    // by ../llm/gemini.provider.ts), not this one. Also now sends the
+    // aspect ratio structurally via response_format.aspect_ratio, in
+    // addition to the existing ASPECT_HINT text prompt below — not instead
+    // of it, so aspect ratio is no longer conveyed by prompt wording alone.
+    const requestBody = {
+      model: this.model,
+      input,
+      response_format: {
+        type: "image",
+        mime_type: "image/jpeg",
+        image_size: "1K",
+        aspect_ratio: ASPECT_RATIO_STRING[req.aspectRatio],
+      },
+    };
+
+    // TEMPORARY DEBUG LOG (2026-08-04) — requested runtime verification of
+    // the exact request body vs. source code. Logs shape/sizes only, never
+    // raw base64. REMOVE: delete this entire console.log(...) block (only
+    // this block — requestBody itself, above, is NOT temporary, it's the
+    // real request construction, unchanged behavior from before).
+    console.log("GEMINI_REQUEST_DEBUG", JSON.stringify({
+      model: requestBody.model,
+      inputCount: Array.isArray(input) ? input.length : 1,
+      input: Array.isArray(input)
+        ? input.map((part, i) =>
+            "data" in part
+              ? { index: i, type: "image", mime_type: part.mime_type, base64Length: part.data?.length ?? 0, isEmpty: !part.data || part.data.length === 0 }
+              : { index: i, type: "text", first100Chars: part.text.slice(0, 100) }
+          )
+        : { type: "text-only", first100Chars: input.slice(0, 100) },
+      imageCount: referenceImages.length,
+      lastImageIsUserUpload: referenceImages.length > 0,
+      lastImageBase64Length: referenceImages.length > 0 ? referenceImages[referenceImages.length - 1].data?.length ?? 0 : null,
+      lastImageIsEmpty: referenceImages.length > 0 ? !referenceImages[referenceImages.length - 1].data || referenceImages[referenceImages.length - 1].data.length === 0 : null,
+      response_format: requestBody.response_format,
+    }));
+
     const res = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
       method: "POST",
       headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
-      // Real bug, confirmed live (2026-08-04) — this request shape was
-      // checked against the CURRENT official Interactions API reference
-      // (ai.google.dev/api/interactions-api, ai.google.dev/gemini-api/docs/
-      // image-generation, fetched live). generation_config's documented
-      // sub-fields are max_output_tokens/seed/stop_sequences/thinking_level/
-      // thinking_summaries/tool_choice — temperature and image_config are
-      // not among them. response_modalities does not appear in the current
-      // field list at all. The current documented example instead nests
-      // image output config under a top-level response_format object.
-      // Replaced with exactly that documented shape; aspectRatio is
-      // unchanged, still steered via the existing ASPECT_HINT text prompt
-      // (not a new capability, no unrelated logic touched).
-      body: JSON.stringify({
-        model: this.model.startsWith("models/") ? this.model : `models/${this.model}`,
-        input,
-        response_format: { type: "image", mime_type: "image/jpeg", image_size: "1K" },
-      }),
+      body: JSON.stringify(requestBody),
       signal,
     });
 

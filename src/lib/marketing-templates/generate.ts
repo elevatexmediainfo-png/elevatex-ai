@@ -130,13 +130,31 @@ export async function generateFromMarketingTemplate(
       // Every curated reference asset, in admin-set order, plus the user's
       // own upload last — multi-image conditioning (2026-07-24 extension).
       const allImages = userImage ? [...referenceImages, userImage] : referenceImages;
+
+      // Requirement (2026-08-04) — a template requiring the user's own
+      // identity-preserving upload (userAssetRequired) must never fail
+      // over to an IMAGE provider that can't use a reference image at
+      // all. openai_images (src/lib/providers/image/
+      // openai-images.provider.ts) has zero referenceImage/
+      // referenceImages handling — confirmed by reading its generate()
+      // implementation in full — so it would silently produce a
+      // completely unrelated face if it ever ran for one of these
+      // templates. Scoped to this IMAGE branch only; VIDEO's
+      // allowedProviderIds (a different provider set, e.g. "veo") is
+      // untouched below.
+      const IMAGE_PROVIDERS_WITHOUT_REFERENCE_IMAGE_SUPPORT = ["openai_images"];
+      const imageAllowedProviderIds = template.userAssetRequired
+        ? allowedProviderIds.filter((id) => !IMAGE_PROVIDERS_WITHOUT_REFERENCE_IMAGE_SUPPORT.includes(id))
+        : allowedProviderIds;
+
       const result = await generateImage(
         { prompt: template.promptTemplate, aspectRatio: template.aspectRatio, referenceImages: allImages },
         "creative_image",
         { userId: input.userId },
         template.primaryProviderId,
-        allowedProviderIds
+        imageAllowedProviderIds
       );
+      resultProviderId = result.providerId;
       if (result.providerId === MOCK_PROVIDER_ID) {
         throw new MarketingTemplateMockFallbackError(
           "Generation used the placeholder provider, not a real one — neither the Primary nor Fallback provider is currently enabled and reachable."
@@ -224,9 +242,14 @@ export async function generateFromMarketingTemplate(
       // Permanent free tier (2026-08-02) — no consumeCredits() call here,
       // ever, regardless of the template's own configured creditCost —
       // Marketing Templates never actually charge.
+      // Debugging (2026-08-04) — resultProviderId is now persisted for
+      // BOTH output types (previously computed in memory but never
+      // written to the database for either, and never even assigned at
+      // all for IMAGE) so which provider (primary vs. fallback) served a
+      // given generation is a queryable, durable fact.
       await tx.marketingTemplateGeneration.update({
         where: { id: generation.id },
-        data: { status: "COMPLETED", resultEditorAssetId: editorAsset.id },
+        data: { status: "COMPLETED", resultEditorAssetId: editorAsset.id, resultProviderId },
       });
       return { editorAsset };
     });

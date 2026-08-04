@@ -551,6 +551,17 @@ model MarketingTemplateGeneration {
   resultEditorAssetId String?
   resultEditorAsset   EditorAsset? @relation(fields: [resultEditorAssetId], references: [id], onDelete: SetNull)
 
+  // Debugging (2026-08-04) — the provider id that actually served this
+  // specific generation (e.g. "gemini_images", "openai_images"), for BOTH
+  // IMAGE and VIDEO output types. Previously computed in memory
+  // (generateFromMarketingTemplate()'s own resultProviderId) but never
+  // persisted anywhere and never even assigned for IMAGE output — this
+  // column and the code writing to it close that gap so which provider
+  // (primary vs. fallback) served a given result is a queryable fact, not
+  // something only visible in transient GenerationLog rows correlated by
+  // timestamp. Nullable — historical rows predate this column.
+  resultProviderId String?
+
   createdAt DateTime @default(now())
 
   @@index([userId, createdAt])
@@ -3273,6 +3284,14 @@ model AiEditJob {
   // this never invents or overrides timing from the script. Null means
   // no script was provided.
   script String? @db.Text
+  // Founder request (2026-07-30) — which of the 8 proposal sections this
+  // job actually runs (see AI_EDIT_MODULES, lib/validations/video-editor.ts).
+  // A plain string array, not a set of booleans — mirrors how the job's
+  // OWN output (AITimelinePlan) already has one array per section, and
+  // adding a 9th module never needs a new column. Null means "every
+  // module" (the exact pre-existing behavior, for any job created before
+  // this field existed or by a caller that omits it).
+  selectedModules Json?
 
   // The raw TranscriptionResult (words/segments/language/durationSeconds)
   // — kept as its own column, not folded into timelinePlan, so
