@@ -131,6 +131,25 @@ export async function generateFromMarketingTemplate(
       // own upload last — multi-image conditioning (2026-07-24 extension).
       const allImages = userImage ? [...referenceImages, userImage] : referenceImages;
 
+      // Removed from Marketing Templates entirely (2026-08-04) — "imagen"
+      // (src/lib/providers/image/imagen.provider.ts) is a deprecated
+      // Google endpoint (shutting down 2026-08-17, per that file's own
+      // comment) with zero reference-image handling, confirmed the real
+      // root cause of production still calling
+      // models/imagen-4.0-generate-001. The admin API
+      // (api/admin/marketing-templates) now rejects "imagen" for NEW
+      // primary/fallback choices, but any EXISTING template saved before
+      // that validation existed is remapped here, at generation time,
+      // rather than thrown as an error — it keeps working immediately,
+      // with no admin action required. Scoped to this IMAGE branch only;
+      // imagen.provider.ts and its registration in
+      // lib/providers/image/index.ts are completely untouched, so every
+      // other feature can still use it, and VIDEO's allowedProviderIds
+      // (a different provider set, e.g. "veo") is unaffected below.
+      const remapImagenToGemini = (id: string | null) => (id === "imagen" ? "gemini_images" : id);
+      const imagePrimaryProviderId = remapImagenToGemini(template.primaryProviderId);
+      const imageFallbackProviderId = remapImagenToGemini(template.fallbackProviderId);
+
       // Requirement (2026-08-04) — a template requiring the user's own
       // identity-preserving upload (userAssetRequired) must never fail
       // over to an IMAGE provider that can't use a reference image at
@@ -139,19 +158,23 @@ export async function generateFromMarketingTemplate(
       // referenceImages handling — confirmed by reading its generate()
       // implementation in full — so it would silently produce a
       // completely unrelated face if it ever ran for one of these
-      // templates. Scoped to this IMAGE branch only; VIDEO's
-      // allowedProviderIds (a different provider set, e.g. "veo") is
-      // untouched below.
+      // templates.
       const IMAGE_PROVIDERS_WITHOUT_REFERENCE_IMAGE_SUPPORT = ["openai_images"];
+      // De-duplicated — if both primary and fallback were "imagen", they'd
+      // both remap to "gemini_images"; runGeneration() doesn't need the
+      // same provider id twice in its chain.
+      const rawImageAllowedProviderIds = Array.from(
+        new Set([imagePrimaryProviderId, imageFallbackProviderId].filter((id): id is string => Boolean(id)))
+      );
       const imageAllowedProviderIds = template.userAssetRequired
-        ? allowedProviderIds.filter((id) => !IMAGE_PROVIDERS_WITHOUT_REFERENCE_IMAGE_SUPPORT.includes(id))
-        : allowedProviderIds;
+        ? rawImageAllowedProviderIds.filter((id) => !IMAGE_PROVIDERS_WITHOUT_REFERENCE_IMAGE_SUPPORT.includes(id))
+        : rawImageAllowedProviderIds;
 
       const result = await generateImage(
         { prompt: template.promptTemplate, aspectRatio: template.aspectRatio, referenceImages: allImages },
         "creative_image",
         { userId: input.userId },
-        template.primaryProviderId,
+        imagePrimaryProviderId ?? undefined,
         imageAllowedProviderIds
       );
       resultProviderId = result.providerId;

@@ -59,6 +59,16 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     return apiError("ERR_VALIDATION", "Fallback Provider must be different from Primary Provider.", 400);
   }
 
+  // Removed from Marketing Templates entirely (2026-08-04) — "imagen"
+  // (src/lib/providers/image/imagen.provider.ts) is a deprecated Google
+  // endpoint (shutting down 2026-08-17) with zero reference-image
+  // handling, so it silently drops any uploaded identity photo. Every
+  // other feature can still use it; only Marketing Templates is blocked
+  // here.
+  if (effectivePrimary === "imagen" || effectiveFallback === "imagen") {
+    return apiError("ERR_VALIDATION", "Imagen is deprecated and cannot be used for Marketing Templates. Use Gemini Images instead.", 400);
+  }
+
   const template = await prisma.marketingTemplate.update({ where: { id }, data: parsed.data });
   return apiSuccess({ template });
 }

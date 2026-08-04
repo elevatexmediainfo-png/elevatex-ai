@@ -58,6 +58,20 @@ const createSchema = z
   .refine((data) => !data.fallbackProviderId || data.fallbackProviderId !== data.primaryProviderId, {
     message: "Fallback Provider must be different from Primary Provider.",
     path: ["fallbackProviderId"],
+  })
+  // Removed from Marketing Templates entirely (2026-08-04) — "imagen"
+  // (src/lib/providers/image/imagen.provider.ts) is a deprecated Google
+  // endpoint (shutting down 2026-08-17) with zero reference-image
+  // handling, so it silently drops any uploaded identity photo. Every
+  // other feature can still use it; only Marketing Templates is blocked
+  // here.
+  .refine((data) => data.primaryProviderId !== "imagen", {
+    message: "Imagen is deprecated and cannot be used for Marketing Templates. Use Gemini Images instead.",
+    path: ["primaryProviderId"],
+  })
+  .refine((data) => data.fallbackProviderId !== "imagen", {
+    message: "Imagen is deprecated and cannot be used for Marketing Templates. Use Gemini Images instead.",
+    path: ["fallbackProviderId"],
   });
 
 export async function GET() {
