@@ -414,6 +414,19 @@ export const createEditorExportPresetSchema = z.object({
 // would create a circular module dependency.
 export const AI_BROLL_DENSITIES = ["MINIMAL", "BALANCED", "HEAVY"] as const;
 
+// Module selection (founder request, 2026-07-30) — lets the Intake form run
+// a SUBSET of the pipeline's proposal sections instead of always producing
+// all eight. "sceneRemoval" is its own independent step; the other seven
+// (captions/zoom/broll/stickers/music/sfx/transitions) all come back from
+// the SAME single planTimeline() reasoning call (see ai-edit-jobs.ts's own
+// doc comment) — selecting only some of them still makes that one call
+// (there's no way to ask GPT for a subset), it just discards the sections
+// the caller didn't ask for before they reach asset resolution/the plan.
+// Omitted entirely = every module runs, preserving the exact pre-existing
+// behavior for any caller that doesn't send this field.
+export const AI_EDIT_MODULES = ["captions", "sceneRemoval", "zoom", "broll", "music", "sfx", "stickers", "transitions"] as const;
+export type AiEditModule = (typeof AI_EDIT_MODULES)[number];
+
 // brollDensity mirrors stylePreset's own shape exactly.
 // brollStockOnly (2026-07-18) — per-job override of the AI_EDIT_BROLL_
 // STOCK_ONLY admin default (see AiEditJob.brollStockOnly's own doc
@@ -426,4 +439,5 @@ export const createAiEditJobSchema = z.object({
   brollDensity: z.enum(AI_BROLL_DENSITIES).optional(),
   brollStockOnly: z.boolean().optional(),
   script: z.string().min(1).max(20_000).optional(),
+  selectedModules: z.array(z.enum(AI_EDIT_MODULES)).min(1).optional(),
 });

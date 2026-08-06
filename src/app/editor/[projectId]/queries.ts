@@ -859,8 +859,14 @@ export function useAiEditJobsQuery(projectId: string) {
 export function useCreateAiEditJobMutation(projectId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (input: { assetId: string; stylePreset?: string; brollDensity?: "MINIMAL" | "BALANCED" | "HEAVY"; brollStockOnly?: boolean; script?: string }) =>
-      editorApi<{ job: AiEditJobView }>(`/api/editor/projects/${projectId}/ai-edit-jobs`, "POST", input),
+    mutationFn: (input: {
+      assetId: string;
+      stylePreset?: string;
+      brollDensity?: "MINIMAL" | "BALANCED" | "HEAVY";
+      brollStockOnly?: boolean;
+      script?: string;
+      selectedModules?: string[];
+    }) => editorApi<{ job: AiEditJobView }>(`/api/editor/projects/${projectId}/ai-edit-jobs`, "POST", input),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: aiEditJobsQueryKey(projectId) }),
   });
 }
