@@ -4,6 +4,7 @@ import { logger } from "@/lib/observability/logger";
 import { aiReeditResponseSchema, type AIReeditResponse } from "@/lib/validations/ai-reedit";
 import type { AICaption } from "@/lib/validations/ai-timeline";
 import { buildFallbackCaptionsFromWords, splitTextIntoCaptionChunks, MAX_WORDS_PER_CAPTION } from "@/lib/video-editor/caption-formatting";
+import { chatTemperatureParam } from "../openai-chat-params";
 import {
   parsePlanOutputLeniently,
   type ReasoningCaptionRaw,
@@ -266,7 +267,11 @@ async function runJsonRepairLoop<T>({ apiKey, model, messages, schema, repairMax
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages, temperature: 0.4, response_format: { type: "json_object" } }),
+      // Fix (2026-08-06) — reasoning-tier models (o-series, gpt-5 family)
+      // reject ANY custom temperature value; chatTemperatureParam omits it
+      // entirely for those, detected by model name, not hardcoded per
+      // caller — see openai-chat-params.ts's own doc comment.
+      body: JSON.stringify({ model, messages, ...chatTemperatureParam(model, 0.4), response_format: { type: "json_object" } }),
       signal,
     });
     if (!res.ok) {
@@ -352,7 +357,11 @@ async function runPlanJsonRepairLoop(params: {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages, temperature: 0.4, response_format: { type: "json_object" } }),
+      // Fix (2026-08-06) — reasoning-tier models (o-series, gpt-5 family)
+      // reject ANY custom temperature value; chatTemperatureParam omits it
+      // entirely for those, detected by model name, not hardcoded per
+      // caller — see openai-chat-params.ts's own doc comment.
+      body: JSON.stringify({ model, messages, ...chatTemperatureParam(model, 0.4), response_format: { type: "json_object" } }),
       signal,
     });
     if (!res.ok) {

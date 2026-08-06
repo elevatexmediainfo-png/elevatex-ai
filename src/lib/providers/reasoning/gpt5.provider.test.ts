@@ -124,6 +124,36 @@ describe("GPT5ReasoningProvider.plan", () => {
     expect(result.captions).toEqual([{ text: "only.", startMs: 0, endMs: 500 }]);
   });
 
+  // Fix (2026-08-06) — real production incident: OpenAI rejects any
+  // custom `temperature` for reasoning-tier models (o-series, gpt-5
+  // family) with a 400 "Unsupported value: 'temperature'." This adapter's
+  // DEFAULT_MODEL is "gpt-5" — the exact model this incident was reported
+  // against — so the request body must never include a temperature field
+  // for the default configuration.
+  it("omits `temperature` entirely for the default gpt-5 model (real incident: OpenAI rejects any non-default value for reasoning-tier models)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.plan(BASE_REQUEST);
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.model).toBe("gpt-5");
+    expect("temperature" in body).toBe(false);
+  });
+
+  it("still sends a custom `temperature` for a non-reasoning model (e.g. a hypothetical gpt-4o override) — preserved, not dropped for every model", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key", model: "gpt-4o-mini" });
+    await provider.plan(BASE_REQUEST);
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.model).toBe("gpt-4o-mini");
+    expect(body.temperature).toBe(0.4);
+  });
+
   it("numbers the transcript word list and instructs the model to cite word indices, not estimate milliseconds, for captions", async () => {
     const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
     vi.stubGlobal("fetch", fetchMock);
@@ -502,6 +532,20 @@ describe("GPT5ReasoningProvider.reEdit", () => {
   it("throws a clear error when no API key is configured", async () => {
     const provider = new GPT5ReasoningProvider({});
     await expect(provider.reEdit(BASE_REEDIT_REQUEST)).rejects.toThrow(/no API key/);
+  });
+
+  // Fix (2026-08-06) — reEdit() shares runJsonRepairLoop with plan() above;
+  // same real incident, same fix must apply to this call site too.
+  it("omits `temperature` entirely for the default gpt-5 model", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(JSON.stringify({ action: "remove_effect", effect: "zoom" })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.reEdit(BASE_REEDIT_REQUEST);
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.model).toBe("gpt-5");
+    expect("temperature" in body).toBe(false);
   });
 
   it("returns a validated remove_effect response on a well-formed first response", async () => {
