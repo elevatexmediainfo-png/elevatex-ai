@@ -8,6 +8,7 @@ import {
   createTrimClipCommand,
   type AddTrackAndClipDeps,
   type ClipCommandDeps,
+  type EditorCommand,
 } from "./commands";
 import type { ClipView, TrackView, TransitionView } from "../types";
 
@@ -159,6 +160,130 @@ describe("createDeleteClipCommand", () => {
     expect(deps.addClip).toHaveBeenCalledTimes(2);
     const restoredStartTimes = (deps as unknown as { addClipCalls: { startMs: number }[] }).addClipCalls.map((c) => c.startMs);
     expect(restoredStartTimes.sort()).toEqual([0, 5000]);
+  });
+});
+
+// Fix (2026-08-06, FIX 6 — "composite timeline updates must become
+// transactional; if one command fails, rollback everything"). Uses plain
+// hand-built EditorCommand objects (not real command constructors) to
+// exercise createCompositeCommand's own rollback mechanics in isolation.
+describe("createCompositeCommand — transactional rollback (FIX 6)", () => {
+  it("rolls back every already-succeeded sibling, in reverse order, when one sibling fails", async () => {
+    const order: string[] = [];
+    const commandA: EditorCommand = {
+      label: "A",
+      execute: async () => {
+        order.push("execute-A");
+      },
+      undo: async () => {
+        order.push("undo-A");
+      },
+    };
+    const commandB: EditorCommand = {
+      label: "B",
+      execute: async () => {
+        order.push("execute-B");
+        throw new Error("B failed");
+      },
+      undo: async () => {
+        order.push("undo-B");
+      },
+    };
+    const commandC: EditorCommand = {
+      label: "C",
+      execute: async () => {
+        order.push("execute-C");
+      },
+      undo: async () => {
+        order.push("undo-C");
+      },
+    };
+    const composite = createCompositeCommand("Test Composite", [commandA, commandB, commandC]);
+
+    await expect(composite.execute()).rejects.toThrow(/failed and was rolled back/);
+
+    // A and C succeeded, B failed — only A and C get rolled back; B never
+    // gets an undo() call (it never succeeded in the first place).
+    expect(order).toContain("undo-A");
+    expect(order).toContain("undo-C");
+    expect(order).not.toContain("undo-B");
+    // Reverse order: C (declared after A) is rolled back before A.
+    expect(order.indexOf("undo-C")).toBeLessThan(order.indexOf("undo-A"));
+  });
+
+  it("still rolls back every succeeded sibling even when one sibling's OWN undo() also throws mid-rollback", async () => {
+    const order: string[] = [];
+    const commandA: EditorCommand = {
+      label: "A",
+      execute: async () => {
+        order.push("execute-A");
+      },
+      undo: async () => {
+        order.push("undo-A-attempted");
+        throw new Error("undo-A also failed");
+      },
+    };
+    const commandB: EditorCommand = { label: "B", execute: async () => { throw new Error("B failed"); }, undo: async () => {} };
+    const commandC: EditorCommand = {
+      label: "C",
+      execute: async () => {
+        order.push("execute-C");
+      },
+      undo: async () => {
+        order.push("undo-C");
+      },
+    };
+    const composite = createCompositeCommand("Test Composite", [commandA, commandB, commandC]);
+
+    // The ORIGINAL failure (B) is what surfaces to the caller, not A's
+    // rollback failure — a rollback-time error must never mask why the
+    // whole thing failed in the first place.
+    await expect(composite.execute()).rejects.toThrow(/B failed/);
+    expect(order).toContain("undo-A-attempted");
+    expect(order).toContain("undo-C"); // C's rollback still ran despite A's own undo() throwing
+  });
+
+  it("never calls undo() on anything when every sibling succeeds (unchanged happy path)", async () => {
+    const commandA = { label: "A", execute: vi.fn().mockResolvedValue(undefined), undo: vi.fn().mockResolvedValue(undefined) };
+    const commandB = { label: "B", execute: vi.fn().mockResolvedValue(undefined), undo: vi.fn().mockResolvedValue(undefined) };
+    const composite = createCompositeCommand("Test Composite", [commandA, commandB]);
+
+    await composite.execute();
+
+    expect(commandA.execute).toHaveBeenCalledTimes(1);
+    expect(commandB.execute).toHaveBeenCalledTimes(1);
+    expect(commandA.undo).not.toHaveBeenCalled();
+    expect(commandB.undo).not.toHaveBeenCalled();
+  });
+
+  it("includes every failed sibling's own message and the failure count when multiple fail simultaneously", async () => {
+    const commandA: EditorCommand = { label: "A", execute: async () => {}, undo: async () => {} };
+    const commandB: EditorCommand = {
+      label: "B",
+      execute: async () => {
+        throw new Error("B broke");
+      },
+      undo: async () => {},
+    };
+    const commandD: EditorCommand = {
+      label: "D",
+      execute: async () => {
+        throw new Error("D broke");
+      },
+      undo: async () => {},
+    };
+    const composite = createCompositeCommand("Test Composite", [commandA, commandB, commandD]);
+
+    let caught: Error | null = null;
+    try {
+      await composite.execute();
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).not.toBeNull();
+    expect(caught!.message).toContain("B broke");
+    expect(caught!.message).toContain("D broke");
+    expect(caught!.message).toContain("2/3");
   });
 });
 

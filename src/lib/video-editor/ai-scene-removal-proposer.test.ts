@@ -19,13 +19,38 @@ describe("proposeSceneRemovals", () => {
     expect(proposeSceneRemovals(words)).toEqual([]);
   });
 
-  it("respects a custom silenceThresholdMs option", () => {
+  // Fix (2026-08-06, FIX 3) — silenceThresholdMs is now the ADAPTIVE
+  // detector's pivot, not a flat cutoff, so a custom value scales the
+  // effective per-gap threshold rather than being compared directly —
+  // still bounded by the default 350ms natural-breathing floor either way.
+  it("respects a custom silenceThresholdMs option as the adaptive pivot, still bounded by the default natural-breathing floor", () => {
     const words = [
       { word: "a", startMs: 0, endMs: 100 },
-      { word: "b", startMs: 300, endMs: 400 }, // 200ms gap
+      { word: "b", startMs: 500, endMs: 600 }, // 400ms gap — above the 350ms default floor
     ];
-    expect(proposeSceneRemovals(words, { silenceThresholdMs: 500 })).toEqual([]);
-    expect(proposeSceneRemovals(words, { silenceThresholdMs: 150 })).toEqual([{ startMs: 100, endMs: 300, reason: "silence" }]);
+    // A high pivot raises the effective threshold well above this gap.
+    expect(proposeSceneRemovals(words, { silenceThresholdMs: 2000 })).toEqual([]);
+    // A low pivot lowers the effective threshold below this gap.
+    expect(proposeSceneRemovals(words, { silenceThresholdMs: 100 })).toEqual([{ startMs: 100, endMs: 500, reason: "silence" }]);
+  });
+
+  it("the default 350ms natural-breathing floor blocks a low pivot from removing a short gap, unless minThresholdMs is explicitly lowered too", () => {
+    const words = [
+      { word: "a", startMs: 0, endMs: 100 },
+      { word: "b", startMs: 300, endMs: 400 }, // 200ms gap — below the default 350ms floor
+    ];
+    expect(proposeSceneRemovals(words, { silenceThresholdMs: 150 })).toEqual([]);
+    expect(proposeSceneRemovals(words, { silenceThresholdMs: 150, minThresholdMs: 100 })).toEqual([
+      { startMs: 100, endMs: 300, reason: "silence" },
+    ]);
+  });
+
+  it("always removes a pause at/above the default 2500ms ceiling, regardless of a huge custom pivot", () => {
+    const words = [
+      { word: "a", startMs: 0, endMs: 100 },
+      { word: "b", startMs: 3000, endMs: 3100 }, // 2900ms gap
+    ];
+    expect(proposeSceneRemovals(words, { silenceThresholdMs: 100_000 })).toEqual([{ startMs: 100, endMs: 3000, reason: "silence" }]);
   });
 
   it("proposes a filler_word removal for a plain filler word", () => {

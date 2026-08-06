@@ -45,7 +45,9 @@ describe("GPT5ReasoningProvider.plan", () => {
     const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
     const result = await provider.plan(BASE_REQUEST);
 
-    expect(result.captions).toEqual([{ text: "Hello world", startMs: 0, endMs: 600 }]);
+    // Fix (2026-08-06, FIX 5) — captions now always end in real terminal
+    // punctuation ("Hello world" -> "Hello world.").
+    expect(result.captions).toEqual([{ text: "Hello world.", startMs: 0, endMs: 600 }]);
     expect(result.zoom).toEqual([]);
     expect(result.providerRef).toBe("chatcmpl-test");
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -77,9 +79,10 @@ describe("GPT5ReasoningProvider.plan", () => {
     const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
     const result = await provider.plan({ ...BASE_REQUEST, words });
 
+    // Fix (2026-08-06, FIX 5) — proper terminal punctuation added.
     expect(result.captions).toEqual([
-      { text: "one two", startMs: 0, endMs: 250 },
-      { text: "three four", startMs: 250, endMs: 950 },
+      { text: "one two.", startMs: 0, endMs: 250 },
+      { text: "three four.", startMs: 250, endMs: 950 },
     ]);
   });
 
@@ -101,7 +104,8 @@ describe("GPT5ReasoningProvider.plan", () => {
     const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
     const result = await provider.plan({ ...BASE_REQUEST, words, stylePreset: "bold punchy hinglish energetic" });
 
-    expect(result.captions).toEqual([{ text: "Kya aap", startMs: 0, endMs: 360, style: { fontWeight: 800 } }]);
+    // Fix (2026-08-06, FIX 5) — proper terminal punctuation added.
+    expect(result.captions).toEqual([{ text: "Kya aap.", startMs: 0, endMs: 360, style: { fontWeight: 800 } }]);
   });
 
   it("clamps an out-of-range word-index citation rather than crashing the job", async () => {
@@ -116,7 +120,8 @@ describe("GPT5ReasoningProvider.plan", () => {
     const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
     const result = await provider.plan({ ...BASE_REQUEST, words });
 
-    expect(result.captions).toEqual([{ text: "only", startMs: 0, endMs: 500 }]);
+    // Fix (2026-08-06, FIX 5) — proper terminal punctuation added.
+    expect(result.captions).toEqual([{ text: "only.", startMs: 0, endMs: 500 }]);
   });
 
   it("numbers the transcript word list and instructs the model to cite word indices, not estimate milliseconds, for captions", async () => {
@@ -151,7 +156,8 @@ describe("GPT5ReasoningProvider.plan", () => {
     const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
     const result = await provider.plan(BASE_REQUEST);
 
-    expect(result.captions).toEqual([{ text: "Hello world", startMs: 0, endMs: 600 }]);
+    // Fix (2026-08-06, FIX 5) — proper terminal punctuation added.
+    expect(result.captions).toEqual([{ text: "Hello world.", startMs: 0, endMs: 600 }]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
     // The repair call must include the model's own bad output plus a
@@ -182,24 +188,67 @@ describe("GPT5ReasoningProvider.plan", () => {
     expect(messages.some((m) => m.role === "user" && m.content.includes("not valid JSON"))).toBe(true);
   });
 
-  it("surfaces a clear 'planning failed' error (not silently applying malformed data) when the repair attempt ALSO fails", async () => {
+  // Fix (2026-08-06, FIX 2) — this used to assert the WHOLE plan() call
+  // rejected when just ONE caption item was malformed, per the founder's
+  // original "surface a clear failure, don't silently apply malformed
+  // data" instruction. That instruction is still honored (nothing invalid
+  // is ever applied, and the drop is surfaced via `warnings`) but the
+  // production incident this fix addresses was the OTHER half of that
+  // same behavior: one bad item was ALSO wiping out the other, perfectly
+  // valid sections (zoom/broll here, and captions/broll/etc. in general).
+  // Renamed and rewritten to assert the new, correct behavior: the bad
+  // item is dropped, everything else that validated is kept, and the drop
+  // is still visible via `warnings` — never silent. Also demonstrates FIX
+  // 5's "never return empty captions": since the model's own caption
+  // proposal was dropped but real transcript words exist (BASE_REQUEST's
+  // "Hello"/"world"), the result falls back to those real words rather
+  // than an empty array.
+  it("drops an invalid item (not the whole plan) when the repair attempt ALSO still has it wrong, surfacing the drop via warnings, and falls back to real transcript words for captions", async () => {
     const stillMalformed = JSON.stringify({ captions: [{ text: "", sourceWordStartIndex: 0, sourceWordEndIndex: 1 }], zoom: [], broll: [] }); // empty text fails min(1)
     const fetchMock = vi.fn().mockResolvedValue(chatResponse(stillMalformed));
     vi.stubGlobal("fetch", fetchMock);
 
     const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
-    await expect(provider.plan(BASE_REQUEST)).rejects.toThrow(/invalid timeline JSON even after 1 repair attempt/);
-    expect(fetchMock).toHaveBeenCalledTimes(2); // original + exactly 1 repair attempt, never applied
+    const result = await provider.plan(BASE_REQUEST);
+
+    // The model's own (invalid, empty-text) proposal was dropped — but
+    // real transcript words exist, so this is never a silent empty array.
+    expect(result.captions).toEqual([{ text: "Hello world.", startMs: 0, endMs: 600 }]);
+    expect(result.zoom).toEqual([]);
+    expect(result.broll).toEqual([]);
+    expect(result.warnings).toBeDefined();
+    expect(result.warnings!.some((w) => w.includes("captions[0]"))).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // original + exactly 1 repair attempt, still surfaced, never silently retried forever
   });
 
-  it("respects repairMaxAttempts: 0 disables repair, fails on the very first bad response", async () => {
+  it("respects repairMaxAttempts: 0 (disables repair) — still returns whatever validated (falling back to real words for captions), with a warning for what didn't", async () => {
     const malformed = JSON.stringify({ captions: [{ text: "", sourceWordStartIndex: 0, sourceWordEndIndex: 1 }], zoom: [], broll: [] });
     const fetchMock = vi.fn().mockResolvedValue(chatResponse(malformed));
     vi.stubGlobal("fetch", fetchMock);
 
     const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
-    await expect(provider.plan({ ...BASE_REQUEST, repairMaxAttempts: 0 })).rejects.toThrow(/invalid timeline JSON even after 0 repair attempt/);
+    const result = await provider.plan({ ...BASE_REQUEST, repairMaxAttempts: 0 });
+
+    expect(result.captions).toEqual([{ text: "Hello world.", startMs: 0, endMs: 600 }]);
+    expect(result.warnings).toBeDefined();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a valid section (captions) when a DIFFERENT section (broll) is invalid, instead of blanking everything — the exact production bug this fix addresses", async () => {
+    const partiallyBad = JSON.stringify({
+      captions: [{ text: "Hello world", sourceWordStartIndex: 0, sourceWordEndIndex: 1 }],
+      zoom: [],
+      broll: [{ startMs: 0, endMs: 1000, trackHint: "broll", source: "stock" }], // missing searchQuery — fails aiBrollSchema's refine
+    });
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(partiallyBad));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    const result = await provider.plan({ ...BASE_REQUEST, repairMaxAttempts: 0 });
+
+    expect(result.captions).toEqual([{ text: "Hello world.", startMs: 0, endMs: 600 }]);
+    expect(result.broll).toEqual([]);
+    expect(result.warnings?.some((w) => w.includes("broll[0]") && w.includes("searchQuery"))).toBe(true);
   });
 
   it("throws with the response body on a non-ok HTTP response, no repair attempted", async () => {
@@ -296,6 +345,26 @@ describe("GPT5ReasoningProvider.plan", () => {
     expect(result.music).toEqual({ searchQuery: "cinematic upbeat", duckingEnabled: true, duckingVoiceTrackHint: "voice" });
     expect(result.sfx).toEqual([{ atMs: 1500, assetQuery: "whoosh" }]);
     expect(result.transitions).toEqual([{ betweenClipIds: ["clip-a", "clip-b"], type: "CROSSFADE", durationMs: 500 }]);
+  });
+
+  // Fix (2026-08-06, FIX 4 — "important nouns, locations, products,
+  // actions, people, brands automatically generate stock search queries").
+  it("instructs TASK 3 to scan for the six named categories of concrete, visualizable mentions", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.plan(BASE_REQUEST);
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const userMessage = body.messages.find((m: { role: string }) => m.role === "user").content as string;
+    expect(userMessage).toContain("Important NOUNS");
+    expect(userMessage).toContain("LOCATIONS");
+    expect(userMessage).toContain("PRODUCTS");
+    expect(userMessage).toContain("ACTIONS");
+    expect(userMessage).toContain("PEOPLE");
+    expect(userMessage).toContain("BRANDS");
+    expect(userMessage).toContain("a stock library almost never carries real licensed footage of a named brand");
   });
 
   it("strengthens the b-roll stock-vs-generate bias in TASK 3's prompt (real cost, generate as last resort)", async () => {
@@ -512,13 +581,46 @@ describe("resolveCaptionTiming (pure)", () => {
     { word: "c", startMs: 200, endMs: 300 },
   ];
 
-  it("resolves a single-word caption to that word's own span", () => {
+  it("resolves a single-word caption to that word's own span, with proper terminal punctuation added (FIX 5)", () => {
     const result = resolveCaptionTiming([{ text: "a", sourceWordStartIndex: 0, sourceWordEndIndex: 0 }], words);
-    expect(result).toEqual([{ text: "a", startMs: 0, endMs: 100, style: undefined, reveal: undefined }]);
+    expect(result).toEqual([{ text: "a.", startMs: 0, endMs: 100, style: undefined, reveal: undefined }]);
   });
 
   it("returns an empty array when there are no real transcript words to anchor to", () => {
     const result = resolveCaptionTiming([{ text: "a", sourceWordStartIndex: 0, sourceWordEndIndex: 0 }], []);
     expect(result).toEqual([]);
+  });
+
+  // Fix (2026-08-06, FIX 5) — a caption citing a word range whose OWN text
+  // is longer than 12 words (max 6 words/line x 2 lines) is split into
+  // multiple real caption items, each line-balanced/punctuated, with
+  // internal timing proportionally mapped across the real
+  // [start,end] word-timestamp range (the overall anchors are always
+  // real transcript timestamps; only the split points BETWEEN the
+  // resulting captions are a proportional estimate — see this function's
+  // own doc comment in gpt5.provider.ts).
+  it("splits an oversized caption (>12 words in its own text) into multiple line-balanced, punctuated captions", () => {
+    const longWords = Array.from({ length: 20 }, (_, i) => ({ word: `w${i}`, startMs: i * 100, endMs: i * 100 + 90 }));
+    const longText = Array.from({ length: 14 }, (_, i) => `word${i}`).join(" "); // 14 words > 12
+    const result = resolveCaptionTiming([{ text: longText, sourceWordStartIndex: 0, sourceWordEndIndex: 19 }], longWords);
+
+    expect(result).toHaveLength(2); // 14 words -> ceil(14/12) = 2 captions
+    for (const caption of result) {
+      const lines = caption.text.split("\n");
+      expect(lines.length).toBeLessThanOrEqual(2);
+      for (const line of lines) {
+        expect(line.split(" ").length).toBeLessThanOrEqual(6);
+      }
+    }
+    // Anchored to the real overall range: first caption starts at the
+    // real range start, last caption ends at the real range end.
+    expect(result[0].startMs).toBe(longWords[0].startMs);
+    expect(result[result.length - 1].endMs).toBe(longWords[19].endMs);
+  });
+
+  it("falls back to real transcript words (never empty) when given zero raw captions but real words exist", () => {
+    const result = resolveCaptionTiming([], words);
+    expect(result.length).toBeGreaterThan(0);
+    expect(result[0].startMs).toBe(0);
   });
 });

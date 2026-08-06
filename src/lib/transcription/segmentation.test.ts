@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { assignParagraphIndices, detectFillerWords, detectSilenceGaps, wordsWithinSegment } from "./segmentation";
+import {
+  adaptiveSilenceThresholdMs,
+  assignParagraphIndices,
+  detectFillerWords,
+  detectSilenceGaps,
+  detectSilenceGapsAdaptive,
+  wordsWithinSegment,
+} from "./segmentation";
 
 describe("detectSilenceGaps", () => {
   it("returns no gaps when words are closely spaced", () => {
@@ -31,6 +38,91 @@ describe("detectSilenceGaps", () => {
   it("returns no gaps for a single word or empty list", () => {
     expect(detectSilenceGaps([])).toEqual([]);
     expect(detectSilenceGaps([{ word: "solo", startMs: 0, endMs: 100 }])).toEqual([]);
+  });
+});
+
+// Fix (2026-08-06, FIX 3 — "gap removal quality is poor / threshold too
+// conservative, implement adaptive silence detection based on speech
+// speed instead of a fixed threshold").
+describe("adaptiveSilenceThresholdMs (pure scaling math)", () => {
+  it("returns baseThresholdMs unchanged when local speech rate equals the reference rate", () => {
+    expect(adaptiveSilenceThresholdMs(150, { referenceWpm: 150, baseThresholdMs: 800 })).toBe(800);
+  });
+
+  it("lowers the effective threshold for faster-than-reference local speech", () => {
+    // 300 WPM is twice the 150 WPM reference -> half the base threshold.
+    expect(adaptiveSilenceThresholdMs(300, { referenceWpm: 150, baseThresholdMs: 800 })).toBe(400);
+  });
+
+  it("raises the effective threshold for slower-than-reference local speech", () => {
+    // 75 WPM is half the 150 WPM reference -> double the base threshold.
+    expect(adaptiveSilenceThresholdMs(75, { referenceWpm: 150, baseThresholdMs: 800 })).toBe(1600);
+  });
+
+  it("clamps the result to maxThresholdMs even for an extremely slow local rate", () => {
+    expect(adaptiveSilenceThresholdMs(1, { referenceWpm: 150, baseThresholdMs: 800, maxThresholdMs: 2500 })).toBe(2500);
+  });
+
+  it("clamps the result to minThresholdMs even for an extremely fast local rate", () => {
+    expect(adaptiveSilenceThresholdMs(10_000, { referenceWpm: 150, baseThresholdMs: 800, minThresholdMs: 350 })).toBe(350);
+  });
+
+  it("falls back to baseThresholdMs when no local rate could be measured (null)", () => {
+    expect(adaptiveSilenceThresholdMs(null, { baseThresholdMs: 800 })).toBe(800);
+  });
+});
+
+describe("detectSilenceGapsAdaptive", () => {
+  it("always removes a gap at/above maxThresholdMs, regardless of local speech speed", () => {
+    // Deliberately slow local articulation (long word durations) — even
+    // though that would normally RAISE the effective threshold, the hard
+    // ceiling still fires for a genuinely long pause.
+    const words = [
+      { word: "slow", startMs: 0, endMs: 900 },
+      { word: "word", startMs: 3500, endMs: 4400 }, // 2600ms gap
+    ];
+    const gaps = detectSilenceGapsAdaptive(words, { maxThresholdMs: 2500 });
+    expect(gaps).toEqual([{ startMs: 900, endMs: 3500, gapMs: 2600 }]);
+  });
+
+  it("never removes a gap below minThresholdMs, regardless of local speech speed", () => {
+    // Deliberately fast local articulation (short word durations) — even
+    // though that would normally LOWER the effective threshold well below
+    // this gap, the hard floor still blocks a natural breathing pause.
+    const words = [
+      { word: "fast", startMs: 0, endMs: 60 },
+      { word: "word", startMs: 300, endMs: 360 }, // 240ms gap
+    ];
+    const gaps = detectSilenceGapsAdaptive(words, { minThresholdMs: 350 });
+    expect(gaps).toEqual([]);
+  });
+
+  it("proposes a shorter gap for fast local speech than the same-length gap would need at a normal pace", () => {
+    // Fast speaker (~40ms/word => 1500 WPM articulation rate) — a 500ms
+    // gap should read as comparatively long against that pace.
+    const fastWords = [
+      { word: "a", startMs: 0, endMs: 40 },
+      { word: "b", startMs: 40, endMs: 80 },
+      { word: "c", startMs: 580, endMs: 620 }, // 500ms gap after "b"
+    ];
+    expect(detectSilenceGapsAdaptive(fastWords, { baseThresholdMs: 800, referenceWpm: 150 })).toEqual([
+      { startMs: 80, endMs: 580, gapMs: 500 },
+    ]);
+
+    // Same 500ms gap, but slow speaker (~400ms/word => 150 WPM, exactly
+    // the reference rate) — effective threshold stays at the 800ms base,
+    // so the same 500ms gap is NOT proposed.
+    const slowWords = [
+      { word: "a", startMs: 0, endMs: 400 },
+      { word: "b", startMs: 400, endMs: 800 },
+      { word: "c", startMs: 1300, endMs: 1700 }, // 500ms gap after "b"
+    ];
+    expect(detectSilenceGapsAdaptive(slowWords, { baseThresholdMs: 800, referenceWpm: 150 })).toEqual([]);
+  });
+
+  it("returns no gaps for a single word or empty list", () => {
+    expect(detectSilenceGapsAdaptive([])).toEqual([]);
+    expect(detectSilenceGapsAdaptive([{ word: "solo", startMs: 0, endMs: 100 }])).toEqual([]);
   });
 });
 

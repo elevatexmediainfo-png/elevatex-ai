@@ -1,13 +1,21 @@
 import { DEFAULT_REVEAL_CONFIG } from "@/lib/video-editor/text-style";
+import { buildFallbackCaptionsFromWords } from "@/lib/video-editor/caption-formatting";
 import type { ReasoningPlanRequest, ReasoningPlanResult, ReasoningProvider, ReasoningReeditRequest, ReasoningReeditResult } from "./types";
 
 // Default provider (selected when no REASONING ProviderConfig is enabled)
 // — deterministic captions chunked straight from the given words (one
-// caption per ~8 words) and, when video-understanding emphasis moments
+// caption per <=12 words, line-balanced/punctuated — see
+// caption-formatting.ts) and, when video-understanding emphasis moments
 // were given, one subtle zoom per moment. Same simulated-latency pattern
 // as the other category mocks; exercises the full pipeline (merge,
 // persistence, UI) without API credentials.
-const WORDS_PER_CAPTION = 8;
+//
+// Fix (2026-08-06, FIX 5) — this used to inline its own "~8 words per
+// caption" chunking loop with no line-formatting at all. Now reuses
+// buildFallbackCaptionsFromWords, the SAME real-transcript-word chunker
+// gpt5.provider.ts's resolveCaptionTiming() falls back to when the real
+// model proposes nothing — one implementation of "never empty, always
+// properly formatted" captions, not two independently-maintained copies.
 
 export class MockReasoningProvider implements ReasoningProvider {
   readonly id = "mock";
@@ -16,17 +24,12 @@ export class MockReasoningProvider implements ReasoningProvider {
   async plan(req: ReasoningPlanRequest): Promise<ReasoningPlanResult> {
     await new Promise((resolve) => setTimeout(resolve, 1200));
 
-    const captions: ReasoningPlanResult["captions"] = [];
-    for (let i = 0; i < req.words.length; i += WORDS_PER_CAPTION) {
-      const chunk = req.words.slice(i, i + WORDS_PER_CAPTION);
-      if (chunk.length === 0) continue;
-      captions.push({
-        text: chunk.map((w) => w.word).join(" "),
-        startMs: chunk[0].startMs,
-        endMs: chunk[chunk.length - 1].endMs,
-        reveal: { ...DEFAULT_REVEAL_CONFIG, mode: "WORD" },
-      });
-    }
+    const captions: ReasoningPlanResult["captions"] = buildFallbackCaptionsFromWords(req.words).map((c) => ({
+      text: c.text,
+      startMs: c.startMs,
+      endMs: c.endMs,
+      reveal: { ...DEFAULT_REVEAL_CONFIG, mode: "WORD" },
+    }));
 
     const zoom: ReasoningPlanResult["zoom"] = (req.videoAnalysis?.emphasisMoments ?? []).map((moment) => ({
       startMs: moment.startMs,

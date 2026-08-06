@@ -45,7 +45,7 @@ vi.mock("@/lib/observability/logger", () => ({ logger: { error: vi.fn(), info: v
 // Imports AFTER the mocks above (vitest hoists vi.mock calls, but keeping
 // the import last mirrors the mocked-module convention this codebase's
 // other vi.mock-based tests already use, e.g. track-stacking.test.ts).
-const { pickBestStockResult, resolveBrollItem, resolveBrollItems } = await import("./ai-broll-resolver");
+const { buildBroadenedQueries, pickBestStockResult, resolveBrollItem, resolveBrollItems } = await import("./ai-broll-resolver");
 
 function stockResult(overrides: Partial<StockSearchResult> = {}): StockSearchResult {
   return { externalId: "1", title: "A clip", previewUrl: "https://x/preview.jpg", downloadUrl: "https://x/download.mp4", kind: "VIDEO", ...overrides };
@@ -154,6 +154,28 @@ function brollStock(overrides: Partial<AIBroll> = {}): AIBroll {
   return { startMs: 1000, endMs: 3000, trackHint: "broll", source: "stock", searchQuery: "typing on a laptop", ...overrides };
 }
 
+// Fix (2026-08-06, FIX 4 — "never leave B-roll empty if stock footage
+// exists").
+describe("buildBroadenedQueries", () => {
+  it("returns just the original query when it's already a single token", () => {
+    expect(buildBroadenedQueries("pump")).toEqual(["pump"]);
+  });
+
+  it("strips stopwords, then progressively drops tokens from the front, without duplicates", () => {
+    expect(buildBroadenedQueries("a domestic water pump appliance")).toEqual([
+      "a domestic water pump appliance",
+      "domestic water pump appliance", // stopword "a" stripped
+      "water pump appliance",
+      "pump appliance",
+      "appliance",
+    ]);
+  });
+
+  it("skips the stopword-stripped candidate when the query has no stopwords at all", () => {
+    expect(buildBroadenedQueries("automatic water pump")).toEqual(["automatic water pump", "water pump", "pump"]);
+  });
+});
+
 describe("resolveBrollItem — stock", () => {
   it("resolves successfully: searches, picks the best result, materializes, sets resolvedAssetId/Url", async () => {
     searchStockMediaMock.mockResolvedValue({ outcomes: [{ providerId: "pexels", results: [stockResult({ externalId: "vid-1", kind: "VIDEO" })] }] });
@@ -178,6 +200,37 @@ describe("resolveBrollItem — stock", () => {
     expect(result.resolvedAssetId).toBeUndefined();
     expect(result.resolutionNote).toContain("No stock results found");
     expect(materializeStockAssetMock).not.toHaveBeenCalled();
+  });
+
+  // Fix (2026-08-06, FIX 4) — the exact production requirement: the
+  // over-specific original query finds nothing, but a broadened phrasing
+  // of the SAME query finds something real — this must resolve, not stay
+  // empty, since usable stock footage genuinely exists for the broader
+  // idea.
+  it("broadens an over-specific query that found nothing, and resolves via the broader phrasing", async () => {
+    searchStockMediaMock.mockImplementation(async (_category: string, query: string) => {
+      // Only the fully-broadened single-token query ("appliance") finds
+      // anything — every more-specific phrasing returns empty.
+      if (query === "appliance") return { outcomes: [{ providerId: "pixabay", results: [stockResult({ externalId: "appliance-1", kind: "VIDEO", title: "kitchen appliance closeup" })] }] };
+      return { outcomes: [{ providerId: "pixabay", results: [] }] };
+    });
+    materializeStockAssetMock.mockResolvedValue({ id: "asset-broadened", url: "https://cdn/b.mp4", thumbnailUrl: null });
+
+    const result = await resolveBrollItem(brollStock({ searchQuery: "a domestic water pump appliance" }), CTX);
+
+    expect(result.resolvedAssetId).toBe("asset-broadened");
+    expect(materializeStockAssetMock).toHaveBeenCalledWith("user-1", "pixabay", "STOCK_MEDIA", expect.objectContaining({ externalId: "appliance-1" }));
+  });
+
+  it("never broadens a query that already found something on the first, most-specific attempt (no extra round trips for an already-working query)", async () => {
+    searchStockMediaMock.mockResolvedValue({ outcomes: [{ providerId: "pexels", results: [stockResult({ externalId: "vid-exact", kind: "VIDEO" })] }] });
+    materializeStockAssetMock.mockResolvedValue({ id: "asset-exact", url: "https://cdn/e.mp4", thumbnailUrl: null });
+
+    const result = await resolveBrollItem(brollStock({ searchQuery: "a domestic water pump appliance" }), CTX);
+
+    expect(result.resolvedAssetId).toBe("asset-exact");
+    // Exactly one video+image search pair — no broadened attempts fired.
+    expect(searchStockMediaMock).toHaveBeenCalledTimes(2);
   });
 
   it("flags a materialize failure (e.g. download error) as unresolved, not a thrown exception", async () => {

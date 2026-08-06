@@ -16,7 +16,7 @@
 // silence/filler_word. The merge function combines both sources into one
 // sensible, non-redundant candidate list.
 
-import { detectFillerWords, detectSilenceGaps, type TimedWord } from "@/lib/transcription/segmentation";
+import { detectFillerWords, detectSilenceGapsAdaptive, type TimedWord } from "@/lib/transcription/segmentation";
 import type { AISceneRemoval, AISceneRemovalReason } from "@/lib/validations/ai-timeline";
 
 export interface SceneRemovalProposerOptions {
@@ -24,8 +24,27 @@ export interface SceneRemovalProposerOptions {
   // DIFFERENT default from detectSilenceGaps' own 700ms (tuned for
   // paragraph-boundary detection, Milestone 11's own purpose) — cutting
   // silence out of a final video calls for a longer bar than merely
-  // marking a paragraph break.
+  // marking a paragraph break. Fix (2026-08-06, FIX 3) — this is now the
+  // ADAPTIVE detector's pivot/base value (see detectSilenceGapsAdaptive,
+  // lib/transcription/segmentation.ts), not a flat cutoff — kept the same
+  // option name/meaning for the common case (an admin's existing tuning of
+  // "the typical threshold" still means the same thing) while the actual
+  // per-gap decision now also accounts for local speech speed and the two
+  // hard clamps below.
   silenceThresholdMs?: number;
+  // Fix (2026-08-06, FIX 3) — "long pauses must always be removed / natural
+  // breathing pauses should remain." Both admin-configurable
+  // (AI_EDIT_SILENCE_MIN_THRESHOLD_MS/AI_EDIT_SILENCE_MAX_THRESHOLD_MS,
+  // read by ai-edit-jobs.ts, same "config read at the orchestration layer,
+  // passed down as a plain option" convention as silenceThresholdMs
+  // itself). Omitted means detectSilenceGapsAdaptive's own defaults (350ms
+  // floor, 2500ms ceiling).
+  minThresholdMs?: number;
+  maxThresholdMs?: number;
+  // Fix (2026-08-06, FIX 3) — the speech rate this calibration pivots
+  // around (AI_EDIT_SILENCE_REFERENCE_WPM). Omitted means
+  // detectSilenceGapsAdaptive's own default (150 WPM).
+  referenceWpm?: number;
 }
 
 export const DEFAULT_SILENCE_THRESHOLD_MS = 800;
@@ -33,7 +52,12 @@ export const DEFAULT_SILENCE_THRESHOLD_MS = 800;
 export function proposeSceneRemovals(words: TimedWord[], options: SceneRemovalProposerOptions = {}): AISceneRemoval[] {
   const silenceThresholdMs = options.silenceThresholdMs ?? DEFAULT_SILENCE_THRESHOLD_MS;
 
-  const silenceRemovals: AISceneRemoval[] = detectSilenceGaps(words, silenceThresholdMs).map((gap) => ({
+  const silenceRemovals: AISceneRemoval[] = detectSilenceGapsAdaptive(words, {
+    baseThresholdMs: silenceThresholdMs,
+    minThresholdMs: options.minThresholdMs,
+    maxThresholdMs: options.maxThresholdMs,
+    referenceWpm: options.referenceWpm,
+  }).map((gap) => ({
     startMs: gap.startMs,
     endMs: gap.endMs,
     reason: "silence" as const,

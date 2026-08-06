@@ -63,7 +63,7 @@ import { filterAcceptedPlan, itemKey } from "./ai-review-selection";
 import { summarizePlanCounts } from "./ai-plan-summary";
 import { aiTimelinePlanSchema, AI_ZOOM_SOURCE_CLIP_PLACEHOLDER, type AISceneRemovalReason, type AITimelinePlan } from "@/lib/validations/ai-timeline";
 import { AI_STYLE_PRESETS } from "@/lib/validations/ai-style-presets";
-import { AI_BROLL_DENSITIES } from "@/lib/validations/video-editor";
+import { AI_BROLL_DENSITIES, AI_EDIT_MODULES, type AiEditModule } from "@/lib/validations/video-editor";
 import type { AiEditJobStatus, AiEditJobView, AssetView, EditorTrackKind, ProjectView } from "../types";
 
 // Phase 12 Module 8 — same "genuine PATCH, not a display-only toggle"
@@ -112,6 +112,21 @@ const STATUS_LABEL: Record<AiEditJobStatus, string> = {
   FAILED: "Failed",
   CANCELLED: "Cancelled",
 };
+
+// Founder request (2026-07-30) — module selection checkboxes, Intake form.
+// Order matches the founder's own list exactly (sceneRemoval is presented
+// as "Silence Removal" — same underlying module, user-facing name only).
+const MODULE_LABELS: Record<AiEditModule, string> = {
+  captions: "Captions",
+  sceneRemoval: "Silence Removal",
+  zoom: "Zoom",
+  broll: "B-roll",
+  music: "Music",
+  sfx: "SFX",
+  stickers: "Stickers",
+  transitions: "Transitions",
+};
+const MODULE_CHECKBOX_ORDER: AiEditModule[] = ["captions", "sceneRemoval", "zoom", "broll", "music", "sfx", "stickers", "transitions"];
 
 const REASON_LABEL: Record<AISceneRemovalReason, string> = {
   silence: "Silence",
@@ -251,6 +266,18 @@ export function AiAutoEditPanel({
   // every job created before this control existed.
   const [brollDensity, setBrollDensity] = React.useState<"" | (typeof AI_BROLL_DENSITIES)[number]>("");
   const [script, setScript] = React.useState("");
+  // Founder request (2026-07-30) — module selection. All 8 checked by
+  // default so a run with no interaction here behaves exactly as it always
+  // did (every module runs) — unchecking is the only way to narrow scope.
+  const [selectedModules, setSelectedModules] = React.useState<Set<AiEditModule>>(new Set(AI_EDIT_MODULES));
+  function toggleModule(module: AiEditModule) {
+    setSelectedModules((prev) => {
+      const next = new Set(prev);
+      if (next.has(module)) next.delete(module);
+      else next.add(module);
+      return next;
+    });
+  }
   // Real bug fix (2026-07-18) — covers the auto-add-to-timeline step
   // (ensureSourceAssetOnTimeline) that now runs before job creation; see
   // handleRun's own comment for why this can't just reuse
@@ -405,6 +432,7 @@ export function AiAutoEditPanel({
     // asset was still READY-selectable but a subsequent status change
     // hasn't re-rendered yet (e.g. a stale query cache).
     if (sourceAssets.find((a) => a.id === selectedAssetId)?.status !== "READY") return;
+    if (selectedModules.size === 0) return;
     // Guards the button's own disabled state below — ensureSourceAssetOnTimeline
     // is real async work (an addTrack/addClip round trip) that happens BEFORE
     // createJobMutation.isPending would ever flip true on its own, so without
@@ -417,6 +445,7 @@ export function AiAutoEditPanel({
         stylePreset: stylePreset.trim() || undefined,
         brollDensity: brollDensity || undefined,
         script: script.trim() || undefined,
+        selectedModules: Array.from(selectedModules),
       });
     } catch {
       // editorApi() already toast.error()'d the real message (e.g. the new
@@ -648,7 +677,29 @@ export function AiAutoEditPanel({
               className="min-h-16 resize-y bg-editor-surface-1 text-caption text-neutral-100"
             />
           </div>
-          <Button type="button" className="w-full" disabled={!selectedAssetId || preparingRun || createJobMutation.isPending} onClick={() => void handleRun()}>
+          <div className="space-y-1.5">
+            <span className="text-caption text-neutral-500">What to run</span>
+            {/* Founder request (2026-07-30) — module selection. All checked
+                by default (a run with no interaction here still produces
+                every section, exactly as before this control existed).
+                sceneRemoval/captions/etc. all reuse the SAME job/pipeline —
+                this only narrows which sections it proposes, never spins up
+                a second pipeline. */}
+            <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
+              {MODULE_CHECKBOX_ORDER.map((module) => (
+                <label key={module} className="flex items-center gap-2 text-caption text-neutral-300">
+                  <Checkbox checked={selectedModules.has(module)} onCheckedChange={() => toggleModule(module)} />
+                  {MODULE_LABELS[module]}
+                </label>
+              ))}
+            </div>
+          </div>
+          <Button
+            type="button"
+            className="w-full"
+            disabled={!selectedAssetId || preparingRun || createJobMutation.isPending || selectedModules.size === 0}
+            onClick={() => void handleRun()}
+          >
             {preparingRun || createJobMutation.isPending ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
             Run AI Auto-Edit
           </Button>
@@ -956,9 +1007,19 @@ export function AiAutoEditPanel({
                     )}
 
                     {job.planningError && (
+                      // Fix (2026-08-06, FIX 2) — planningError now covers TWO
+                      // cases sharing one field (see ai-edit-jobs.ts's own doc
+                      // comment): a total planning failure (message already
+                      // reads like "...failed") and a partial degradation where
+                      // most sections still applied (message already reads
+                      // "Some items...were skipped, everything else still
+                      // applied"). The old hardcoded "Timeline planning failed"
+                      // prefix was actively wrong for the partial case, so this
+                      // now shows the message as-is rather than presupposing
+                      // total failure.
                       <p className="flex items-start gap-1 text-micro text-amber-400">
                         <AlertTriangle className="mt-0.5 size-3 shrink-0" />
-                        Timeline planning failed: {job.planningError} — scene removal proposals above are still valid and applicable.
+                        AI planning note: {job.planningError} Scene removal proposals above are always independent of this and remain valid.
                       </p>
                     )}
 

@@ -156,6 +156,84 @@ export const reasoningPlanOutputSchema = z.object({
 });
 export type ReasoningPlanOutput = z.infer<typeof reasoningPlanOutputSchema>;
 
+// Fix (2026-08-06, founder-reported production incident — "AI Timeline
+// Planning is failing") — reasoningPlanOutputSchema above validates the
+// model's ENTIRE response as ONE object; gpt5.provider.ts USED TO run the
+// whole thing through a single `.safeParse()`, which meant one invalid
+// item ANYWHERE (a bad broll item, an empty caption string, an out-of-
+// range sfx timestamp) failed the WHOLE response, and once repair
+// attempts were exhausted, the caller (ai-edit-jobs.ts) reset ALL SEVEN
+// sections — including perfectly valid captions/zoom/etc. that had
+// nothing wrong with them — to empty arrays. `parsePlanOutputLeniently`
+// replaces that all-or-nothing gate: each section's array is validated
+// ITEM BY ITEM (`safeArraySection`), a bad item is dropped and its exact
+// Zod issue recorded in `warnings` (still useful for a repair retry —
+// gpt5.provider.ts's `runPlanJsonRepairLoop` still re-prompts with these
+// specific errors while attempts remain, same "give the model a real
+// chance to self-correct first" convention as before), while every OTHER
+// item and section that DID validate survives untouched. Only a
+// genuinely un-parseable response (not an object at all) loses everything
+// — there's nothing to salvage from that shape. "music" is a lone object,
+// not an array, so it gets its own single safeParse rather than
+// safeArraySection.
+function safeArraySection<T>(raw: unknown, itemSchema: z.ZodType<T>, sectionName: string, warnings: string[]): T[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    warnings.push(`"${sectionName}" was expected to be an array in the model's response but was not — treated as empty for this attempt.`);
+    return [];
+  }
+  const kept: T[] = [];
+  raw.forEach((item, i) => {
+    const parsed = itemSchema.safeParse(item);
+    if (parsed.success) {
+      kept.push(parsed.data);
+    } else {
+      const detail = parsed.error.issues.map((issue) => (issue.path.length > 0 ? `${issue.path.join(".")}: ${issue.message}` : issue.message)).join("; ");
+      warnings.push(`"${sectionName}[${i}]" failed validation and was dropped (${detail}).`);
+    }
+  });
+  return kept;
+}
+
+export interface LenientPlanParseResult {
+  data: ReasoningPlanOutput;
+  // One entry per dropped item/section, human-readable — surfaced to
+  // ai-edit-jobs.ts's `planningError` (advisory, never blocks the job)
+  // and fed back into the repair prompt while attempts remain. Empty
+  // array means every section validated cleanly.
+  warnings: string[];
+}
+
+export function parsePlanOutputLeniently(raw: unknown): LenientPlanParseResult {
+  const warnings: string[] = [];
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return {
+      data: { captions: [], zoom: [], broll: [], stickers: [], sfx: [], transitions: [] },
+      warnings: ["The model's response was not a JSON object with the expected sections — every section is empty for this attempt."],
+    };
+  }
+  const obj = raw as Record<string, unknown>;
+  const captions = safeArraySection(obj.captions, reasoningCaptionRawSchema, "captions", warnings);
+  const zoom = safeArraySection(obj.zoom, reasoningZoomItemSchema, "zoom", warnings);
+  const broll = safeArraySection(obj.broll, aiBrollSchema, "broll", warnings);
+  const stickers = safeArraySection(obj.stickers, aiStickerSchema, "stickers", warnings);
+  const sfx = safeArraySection(obj.sfx, aiSfxSchema, "sfx", warnings);
+  const transitions = safeArraySection(obj.transitions, aiTransitionSchema, "transitions", warnings);
+
+  let music: ReasoningPlanOutput["music"];
+  if (obj.music !== undefined && obj.music !== null) {
+    const parsedMusic = aiMusicSchema.safeParse(obj.music);
+    if (parsedMusic.success) {
+      music = parsedMusic.data;
+    } else {
+      const detail = parsedMusic.error.issues.map((issue) => (issue.path.length > 0 ? `${issue.path.join(".")}: ${issue.message}` : issue.message)).join("; ");
+      warnings.push(`"music" failed validation and was dropped (${detail}).`);
+    }
+  }
+
+  return { data: { captions, zoom, broll, stickers, music, sfx, transitions }, warnings };
+}
+
 export interface ReasoningPlanResult {
   captions: AICaption[];
   zoom: ReasoningZoomItem[];
@@ -166,6 +244,13 @@ export interface ReasoningPlanResult {
   transitions: AITransitionPlan[];
   providerRef?: string;
   usage?: { tokens?: number };
+  // Fix (2026-08-06) — set (non-empty) when parsePlanOutputLeniently
+  // dropped one or more invalid items/sections even after every repair
+  // attempt was exhausted. Undefined/omitted means every section
+  // validated cleanly — the common case. ai-edit-jobs.ts surfaces this via
+  // its existing `planningError` field so degradation is never silent,
+  // without discarding the sections that DID come back valid.
+  warnings?: string[];
 }
 
 // Phase 12 Module 9 — Prompt-based re-edit. A second, genuinely different

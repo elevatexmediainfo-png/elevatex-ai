@@ -34,6 +34,7 @@ import {
   type AISticker,
   type AICostSummary,
 } from "@/lib/validations/ai-timeline";
+import { AI_EDIT_MODULES, type AiEditModule } from "@/lib/validations/video-editor";
 
 // Module 2's plan always reads the PROJECT's own current aspect ratio for
 // intake.aspectRatio (below, in processAiEditJob) — this module only
@@ -96,6 +97,10 @@ export interface CreateAiEditJobInput {
   // Phase 12 Module 8 — pasted reference text, "if provided." See
   // aiIntakeSchema.script's own doc comment for the full contract.
   script?: string;
+  // Founder request (2026-07-30) — see AI_EDIT_MODULES' own doc comment.
+  // Omitted/undefined means "every module" (unchanged pre-existing
+  // behavior).
+  selectedModules?: AiEditModule[];
 }
 
 export async function createAiEditJob(input: CreateAiEditJobInput) {
@@ -127,9 +132,22 @@ export async function createAiEditJob(input: CreateAiEditJobInput) {
       brollRelevanceFallbackThreshold,
       brollDensity: input.brollDensity,
       script: input.script,
+      selectedModules: input.selectedModules as unknown as never,
     },
   });
 }
+
+// Null/missing (job predates this field, or the caller omitted it) means
+// "every module" — the exact behavior this pipeline always had before
+// module selection existed.
+function resolveSelectedModules(raw: unknown): AiEditModule[] {
+  return Array.isArray(raw) ? (raw as AiEditModule[]) : [...AI_EDIT_MODULES];
+}
+
+// The 7 sections that all come back from the ONE planTimeline() reasoning
+// call — see that call site's own comment for why this can't be split per
+// module.
+const TIMELINE_PLANNING_MODULES: AiEditModule[] = ["captions", "zoom", "broll", "stickers", "music", "sfx", "transitions"];
 
 // Same compare-and-swap shape as exports.ts's claimNextExport() — see that
 // function's own comment for the "single-instance worker process only"
@@ -237,6 +255,9 @@ export async function processAiEditJob(jobId: string): Promise<void> {
   const job = await prisma.aiEditJob.findUnique({ where: { id: jobId } });
   if (!job) return;
 
+  const selectedModules = resolveSelectedModules(job.selectedModules);
+  const wantsModule = (m: AiEditModule) => selectedModules.includes(m);
+
   try {
     // Re-fetch project/asset fresh — this worker call is a separate
     // process tick from createAiEditJob, not trusting anything cached
@@ -297,14 +318,36 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     }
 
     await setStatus(jobId, "PLANNING_REMOVALS", { progress: 45 });
-    const silenceThresholdMs = await getConfig("AI_EDIT_SILENCE_THRESHOLD_MS");
-    const transcriptRemovals = proposeSceneRemovals(transcript.words, { silenceThresholdMs });
-    const videoRemovals: AISceneRemoval[] = (videoAnalysis?.flaggedSegments ?? []).map((f) => ({
-      startMs: f.startMs,
-      endMs: f.endMs,
-      reason: f.reason,
-    }));
-    const sceneRemoval = mergeSceneRemovalCandidates([...transcriptRemovals, ...videoRemovals]);
+    // Founder request (2026-07-30) — module selection. If "sceneRemoval"
+    // wasn't selected, skip proposing it entirely rather than computing it
+    // and discarding it — this step (unlike planTimeline below) is fully
+    // independent, so it can be skipped outright with no shared call to
+    // preserve.
+    let sceneRemoval: AISceneRemoval[] = [];
+    if (wantsModule("sceneRemoval")) {
+      // Fix (2026-08-06, FIX 3) — proposeSceneRemovals now runs an ADAPTIVE
+      // silence detector (per-gap threshold from local speech speed, see
+      // ai-scene-removal-proposer.ts/lib/transcription/segmentation.ts's
+      // own doc comments), not one flat cutoff. silenceThresholdMs is now
+      // the adaptive pivot; the two new configs are the hard floor/ceiling
+      // ("natural breathing pauses remain" / "long pauses always
+      // removed") — all three admin-configurable, same "read at the
+      // orchestration layer, passed down as a plain option" convention as
+      // before.
+      const [silenceThresholdMs, minThresholdMs, maxThresholdMs, referenceWpm] = await Promise.all([
+        getConfig("AI_EDIT_SILENCE_THRESHOLD_MS"),
+        getConfig("AI_EDIT_SILENCE_MIN_THRESHOLD_MS"),
+        getConfig("AI_EDIT_SILENCE_MAX_THRESHOLD_MS"),
+        getConfig("AI_EDIT_SILENCE_REFERENCE_WPM"),
+      ]);
+      const transcriptRemovals = proposeSceneRemovals(transcript.words, { silenceThresholdMs, minThresholdMs, maxThresholdMs, referenceWpm });
+      const videoRemovals: AISceneRemoval[] = (videoAnalysis?.flaggedSegments ?? []).map((f) => ({
+        startMs: f.startMs,
+        endMs: f.endMs,
+        reason: f.reason,
+      }));
+      sceneRemoval = mergeSceneRemovalCandidates([...transcriptRemovals, ...videoRemovals]);
+    }
 
     // Phase 12 Module 6 — how many surviving segments sceneRemoval (just
     // decided, above) will produce, computed in SOURCE-relative time
@@ -339,6 +382,17 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     // difference is what "surface" means: a job-killing FAILED status
     // would also discard the already-good sceneRemoval work, so this
     // surfaces at the field level instead, visible in the review UI.
+    //
+    // Fix (2026-08-06, FIX 2) — `planTimeline()` itself no longer throws
+    // over a single invalid item (see parsePlanOutputLeniently, reasoning/
+    // types.ts): a bad broll item no longer wipes out valid captions too.
+    // `planResult.warnings` (set only when something was actually dropped
+    // after every repair attempt) is surfaced into this SAME planningError
+    // field below on the SUCCESS path, not just the catch block — the
+    // field always meant "something about planning needs your attention,"
+    // not strictly "planning threw," so a partial-degradation notice and a
+    // total-failure notice share it rather than inventing a second field
+    // (no breaking API/schema change).
     await setStatus(jobId, "PLANNING_TIMELINE", { progress: 55 });
     let captions: AICaption[] = [];
     let zoom: AIZoom[] = [];
@@ -349,47 +403,59 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     let transitions: AITransitionPlan[] = [];
     let planningError: string | null = null;
     let reasoningCostUsd = 0;
-    try {
-      const repairMaxAttempts = await getConfig("AI_EDIT_REASONING_REPAIR_MAX_ATTEMPTS");
-      const planResult = await planTimeline(
-        {
-          words: transcript.words,
-          videoAnalysis: videoAnalysis
-            ? {
-                emphasisMoments: videoAnalysis.emphasisMoments,
-                emotionBeats: videoAnalysis.emotionBeats,
-                visualContext: videoAnalysis.visualContext,
-              }
-            : null,
-          stylePreset: job.stylePreset ?? undefined,
-          brollDensity: (job.brollDensity as ReasoningPlanRequest["brollDensity"]) ?? undefined,
-          brollStockOnly: job.brollStockOnly,
-          referenceScript: job.script ?? undefined,
-          sourceDurationMs,
-          survivingSegmentCount,
-          repairMaxAttempts,
-        },
-        { userId: job.userId }
-      );
-      captions = planResult.captions;
-      // zoom comes back clipId-less (see AI_ZOOM_SOURCE_CLIP_PLACEHOLDER's
-      // own doc comment) — the real clip id is only known client-side, at
-      // apply time (ai-auto-edit-panel.tsx), same as sceneRemoval's own
-      // source-relative-until-apply convention. transitions similarly
-      // come back with segment-boundary placeholders where GPT used them
-      // (AI_TRANSITION_SEGMENT_PLACEHOLDER_PREFIX) — resolved client-side
-      // too, inside the translator itself this time (no apply-time panel
-      // remap needed, unlike zoom/broll — see mapTransitionsToSegmentBoundaries).
-      zoom = planResult.zoom.map((z) => ({ ...z, clipId: AI_ZOOM_SOURCE_CLIP_PLACEHOLDER }));
-      brollProposals = planResult.broll;
-      stickers = planResult.stickers ?? [];
-      music = planResult.music;
-      sfx = planResult.sfx ?? [];
-      transitions = planResult.transitions ?? [];
-      reasoningCostUsd = planResult.costUsd ?? 0;
-    } catch (err) {
-      planningError = err instanceof Error ? err.message : "Timeline planning (captions/zoom/broll/stickers/music/sfx/transitions) failed.";
-      logger.error({ err, jobId }, "[ai edit job] timeline planning failed — continuing with sceneRemoval only");
+    // Founder request (2026-07-30) — module selection. captions/zoom/broll/
+    // stickers/music/sfx/transitions all come back from this ONE planTimeline()
+    // call — there's no way to ask GPT for a subset, so the call itself only
+    // runs at all if AT LEAST ONE of those 7 modules was selected; whichever
+    // of its 7 output sections weren't selected are discarded immediately
+    // below, before they ever reach asset resolution or the assembled plan.
+    if (TIMELINE_PLANNING_MODULES.some(wantsModule)) {
+      try {
+        const repairMaxAttempts = await getConfig("AI_EDIT_REASONING_REPAIR_MAX_ATTEMPTS");
+        const planResult = await planTimeline(
+          {
+            words: transcript.words,
+            videoAnalysis: videoAnalysis
+              ? {
+                  emphasisMoments: videoAnalysis.emphasisMoments,
+                  emotionBeats: videoAnalysis.emotionBeats,
+                  visualContext: videoAnalysis.visualContext,
+                }
+              : null,
+            stylePreset: job.stylePreset ?? undefined,
+            brollDensity: (job.brollDensity as ReasoningPlanRequest["brollDensity"]) ?? undefined,
+            brollStockOnly: job.brollStockOnly,
+            referenceScript: job.script ?? undefined,
+            sourceDurationMs,
+            survivingSegmentCount,
+            repairMaxAttempts,
+          },
+          { userId: job.userId }
+        );
+        captions = wantsModule("captions") ? planResult.captions : [];
+        // zoom comes back clipId-less (see AI_ZOOM_SOURCE_CLIP_PLACEHOLDER's
+        // own doc comment) — the real clip id is only known client-side, at
+        // apply time (ai-auto-edit-panel.tsx), same as sceneRemoval's own
+        // source-relative-until-apply convention. transitions similarly
+        // come back with segment-boundary placeholders where GPT used them
+        // (AI_TRANSITION_SEGMENT_PLACEHOLDER_PREFIX) — resolved client-side
+        // too, inside the translator itself this time (no apply-time panel
+        // remap needed, unlike zoom/broll — see mapTransitionsToSegmentBoundaries).
+        zoom = wantsModule("zoom") ? planResult.zoom.map((z) => ({ ...z, clipId: AI_ZOOM_SOURCE_CLIP_PLACEHOLDER })) : [];
+        brollProposals = wantsModule("broll") ? planResult.broll : [];
+        stickers = wantsModule("stickers") ? (planResult.stickers ?? []) : [];
+        music = wantsModule("music") ? planResult.music : undefined;
+        sfx = wantsModule("sfx") ? (planResult.sfx ?? []) : [];
+        transitions = wantsModule("transitions") ? (planResult.transitions ?? []) : [];
+        reasoningCostUsd = planResult.costUsd ?? 0;
+        if (planResult.warnings && planResult.warnings.length > 0) {
+          planningError = `Some items in the AI's plan were invalid and were skipped, everything else still applied: ${planResult.warnings.join(" ")}`;
+          logger.warn({ jobId, warnings: planResult.warnings }, "[ai edit job] timeline planning partially degraded — some items dropped, continuing with the rest");
+        }
+      } catch (err) {
+        planningError = err instanceof Error ? err.message : "Timeline planning (captions/zoom/broll/stickers/music/sfx/transitions) failed.";
+        logger.error({ err, jobId }, "[ai edit job] timeline planning failed — continuing with sceneRemoval only");
+      }
     }
 
     // Phase 12 Module 5/6 — resolve every proposed asset-needing slot

@@ -779,11 +779,48 @@ export function createUpdateTransformCommand(
 // last action" means the whole multi-select edit, not one clip at a time.
 // Both execute() and undo() run the wrapped commands in parallel — they're
 // independent per-clip mutations, so ordering between them doesn't matter.
+//
+// Fix (2026-08-06, FIX 6 — "composite timeline updates must become
+// transactional; if one command fails, rollback everything") — execute()
+// used to be a plain `Promise.all`, with NO rollback on a partial
+// failure: if one sibling rejected, whatever OTHER siblings had already
+// resolved stayed applied server-side with nothing to undo them (a real,
+// previously-documented trade-off — see ai-auto-edit-panel.tsx's own
+// handleApply catch-block comment, "Apply may have partially failed").
+// Fixed via `Promise.allSettled` (not `Promise.all`): every child command
+// is given a chance to actually finish — never abandoned mid-flight, so
+// "which children truly succeeded" is always accurate, not a race against
+// whichever one happened to reject first — then, if ANY child failed,
+// every child that DID succeed is rolled back via its own real undo()
+// (reverse order — same "undo the most recent thing first" convention
+// every other multi-step undo() in this file already follows), and only
+// THEN does this re-throw. The caller (runCommand, store.tsx) still sees
+// the apply as failed and never pushes a half-applied change onto the
+// undo stack — this composite is now genuinely all-or-nothing from the
+// caller's perspective, matching a real transaction's semantics even
+// though the underlying children are independent HTTP calls, not a real
+// DB transaction. A rollback-time undo() failure is logged and skipped,
+// never allowed to mask the original failure or stop rolling back the
+// rest of the succeeded siblings.
 export function createCompositeCommand(label: string, commands: EditorCommand[]): EditorCommand {
   return {
     label,
     execute: async () => {
-      await Promise.all(commands.map((c) => c.execute()));
+      const results = await Promise.allSettled(commands.map((c) => c.execute()));
+      const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+      if (rejected.length === 0) return;
+
+      const succeededCommands = commands.filter((_, i) => results[i].status === "fulfilled");
+      for (const c of succeededCommands.slice().reverse()) {
+        try {
+          await c.undo();
+        } catch (rollbackErr) {
+          console.error(`["${label}"] rollback of a partially-applied composite command failed — a manual refresh/reload may be needed to see the true current state`, rollbackErr);
+        }
+      }
+
+      const messages = rejected.map((r) => (r.reason instanceof Error ? r.reason.message : String(r.reason)));
+      throw new Error(`"${label}" failed and was rolled back (${rejected.length}/${commands.length} step(s) failed): ${messages.join("; ")}`);
     },
     undo: async () => {
       await Promise.all(commands.map((c) => c.undo()));

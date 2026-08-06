@@ -132,6 +132,38 @@ export function pickBestStockResult(
   return { providerId: best.providerId, result: best.result, relevanceScore: best.relevanceScore };
 }
 
+// Fix (2026-08-06, FIX 4 — "never leave B-roll empty if stock footage
+// exists") — a short, over-specific query (multiple qualifying words
+// stacked onto one core noun, e.g. "domestic water pump appliance") can
+// genuinely return zero results from a keyword-matching stock library
+// even when a broader phrasing of the SAME idea would find something
+// usable. This progressively widens the SEARCH TEXT only — relevance is
+// always scored against the ORIGINAL query (see resolveStockBroll below),
+// so broadening increases recall without ever inflating the quality score
+// of what it finds. Order: (1) the original query itself, (2) the same
+// query with stopwords stripped (reuses this file's own STOPWORDS set —
+// no separate list), (3) progressively fewer tokens, dropped from the
+// FRONT one at a time (the least-specific/qualifying position in these
+// short "adjective(s) + core noun" phrases this app's own prompt asks
+// GPT for — see gpt5.provider.ts's TASK 3), down to the single last token.
+export function buildBroadenedQueries(query: string): string[] {
+  const trimmed = query.trim();
+  const allTokens = trimmed.split(/\s+/).filter(Boolean);
+  if (allTokens.length <= 1) return [trimmed];
+
+  const queries = [trimmed];
+  const meaningfulTokens = allTokens.filter((t) => !STOPWORDS.has(t.toLowerCase()));
+  const stopwordStripped = meaningfulTokens.join(" ");
+  if (stopwordStripped && stopwordStripped.toLowerCase() !== trimmed.toLowerCase()) {
+    queries.push(stopwordStripped);
+  }
+  for (let dropCount = 1; dropCount < meaningfulTokens.length; dropCount++) {
+    const narrowed = meaningfulTokens.slice(dropCount).join(" ");
+    if (narrowed && !queries.includes(narrowed)) queries.push(narrowed);
+  }
+  return queries;
+}
+
 // `queryOverride` (2026-07-18, stock-only policy) — lets the stock-only
 // hard-enforcement path in resolveBrollItem search stock even for an item
 // GPT proposed as "generate" (which has no searchQuery of its own),
@@ -148,19 +180,53 @@ export function pickBestStockResult(
 // resolvedAssetId" as its trigger, so a low-relevance match and a missing
 // one are handled identically with no new branching there.
 async function resolveStockBroll(item: AIBroll, ctx: BrollResolutionContext, queryOverride?: string, minRelevanceScore?: number): Promise<AIBroll> {
-  const query = queryOverride ?? item.searchQuery;
-  if (!query) return { ...item, resolutionNote: 'source:"stock" but no searchQuery was provided.' };
+  const queryOrUndefined = queryOverride ?? item.searchQuery;
+  if (!queryOrUndefined) return { ...item, resolutionNote: 'source:"stock" but no searchQuery was provided.' };
+  // Re-bound to a plain `string` const — TypeScript's control-flow
+  // narrowing from the guard above doesn't propagate into the nested
+  // `searchAndPick` function declaration below (a closure over a
+  // differently-named outer binding), so this makes the non-optional type
+  // explicit rather than fighting the narrowing.
+  const query: string = queryOrUndefined;
 
-  // Search both kinds in parallel — b-roll is conventionally VIDEO
-  // footage, but a well-matched IMAGE is a real, usable fallback when no
-  // video result exists for this specific query (see pickBestStockResult).
-  const [videoOutcomes, imageOutcomes] = await Promise.all([
-    searchStockMedia("STOCK_MEDIA", query, { type: "video", perPage: 5 }),
-    searchStockMedia("STOCK_MEDIA", query, { type: "image", perPage: 5 }),
-  ]);
-  const picked = pickBestStockResult([...videoOutcomes.outcomes, ...imageOutcomes.outcomes], "VIDEO", query);
+  async function searchAndPick(searchText: string) {
+    // Search both kinds in parallel — b-roll is conventionally VIDEO
+    // footage, but a well-matched IMAGE is a real, usable fallback when no
+    // video result exists for this specific query (see pickBestStockResult).
+    const [videoOutcomes, imageOutcomes] = await Promise.all([
+      searchStockMedia("STOCK_MEDIA", searchText, { type: "video", perPage: 5 }),
+      searchStockMedia("STOCK_MEDIA", searchText, { type: "image", perPage: 5 }),
+    ]);
+    // Relevance is ALWAYS scored against the ORIGINAL query (`query`),
+    // never `searchText` — see buildBroadenedQueries' own doc comment.
+    return pickBestStockResult([...videoOutcomes.outcomes, ...imageOutcomes.outcomes], "VIDEO", query);
+  }
+
+  let picked = await searchAndPick(query);
+
+  // Fix (2026-08-06, FIX 4) — the ORIGINAL query found literally NOTHING
+  // (not "found a weak match" — that's the separate, already-existing
+  // relevance-threshold path below) across every enabled provider. Only
+  // THIS case triggers broadening: a specific query that already found
+  // something is never second-guessed, so an already-working query never
+  // pays the extra round-trip cost.
   if (!picked) {
-    return { ...item, resolutionNote: `No stock results found for "${query}".` };
+    const broadenedCandidates = buildBroadenedQueries(query).slice(1);
+    for (const broader of broadenedCandidates) {
+      picked = await searchAndPick(broader);
+      if (picked) {
+        logger.info({ originalQuery: query, widenedQuery: broader }, "[ai broll resolver] original query found nothing — a broadened phrasing found a usable match");
+        break;
+      }
+    }
+  }
+
+  if (!picked) {
+    const wasBroadened = buildBroadenedQueries(query).length > 1;
+    return {
+      ...item,
+      resolutionNote: `No stock results found for "${query}"${wasBroadened ? ", even after broadening the search to simpler phrasings" : ""}.`,
+    };
   }
   if (minRelevanceScore != null && picked.relevanceScore < minRelevanceScore) {
     return {

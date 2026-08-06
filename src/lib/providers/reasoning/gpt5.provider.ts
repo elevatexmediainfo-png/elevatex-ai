@@ -3,8 +3,9 @@ import type { ProviderRuntimeConfig } from "../credentials";
 import { logger } from "@/lib/observability/logger";
 import { aiReeditResponseSchema, type AIReeditResponse } from "@/lib/validations/ai-reedit";
 import type { AICaption } from "@/lib/validations/ai-timeline";
+import { buildFallbackCaptionsFromWords, splitTextIntoCaptionChunks, MAX_WORDS_PER_CAPTION } from "@/lib/video-editor/caption-formatting";
 import {
-  reasoningPlanOutputSchema,
+  parsePlanOutputLeniently,
   type ReasoningCaptionRaw,
   type ReasoningPlanRequest,
   type ReasoningPlanResult,
@@ -42,10 +43,39 @@ function formatWords(words: ReasoningPlanRequest["words"]): string {
 // it spans. Indices are clamped defensively (never crash the whole job
 // over one bad citation) and logged when out of range, which should be
 // rare: the model is shown the exact numbered list it must cite from.
+//
+// Fix (2026-08-06, FIX 5 — "modern social-media captions") — two changes
+// on top of the pre-existing index-resolution above:
+// (1) a caption whose cited word range is longer than
+// MAX_WORDS_PER_CAPTION (12 — see caption-formatting.ts) is now SPLIT into
+// multiple caption items, each formatted (proper punctuation, max 6
+// words/2 lines, auto-balanced) and individually timed. The split works
+// on the MODEL'S OWN text (which may be a rephrased/Hinglish version of
+// the underlying transcript words — see this file's own "keeps real
+// transcript-word timing even when rephrased" test — so it can't just be
+// re-chunked from `words` directly) via splitTextIntoCaptionChunks,
+// proportionally mapping each text chunk's fraction of the total word
+// count onto the real [words[startIdx].startMs, words[endIdx].endMs]
+// time range. The overall start/end anchors are still always real
+// transcript timestamps, never invented — only the INTERNAL split points
+// between an oversized caption's own multiple resulting captions are a
+// proportional (text-length-based) estimate, which is the honest,
+// documented approximation this requires once one citation must become
+// several real caption items.
+// (2) "never return empty captions" — if the model proposed literally
+// zero usable captions (an empty response, or every item dropped by
+// parsePlanOutputLeniently) despite real transcript words existing, this
+// falls back to buildFallbackCaptionsFromWords — the SAME deterministic
+// chunking MockReasoningProvider.plan() already uses when there's no real
+// reasoning at all, reused (not reimplemented) here for the "the real
+// model gave us nothing to work with" case specifically. Never used to
+// override captions the model DID successfully propose.
 export function resolveCaptionTiming(raw: ReasoningCaptionRaw[], words: ReasoningPlanRequest["words"]): AICaption[] {
   if (words.length === 0) return [];
   const lastIndex = words.length - 1;
-  return raw.map((c) => {
+  const result: AICaption[] = [];
+
+  for (const c of raw) {
     let startIdx = c.sourceWordStartIndex;
     let endIdx = c.sourceWordEndIndex;
     if (startIdx > lastIndex || endIdx > lastIndex) {
@@ -56,15 +86,31 @@ export function resolveCaptionTiming(raw: ReasoningCaptionRaw[], words: Reasonin
       startIdx = Math.min(startIdx, lastIndex);
       endIdx = Math.min(endIdx, lastIndex);
     }
-    return {
-      text: c.text,
-      startMs: words[startIdx].startMs,
-      endMs: words[endIdx].endMs,
-      style: c.style,
-      reveal: c.reveal,
-    };
-  });
+    const rangeStartMs = words[startIdx].startMs;
+    const rangeEndMs = words[endIdx].endMs;
+    const rangeDurationMs = Math.max(1, rangeEndMs - rangeStartMs);
+
+    for (const chunk of splitTextIntoCaptionChunks(c.text)) {
+      result.push({
+        text: chunk.text,
+        startMs: rangeStartMs + Math.round(rangeDurationMs * chunk.startFraction),
+        endMs: rangeStartMs + Math.round(rangeDurationMs * chunk.endFraction),
+        style: c.style,
+        reveal: c.reveal,
+      });
+    }
+  }
+
+  if (result.length === 0) {
+    return buildFallbackCaptionsFromWords(words).map((c) => ({ text: c.text, startMs: c.startMs, endMs: c.endMs }));
+  }
+  return result;
 }
+
+// Re-exported for callers (and this file's own doc comments above) that
+// need the hard per-caption word cap without importing caption-
+// formatting.ts's whole surface directly.
+export { MAX_WORDS_PER_CAPTION };
 
 function buildPrompt(req: ReasoningPlanRequest): string {
   const videoSection = req.videoAnalysis
@@ -136,8 +182,19 @@ TASK 1 — captions: Segment the transcript into natural caption chunks (roughly
 
 TASK 2 — zoom: If (and only if) video-understanding emphasis moments were given above, propose 0 to 3 SUBTLE zoom-in windows on the most genuinely emphasized moments — these should feel natural, not jarring. Keep scaleFrom around 100 (native size) and scaleTo modest (110-130 range for a subtle push-in; never above 150). Each zoom window's startMs/endMs should cover roughly the emphasis moment's own span. If no emphasis moments were given, or none are strong enough to be worth a zoom, return an empty zoom array — do not invent zooms.
 
-TASK 3 — broll: ${brollDensityGuidance}${stockOnlyGuidance} Only propose a slot where the transcript mentions something concrete and visualizable that would genuinely benefit from a supporting shot (a specific object, place, action, or scene) — never for abstract statements, filler, or when you're not confident there's a real visual to show. It's completely fine to propose zero, regardless of density. For each slot, set "trackHint" to "broll", startMs/endMs to a short window (1-4 seconds) covering the moment being illustrated, and choose "source":
-- "stock": use this whenever a decent keyword search of a real stock photo/video library would PLAUSIBLY turn up something usable — this covers far more than plain everyday objects: everyday objects, people doing everyday things, generic business/tech/nature/city scenes (e.g. "typing on a laptop," "a stock market chart," "a coffee cup on a desk," "a city skyline at night"), AND real-world professions/settings/activities even when fairly specific in COMBINATION (e.g. "a founder pitching investors," "a doctor examining a patient," "a chef plating a dish," "a warehouse worker scanning boxes") — a specific-sounding scene built from ordinary, photographable real-world elements is still "stock," not "generate." Set "searchQuery" to a short, literal, keyword-style search phrase (2-5 words) a stock library search box would actually match well — not a full sentence, and not an abstract concept. Two specific traps to avoid: (1) if the transcript names an abstract idea rather than a physical thing ("water conservation," "growth," "innovation," "trust"), don't search the abstract phrase itself — describe the one concrete, physically photographable scene or action that represents it instead ("hand turning off a running tap," "small plant sprouting from soil," "two people shaking hands"); (2) avoid a short, generic query built around a word with multiple unrelated real-world meanings ("pump," "crane," "driver") without a disambiguating word, since a stock library will happily match the wrong sense (e.g. "automatic water pump" alone can surface an unrelated industrial concrete pump) — add the one extra literal word that pins down which physical object or setting you mean ("domestic water pump appliance," "construction crane," not "a race car driver's job"). An approximate stock match is virtually always the right choice over spending real generation credits for a closer one.
+TASK 3 — broll: ${brollDensityGuidance}${stockOnlyGuidance} Only propose a slot where the transcript mentions something concrete and visualizable that would genuinely benefit from a supporting shot (a specific object, place, action, or scene) — never for abstract statements, filler, or when you're not confident there's a real visual to show. It's completely fine to propose zero, regardless of density.
+
+Scan the transcript specifically for these SIX kinds of concrete, visualizable mentions — each is its own reason to consider a b-roll slot, and a moment often has more than one of these stacked together (e.g. "our founder demoed the app in Mumbai" is a PERSON + a PRODUCT + a LOCATION at once — that's still ONE slot, not three):
+- Important NOUNS — a specific physical object or thing named in the transcript (a laptop, a coffee cup, a delivery van, a whiteboard).
+- LOCATIONS — a named or clearly implied place or setting (a city, an office, a warehouse, a beach, "our factory floor").
+- PRODUCTS — a specific product, app, device, or piece of software being discussed or demoed.
+- ACTIONS — a physical action or activity being described (typing, shipping a package, shaking hands, cooking, driving).
+- PEOPLE — a role or person being referenced (a founder, a customer, a doctor, a team, "our engineers").
+- BRANDS — a named brand, company, or well-known product line mentioned by name.
+Use whichever of these actually appear — most moments will only hit one or two, and that's fine; do not force all six onto a single transcript.
+
+For each slot, set "trackHint" to "broll", startMs/endMs to a short window (1-4 seconds) covering the moment being illustrated, and choose "source":
+- "stock": use this whenever a decent keyword search of a real stock photo/video library would PLAUSIBLY turn up something usable — this covers far more than plain everyday objects: everyday objects, people doing everyday things, generic business/tech/nature/city scenes (e.g. "typing on a laptop," "a stock market chart," "a coffee cup on a desk," "a city skyline at night"), AND real-world professions/settings/activities even when fairly specific in COMBINATION (e.g. "a founder pitching investors," "a doctor examining a patient," "a chef plating a dish," "a warehouse worker scanning boxes") — a specific-sounding scene built from ordinary, photographable real-world elements is still "stock," not "generate." Set "searchQuery" to a short, literal, keyword-style search phrase (2-5 words) a stock library search box would actually match well — not a full sentence, and not an abstract concept. Three specific traps to avoid: (1) if the transcript names an abstract idea rather than a physical thing ("water conservation," "growth," "innovation," "trust"), don't search the abstract phrase itself — describe the one concrete, physically photographable scene or action that represents it instead ("hand turning off a running tap," "small plant sprouting from soil," "two people shaking hands"); (2) avoid a short, generic query built around a word with multiple unrelated real-world meanings ("pump," "crane," "driver") without a disambiguating word, since a stock library will happily match the wrong sense (e.g. "automatic water pump" alone can surface an unrelated industrial concrete pump) — add the one extra literal word that pins down which physical object or setting you mean ("domestic water pump appliance," "construction crane," not "a race car driver's job"); (3) for a BRAND mention specifically, a stock library almost never carries real licensed footage of a named brand — search the generic real-world scene the brand name implies instead of the literal brand name (a mention of a specific coffee brand becomes "coffee shop counter" or "barista pouring coffee," not the brand's own name as a search phrase). An approximate stock match is virtually always the right choice over spending real generation credits for a closer one.
 - "generate": real money is spent per generated item, stock costs nothing — this is a COST decision, not just a quality one, so treat "generate" as a rare last resort, never a coin-flip default. Use it ONLY when you're confident NO real-world photo or video could plausibly exist for this — fictional/surreal/impossible content (a creature that doesn't exist, a physically impossible scene), an exact custom/branded visual that must match specific unreproducible details (a specific app's exact UI mockup), or a genuinely abstract concept with no literal photographable form. If you can picture ANY real photo or video that would reasonably illustrate the moment — even an imperfect match — that is a "stock" case, not a "generate" one. Set "generation" to { "kind": "image"|"video", "prompt": a detailed visual description }. Prefer "kind":"image" over "video" unless genuine motion is essential to what's being shown — a generated still image is far cheaper and faster, and works fine as a brief cutaway.
 When genuinely uncertain between the two, ALWAYS choose "stock" — an approximate free match costs nothing, an unnecessary generation call spends real credits for marginal benefit. Never set resolvedAssetId, resolvedAssetUrl, or resolutionNote — those are filled in by a later step, not you.
 
@@ -263,6 +320,91 @@ async function runJsonRepairLoop<T>({ apiKey, model, messages, schema, repairMax
   throw new Error(`${errorPrefix} failed: ${lastErrorSummary}`);
 }
 
+// Fix (2026-08-06, FIX 2 — "AI Timeline Planning is failing") — a
+// deliberately SEPARATE loop from runJsonRepairLoop above, not a shared
+// abstraction: this one validates the response PER-SECTION/PER-ITEM
+// (parsePlanOutputLeniently, ./types.ts) instead of one all-or-nothing
+// `schema.safeParse()`, so a single bad broll item can no longer wipe out
+// otherwise-valid captions/zoom/etc. Kept as its own function (a small,
+// deliberate amount of duplication of the outer fetch/JSON.parse-retry
+// skeleton) rather than parametrizing runJsonRepairLoop, since reEdit()'s
+// own strict all-or-nothing contract (a single discriminated action, not
+// independent sections) is real, tested behavior this fix must not risk
+// disturbing. Repair-prompting still fires exactly like before whenever
+// anything was dropped and attempts remain — the only actual behavior
+// change is what happens once attempts are EXHAUSTED: instead of throwing
+// (and the caller resetting every section to empty, the real production
+// bug), this returns whatever validated across every attempt, plus
+// `warnings` naming exactly what was dropped and why. Only a response
+// that isn't valid JSON at all still throws — there's nothing to salvage
+// from that shape, same as runJsonRepairLoop's own non-JSON handling.
+async function runPlanJsonRepairLoop(params: {
+  apiKey: string;
+  model: string;
+  messages: ChatMessage[];
+  repairMaxAttempts: number;
+  errorPrefix: string;
+  signal?: AbortSignal;
+}): Promise<{ data: ReturnType<typeof parsePlanOutputLeniently>["data"]; warnings: string[]; providerRef?: string; usage?: { tokens?: number } }> {
+  const { apiKey, model, messages, repairMaxAttempts, errorPrefix, signal } = params;
+
+  for (let attempt = 0; attempt <= repairMaxAttempts; attempt++) {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages, temperature: 0.4, response_format: { type: "json_object" } }),
+      signal,
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`${errorPrefix} request failed (${res.status}): ${body.slice(0, 300)}`);
+    }
+    const json = await res.json();
+    const text = json.choices?.[0]?.message?.content;
+    if (typeof text !== "string") {
+      throw new Error(`${errorPrefix} response did not contain a message.`);
+    }
+
+    let rawParsed: unknown;
+    try {
+      rawParsed = JSON.parse(text);
+    } catch {
+      if (attempt < repairMaxAttempts) {
+        messages.push({ role: "assistant", content: text });
+        messages.push({
+          role: "user",
+          content: `That response was not valid JSON: Response was not valid JSON. Return ONLY the corrected JSON object, matching the exact schema given earlier — no other text.`,
+        });
+        continue;
+      }
+      throw new Error(`${errorPrefix} returned invalid JSON even after ${repairMaxAttempts} repair attempt(s): Response was not valid JSON.`);
+    }
+
+    const { data, warnings } = parsePlanOutputLeniently(rawParsed);
+    if (warnings.length === 0) {
+      return { data, warnings: [], providerRef: json.id, usage: { tokens: json.usage?.total_tokens } };
+    }
+    if (attempt < repairMaxAttempts) {
+      messages.push({ role: "assistant", content: text });
+      messages.push({
+        role: "user",
+        content: `Some items in that JSON failed schema validation and were dropped: ${warnings.join(" ")} Return ONLY the corrected, COMPLETE JSON object (every section, not just the previously-invalid parts), matching the exact schema given earlier — no other text.`,
+      });
+      continue;
+    }
+    // Repair attempts exhausted — return whatever validated across every
+    // attempt rather than losing every section over one bad item (see
+    // this function's own doc comment above). This is the ONE real
+    // behavior difference from runJsonRepairLoop's own "throw once
+    // exhausted" contract.
+    return { data, warnings, providerRef: json.id, usage: { tokens: json.usage?.total_tokens } };
+  }
+
+  // Unreachable — the loop above always returns — but keeps TypeScript
+  // happy about every code path returning.
+  throw new Error(`${errorPrefix} failed.`);
+}
+
 // Phase 12 Module 9 — a single natural-language instruction about ONE
 // currently-selected clip, interpreted into ONE of a small, fixed set of
 // real operations (lib/validations/ai-reedit.ts's own discriminated
@@ -341,14 +483,12 @@ export class GPT5ReasoningProvider implements ReasoningProvider {
       { role: "user", content: buildPrompt(req) },
     ];
 
-    const result = await runJsonRepairLoop({
+    const result = await runPlanJsonRepairLoop({
       apiKey,
       model: this.model,
       messages,
-      schema: reasoningPlanOutputSchema,
       repairMaxAttempts,
       errorPrefix: "GPT-5 reasoning",
-      schemaFailureKind: "timeline",
       signal,
     });
 
@@ -362,6 +502,7 @@ export class GPT5ReasoningProvider implements ReasoningProvider {
       transitions: result.data.transitions,
       providerRef: result.providerRef,
       usage: result.usage,
+      warnings: result.warnings.length > 0 ? result.warnings : undefined,
     };
   }
 

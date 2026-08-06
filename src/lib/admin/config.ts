@@ -977,7 +977,32 @@ export const CONFIG_REGISTRY = {
     schema: z.number().int().min(100).max(10_000),
     default: 800,
     label: "AI Auto-Editor silence-removal threshold (ms)",
-    description: "A pause between words at or above this length is proposed as a \"silence\" scene-removal window. Deliberately admin-tunable separately from the transcript SEGMENTATION module's own 700ms paragraph-break threshold (a different purpose — cutting silence from the final video, not marking a paragraph boundary). Wired in Phase 12 Module 2.",
+    description: "A pause between words at or above this length is proposed as a \"silence\" scene-removal window. Deliberately admin-tunable separately from the transcript SEGMENTATION module's own 700ms paragraph-break threshold (a different purpose — cutting silence from the final video, not marking a paragraph boundary). Fix (2026-08-06) — this is now the ADAPTIVE detector's pivot value (see detectSilenceGapsAdaptive, lib/transcription/segmentation.ts), scaled per-gap by local speech speed, not a flat cutoff; the three settings below are its hard floor/ceiling/reference rate. Wired in Phase 12 Module 2.",
+    category: "video_editor_policy",
+  },
+  // Fix (2026-08-06, FIX 3 — "gap removal quality is poor") — the three
+  // knobs the adaptive silence detector needs beyond the pivot above. See
+  // detectSilenceGapsAdaptive's own doc comment (lib/transcription/
+  // segmentation.ts) for exactly how each is used.
+  AI_EDIT_SILENCE_MIN_THRESHOLD_MS: {
+    schema: z.number().int().min(50).max(5_000),
+    default: 350,
+    label: "AI Auto-Editor silence-removal floor (ms)",
+    description: "A pause shorter than this is NEVER proposed for removal, regardless of local speech speed — the natural-breathing safety floor (\"natural breathing pauses should remain\"). Lower this if you deliberately want tighter cuts than the default floor allows.",
+    category: "video_editor_policy",
+  },
+  AI_EDIT_SILENCE_MAX_THRESHOLD_MS: {
+    schema: z.number().int().min(500).max(15_000),
+    default: 2500,
+    label: "AI Auto-Editor silence-removal ceiling (ms)",
+    description: "A pause at or above this length is ALWAYS proposed for removal, regardless of local speech speed — no speaker's natural pacing is used to excuse dead air this long (\"long pauses must always be removed\").",
+    category: "video_editor_policy",
+  },
+  AI_EDIT_SILENCE_REFERENCE_WPM: {
+    schema: z.number().int().min(50).max(400),
+    default: 150,
+    label: "AI Auto-Editor silence-removal reference speech rate (WPM)",
+    description: "The articulation speed (words per minute of actual speaking time, pauses excluded) the adaptive threshold is centered on. A local passage faster than this lowers the effective threshold for gaps in it (a pause reads as comparatively longer against a quick pace); a slower passage raises it (the same pause may just be that speaker's natural rhythm). 150 WPM is an average conversational pace.",
     category: "video_editor_policy",
   },
   AI_EDIT_REASONING_REPAIR_MAX_ATTEMPTS: {
