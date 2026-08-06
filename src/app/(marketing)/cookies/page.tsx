@@ -19,7 +19,7 @@ export default function CookiesPage() {
         <h2>Essential cookies</h2>
         <ul>
           <li>
-            <strong>Session cookie:</strong> keeps you signed in after OTP login. Required for the Service to work;
+            <strong>Session cookie:</strong> keeps you signed in after login. Required for the Service to work;
             cannot be disabled without signing out.
           </li>
           <li>
@@ -51,7 +51,7 @@ export default function CookiesPage() {
         <h2>Managing cookies</h2>
         <p>
           You can clear cookies via your browser settings at any time. Clearing the session cookie will sign you
-          out; you can sign back in with your phone number and a new OTP.
+          out; you can sign back in with Google or your email and password.
         </p>
       </div>
 

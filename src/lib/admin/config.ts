@@ -746,11 +746,6 @@ export const CONFIG_REGISTRY = {
       ai_assistant: { limit: 60, windowSeconds: 3600 },
       export_create: { limit: 20, windowSeconds: 3600 },
       contact_form: { limit: 5, windowSeconds: 3600 },
-      // FR-AU-011/FR-AU-012's exact pre-existing OTP thresholds, preserved
-      // as-is — this migration only moves the counting mechanism into the
-      // shared helper, it doesn't change the limits.
-      otp_send_phone: { limit: 3, windowSeconds: 3600 },
-      otp_send_ip: { limit: 20, windowSeconds: 3600 },
     } as const,
     label: "Rate limits",
     description:

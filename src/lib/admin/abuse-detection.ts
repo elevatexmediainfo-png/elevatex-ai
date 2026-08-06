@@ -20,9 +20,10 @@ export interface AbuseFlag {
 
 // RateLimitHit's key is `ratelimit:<action>:<identifier>` — only the
 // user-keyed actions (video_create/asset_upload/ai_assistant/export_create)
-// have a userId as the identifier; otp_send_phone/otp_send_ip are keyed by
-// phone/IP, not a user, so they're excluded here by construction (their key
-// won't match any real user id as the third segment).
+// have a userId as the identifier. Any future non-user-keyed action (the
+// old otp_send_phone/otp_send_ip entries, since removed, were keyed by
+// phone/IP instead) would be excluded here by construction — their key
+// wouldn't match any real user id as the third segment.
 async function getExcessiveRateLimitUsers(): Promise<Map<string, number>> {
   const since = new Date(Date.now() - RATE_LIMIT_WINDOW_HOURS * 60 * 60 * 1000);
   const hits = await prisma.rateLimitHit.findMany({

@@ -23,7 +23,7 @@ Fill in `.env.local`. At minimum for a working production deployment:
 | `DATABASE_URL` | Yes | Overridden to the in-network `postgres` service by `docker-compose.yml` — only matters if you point at an external managed Postgres instead. |
 | `AUTH_SECRET` | Yes | Generate with `openssl rand -base64 32`. |
 | `NEXTAUTH_URL` | Yes | Your real public URL, e.g. `https://app.example.com`. |
-| `MSG91_AUTH_KEY` | Recommended | Without it, OTP send falls back to dev mode (logs the code instead of sending an SMS) — **do not ship to real users without this set**. |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Yes | Google is one of only two supported sign-in methods (the other is email+password) — see console.cloud.google.com/apis/credentials. |
 | `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` / `RAZORPAY_WEBHOOK_SECRET` | Recommended | Without these, Payment falls back to Mock (instant fake confirmation, no real charge). |
 | `S3_BUCKET` / `S3_REGION` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_PUBLIC_BASE_URL` | Recommended | Without these, Storage falls back to Mock (local-only, not durable). |
 | `REDIS_URL` | Optional | Overridden to the in-network `redis` service by `docker-compose.yml`. Without Redis at all, cache/rate-limiting fall back to in-process/DB — fine for a single instance, not for multiple. |
@@ -55,7 +55,7 @@ curl -I http://localhost:3000/
 
 ## 4. First-run installation
 
-Visit `https://your-domain/install` and walk through the Installation Wizard: OTP verification, promote yourself to Super Admin, test the database connection, optionally configure Storage/Payment, optionally seed demo data. This is the **same wizard every environment uses** — there's no separate "production setup script."
+Visit `https://your-domain/install` and walk through the Installation Wizard: create your Super Admin account (email + password), test the database connection, optionally configure Storage/Payment, optionally seed demo data. This is the **same wizard every environment uses** — there's no separate "production setup script."
 
 After install, go to `/admin/ai-providers` and enable the real AI providers (LLM/Image/Voice/Video/Transcription/Email) you want active — every category defaults to Mock until an admin explicitly enables a real one.
 

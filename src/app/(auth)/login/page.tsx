@@ -12,10 +12,6 @@ import { Container } from "@/components/shared/container";
 import { LanguageToggle } from "@/components/shared/language-toggle";
 import { ForceSceneTheme } from "@/components/shared/force-scene-theme";
 
-type Step = "phone" | "otp" | "password";
-
-const RESEND_COOLDOWN_SECONDS = 60;
-
 function GoogleIcon() {
   return (
     <svg viewBox="0 0 24 24" className="size-4">
@@ -43,74 +39,21 @@ function sanitizeCallbackUrl(raw: string | null): string {
   return raw;
 }
 
+// Phone-OTP authentication removed entirely (2026-08-06) — this page used
+// to be a 3-step flow (phone -> otp -> password, phone/Google as the
+// default). Only Google and email+password remain, so there's no longer a
+// "simpler default path" to pick between — both are shown together on one
+// screen, no step state needed.
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const callbackUrl = sanitizeCallbackUrl(searchParams.get("callbackUrl"));
 
-  const [step, setStep] = React.useState<Step>("phone");
-  const [phone, setPhone] = React.useState("");
-  const [otp, setOtp] = React.useState("");
-  const [devOtp, setDevOtp] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [googleLoading, setGoogleLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const [cooldown, setCooldown] = React.useState(0);
-  // MVP install-flow password login (2026-07-27) — see lib/auth/index.ts's
-  // "password" Credentials provider comment. Additive only: phone-OTP above
-  // is completely unchanged, this is a second, independent path for
-  // accounts that have a password set (currently: Installation Wizard
-  // admins).
   const [loginEmail, setLoginEmail] = React.useState("");
   const [loginPassword, setLoginPassword] = React.useState("");
-
-  React.useEffect(() => {
-    if (cooldown <= 0) return;
-    const id = setInterval(() => setCooldown((c) => Math.max(0, c - 1)), 1000);
-    return () => clearInterval(id);
-  }, [cooldown]);
-
-  async function sendOtp() {
-    setError(null);
-    setLoading(true);
-    try {
-      const res = await fetch("/api/auth/otp/send", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone }),
-      });
-      const json = await res.json();
-      if (!json.success) {
-        setError(json.error?.message ?? "Couldn't send OTP. Please try again.");
-        return;
-      }
-      setDevOtp(json.data.devOtp ?? null);
-      setStep("otp");
-      setCooldown(RESEND_COOLDOWN_SECONDS);
-    } catch {
-      setError("Network error. Please check your connection and try again.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function verifyOtp() {
-    setError(null);
-    setLoading(true);
-    try {
-      const res = await signIn("otp", { phone, otp, redirect: false });
-      if (res?.error) {
-        setError("Incorrect or expired code. Please try again.");
-        return;
-      }
-      router.push(callbackUrl);
-      router.refresh();
-    } catch {
-      setError("Network error. Please check your connection and try again.");
-    } finally {
-      setLoading(false);
-    }
-  }
 
   async function handleGoogle() {
     setGoogleLoading(true);
@@ -182,16 +125,8 @@ function LoginForm() {
               "inset 0 1px 0 rgba(255,255,255,0.10), 0 2px 0 rgba(255,255,255,0.04), 0 24px 64px rgba(0,0,0,0.70), 0 0 80px rgba(124,58,237,0.06)",
           }}
         >
-          <h1 className="text-heading-1 text-white">
-            {step === "phone" ? "Log in or sign up" : step === "otp" ? "Enter the code" : "Log in with email"}
-          </h1>
-          <p className="mt-2 text-body-md text-white/50">
-            {step === "phone"
-              ? "Continue with Google or your phone number."
-              : step === "otp"
-                ? `We sent a 6-digit code to +91 ${phone}.`
-                : "Enter your email and password."}
-          </p>
+          <h1 className="text-heading-1 text-white">Log in or sign up</h1>
+          <p className="mt-2 text-body-md text-white/50">Continue with Google or your email.</p>
 
           {error && (
             <div className="mt-4 rounded-lg border border-red-500/20 bg-red-500/[0.08] px-3 py-2 text-body-sm text-red-400">
@@ -199,186 +134,69 @@ function LoginForm() {
             </div>
           )}
 
-          {devOtp && step === "otp" && (
-            <div className="mt-4 rounded-lg border border-amber-500/20 bg-amber-500/[0.08] px-3 py-2 text-body-sm text-amber-400">
-              Dev mode — no SMS gateway configured. Your code is{" "}
-              <span className="font-mono font-semibold">{devOtp}</span>.
+          <div className="mt-6 flex flex-col gap-4">
+            <Button
+              type="button"
+              variant="outline"
+              size="lg"
+              className="w-full border-white/[0.12] bg-white/[0.04] text-white hover:bg-white/[0.08] hover:border-white/[0.18]"
+              disabled={googleLoading}
+              onClick={handleGoogle}
+            >
+              {googleLoading ? <Loader2 className="size-4 animate-spin" /> : <GoogleIcon />}
+              Continue with Google
+            </Button>
+
+            <div className="flex items-center gap-3 text-body-sm text-white/30">
+              <span className="h-px flex-1 bg-white/[0.07]" />
+              or
+              <span className="h-px flex-1 bg-white/[0.07]" />
             </div>
-          )}
 
-          {step === "phone" && (
-            <div className="mt-6 flex flex-col gap-4">
-              <Button
-                type="button"
-                variant="outline"
-                size="lg"
-                className="w-full border-white/[0.12] bg-white/[0.04] text-white hover:bg-white/[0.08] hover:border-white/[0.18]"
-                disabled={googleLoading}
-                onClick={handleGoogle}
-              >
-                {googleLoading ? <Loader2 className="size-4 animate-spin" /> : <GoogleIcon />}
-                Continue with Google
-              </Button>
-
-              <div className="flex items-center gap-3 text-body-sm text-white/30">
-                <span className="h-px flex-1 bg-white/[0.07]" />
-                or
-                <span className="h-px flex-1 bg-white/[0.07]" />
-              </div>
-
-              <div>
-                <label htmlFor="phone" className="mb-1.5 block text-label-md text-white/65">
-                  Mobile number
-                </label>
-                <div className="flex items-center gap-2">
-                  <span className="flex h-11 items-center rounded-md border border-white/[0.10] bg-white/[0.04] px-3 text-body-md text-white/45">
-                    +91
-                  </span>
-                  <Input
-                    id="phone"
-                    inputMode="numeric"
-                    maxLength={10}
-                    placeholder="98765 43210"
-                    value={phone}
-                    onChange={(e) => setPhone(e.target.value.replace(/\D/g, "").slice(0, 10))}
-                    className="h-11 text-body-md"
-                  />
-                </div>
-              </div>
-
-              <Button
-                type="button"
-                variant="primary"
-                size="lg"
-                className="w-full"
-                disabled={phone.length !== 10 || loading}
-                onClick={sendOtp}
-                style={{
-                  background: "linear-gradient(155deg, #8B5CF6 0%, #6D28D9 40%, #2563EB 100%)",
-                  boxShadow:
-                    "0 4px 20px rgba(124,58,237,0.42), 0 2px 8px rgba(37,99,235,0.28), inset 0 1px 0 rgba(255,255,255,0.18)",
-                  color: "white",
-                }}
-              >
-                {loading && <Loader2 className="size-4 animate-spin" />}
-                Send OTP
-              </Button>
-
-              <button
-                type="button"
-                className="text-center text-body-sm text-white/40 hover:text-white/75 transition-colors duration-150"
-                onClick={() => { setStep("password"); setError(null); }}
-              >
-                Log in with email &amp; password instead
-              </button>
-            </div>
-          )}
-
-          {step === "password" && (
-            <div className="mt-6 flex flex-col gap-4">
-              <div>
-                <label htmlFor="login-email" className="mb-1.5 block text-label-md text-white/65">
-                  Email
-                </label>
-                <Input
-                  id="login-email"
-                  type="email"
-                  placeholder="you@company.com"
-                  value={loginEmail}
-                  onChange={(e) => setLoginEmail(e.target.value)}
-                  className="h-11 text-body-md"
-                />
-              </div>
-              <div>
-                <label htmlFor="login-password" className="mb-1.5 block text-label-md text-white/65">
-                  Password
-                </label>
-                <Input
-                  id="login-password"
-                  type="password"
-                  value={loginPassword}
-                  onChange={(e) => setLoginPassword(e.target.value)}
-                  className="h-11 text-body-md"
-                />
-              </div>
-
-              <Button
-                type="button"
-                variant="primary"
-                size="lg"
-                className="w-full"
-                disabled={!loginEmail || !loginPassword || loading}
-                onClick={loginWithPassword}
-                style={{
-                  background: "linear-gradient(155deg, #8B5CF6 0%, #6D28D9 40%, #2563EB 100%)",
-                  boxShadow:
-                    "0 4px 20px rgba(124,58,237,0.42), 0 2px 8px rgba(37,99,235,0.28), inset 0 1px 0 rgba(255,255,255,0.18)",
-                  color: "white",
-                }}
-              >
-                {loading && <Loader2 className="size-4 animate-spin" />}
-                Log in
-              </Button>
-
-              <button
-                type="button"
-                className="text-center text-body-sm text-white/40 hover:text-white/75 transition-colors duration-150"
-                onClick={() => { setStep("phone"); setError(null); }}
-              >
-                Back to phone &amp; Google login
-              </button>
-            </div>
-          )}
-
-          {step === "otp" && (
-            <div className="mt-6 flex flex-col gap-4">
+            <div>
+              <label htmlFor="login-email" className="mb-1.5 block text-label-md text-white/65">
+                Email
+              </label>
               <Input
-                id="otp"
-                inputMode="numeric"
-                maxLength={6}
-                placeholder="123456"
-                value={otp}
-                onChange={(e) => setOtp(e.target.value.replace(/\D/g, "").slice(0, 6))}
-                className="h-11 text-center font-mono text-heading-2 tracking-[0.3em]"
+                id="login-email"
+                type="email"
+                placeholder="you@company.com"
+                value={loginEmail}
+                onChange={(e) => setLoginEmail(e.target.value)}
+                className="h-11 text-body-md"
               />
-
-              <Button
-                type="button"
-                variant="primary"
-                size="lg"
-                className="w-full"
-                disabled={otp.length !== 6 || loading}
-                onClick={verifyOtp}
-                style={{
-                  background: "linear-gradient(155deg, #8B5CF6 0%, #6D28D9 40%, #2563EB 100%)",
-                  boxShadow:
-                    "0 4px 20px rgba(124,58,237,0.42), 0 2px 8px rgba(37,99,235,0.28), inset 0 1px 0 rgba(255,255,255,0.18)",
-                  color: "white",
-                }}
-              >
-                {loading && <Loader2 className="size-4 animate-spin" />}
-                Verify &amp; Continue
-              </Button>
-
-              <div className="flex items-center justify-between text-body-sm">
-                <button
-                  type="button"
-                  className="text-white/40 hover:text-white/75 transition-colors duration-150"
-                  onClick={() => { setStep("phone"); setOtp(""); setError(null); }}
-                >
-                  Change number
-                </button>
-                <button
-                  type="button"
-                  className="text-violet-400 hover:text-violet-300 disabled:text-white/30 transition-colors duration-150"
-                  disabled={cooldown > 0 || loading}
-                  onClick={sendOtp}
-                >
-                  {cooldown > 0 ? `Resend in ${cooldown}s` : "Resend OTP"}
-                </button>
-              </div>
             </div>
-          )}
+            <div>
+              <label htmlFor="login-password" className="mb-1.5 block text-label-md text-white/65">
+                Password
+              </label>
+              <Input
+                id="login-password"
+                type="password"
+                value={loginPassword}
+                onChange={(e) => setLoginPassword(e.target.value)}
+                className="h-11 text-body-md"
+              />
+            </div>
+
+            <Button
+              type="button"
+              variant="primary"
+              size="lg"
+              className="w-full"
+              disabled={!loginEmail || !loginPassword || loading}
+              onClick={loginWithPassword}
+              style={{
+                background: "linear-gradient(155deg, #8B5CF6 0%, #6D28D9 40%, #2563EB 100%)",
+                boxShadow:
+                  "0 4px 20px rgba(124,58,237,0.42), 0 2px 8px rgba(37,99,235,0.28), inset 0 1px 0 rgba(255,255,255,0.18)",
+                color: "white",
+              }}
+            >
+              {loading && <Loader2 className="size-4 animate-spin" />}
+              Log in
+            </Button>
+          </div>
 
           <p className="mt-8 text-center text-caption text-white/30">
             By continuing you agree to our Terms of Service and Privacy Policy.

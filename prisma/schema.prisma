@@ -41,11 +41,16 @@ model User {
   // MVP install-flow password login (2026-07-27) — nullable: only accounts
   // created via the Installation Wizard's admin-creation step (and anyone
   // who later logs in through the "password" Credentials provider) ever set
-  // this. Phone-OTP and Google accounts leave it null and are unaffected.
+  // this. Google-only accounts leave it null and are unaffected.
   // Stored as "saltHex:hashHex" (scrypt) — see lib/security/password.ts.
   passwordHash String?
 
-  // FR-AU-010 — Indian mobile number, +91 implied, stored in E.164 (+91XXXXXXXXXX).
+  // Phone-OTP login removed (2026-08-06) — these two fields are kept as
+  // plain, non-auth profile data (E.164 format, +91XXXXXXXXXX): admin
+  // credit-grant targeting and several admin dashboards' display-fallback
+  // labels still read `phone` (see lib/admin/credit-grants.ts and others).
+  // Nothing writes phoneVerified anymore; it's inert history for accounts
+  // created before this removal.
   phone         String?   @unique
   phoneVerified DateTime?
 
@@ -223,27 +228,6 @@ model CreditAccount {
   updatedAt DateTime @updatedAt
 
   @@map("credit_accounts")
-}
-
-// PRD Section 16.1 (auth.otp_requests) / FR-AU-010–016 — phone OTP login.
-model OtpRequest {
-  id        String  @id @default(cuid())
-  phone     String
-  otpHash   String
-  // Captured for the per-IP rate limit in /api/auth/otp/send — without it,
-  // the per-phone limit alone doesn't stop one IP from rotating through many
-  // numbers.
-  ipAddress String?
-
-  attempts   Int       @default(0)
-  consumedAt DateTime?
-  expiresAt  DateTime
-
-  createdAt DateTime @default(now())
-
-  @@index([phone, createdAt])
-  @@index([ipAddress, createdAt])
-  @@map("otp_requests")
 }
 
 // ============================================================================
@@ -2273,9 +2257,9 @@ model ProviderAuditLog {
 // ============================================================================
 
 // DB-backed fallback for lib/security/rate-limit.ts when REDIS_URL isn't
-// configured — same shape and same "insert then count the window" approach
-// OtpRequest's per-phone/per-IP limiting already used, generalized to an
-// arbitrary `key` (e.g. "video_create:{userId}") instead of being phone-specific.
+// configured — "insert then count the window" approach, generalized to an
+// arbitrary `key` (e.g. "video_create:{userId}") rather than being specific
+// to any one feature.
 model RateLimitHit {
   id        String   @id @default(cuid())
   key       String

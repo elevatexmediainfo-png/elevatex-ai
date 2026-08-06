@@ -4,10 +4,11 @@ import { getConfig } from "@/lib/admin/config";
 
 // Milestone 13 — read-only "is this installation production-ready"
 // checklist (brief item 9, Installation Independence). Every signal here is
-// already-existing state (ProviderConfig rows, CONFIG_REGISTRY values, the
-// MSG91 env var the OTP route already gates on) — this adds zero new
-// settings of its own, it just summarizes what's already configurable
-// from the Admin Panel so a founder doesn't have to check 8 pages by hand.
+// already-existing state (ProviderConfig rows, CONFIG_REGISTRY values) —
+// this adds zero new settings of its own, it just summarizes what's
+// already configurable from the Admin Panel so a founder doesn't have to
+// check 8 pages by hand. (2026-08-06 — the OTP-login checklist item was
+// removed here along with phone-OTP authentication itself.)
 
 export type InstallationItemStatus = "OK" | "WARNING" | "ACTION_NEEDED";
 
@@ -84,19 +85,6 @@ export async function getInstallationChecklist(): Promise<InstallationChecklist>
       });
     }
   }
-
-  const otpConfigured = !!process.env.MSG91_AUTH_KEY;
-  const isProduction = process.env.NODE_ENV === "production";
-  items.push({
-    key: "otp_login",
-    label: "OTP login (MSG91)",
-    status: otpConfigured ? "OK" : isProduction ? "ACTION_NEEDED" : "WARNING",
-    detail: otpConfigured
-      ? "MSG91_AUTH_KEY is set — real OTPs will be sent."
-      : isProduction
-        ? "MSG91_AUTH_KEY is missing in production — OTP login will not work."
-        : "MSG91_AUTH_KEY is not set. Fine for local development (dev OTP fallback is active); set it before deploying to production.",
-  });
 
   const taxDetails = await getConfig("BUSINESS_TAX_DETAILS");
   items.push({

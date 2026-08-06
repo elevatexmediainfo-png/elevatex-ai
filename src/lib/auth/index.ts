@@ -2,121 +2,37 @@ import NextAuth from "next-auth";
 import Google from "next-auth/providers/google";
 import Credentials from "next-auth/providers/credentials";
 import { PrismaAdapter } from "@auth/prisma-adapter";
-import crypto from "crypto";
 
 import { prisma } from "@/lib/prisma";
 import { authConfig } from "./config";
-import { verifyOtpSchema, sendOtpSchema, toE164Phone, passwordLoginSchema } from "@/lib/validations/auth";
+import { passwordLoginSchema, emailSchema } from "@/lib/validations/auth";
 import { verifyPassword } from "@/lib/security/password";
 import { grantCredits } from "@/lib/credits/engine";
 import { getConfig } from "@/lib/admin/config";
 
-const MAX_OTP_ATTEMPTS = 3; // FR-AU-015
-
-// Same gate api/auth/otp/send/route.ts already uses for its devOtp fallback —
-// reused here, not reinvented, so both "dev mode" concepts can never disagree
-// about whether they're active. Real OTP rate limiting (lib/security/rate-
-// limit.ts, 3/hour per phone) makes repeated local admin-panel testing
-// impractical once that limit is hit — this provider exists purely to
-// unblock that loop. It is excluded from the `providers` array entirely
-// (not just refused at runtime) whenever this evaluates false, and
-// `authorize()` below re-checks it independently as a second guard.
-export const DEV_LOGIN_BYPASS_ENABLED =
-  process.env.NODE_ENV !== "production" && !process.env.MSG91_AUTH_KEY;
+// OTP/phone authentication removed entirely (2026-08-06) — this codebase
+// used to support phone-OTP (Credentials provider "otp", MSG91/Twilio SMS)
+// alongside Google and email+password. Only Google and email+password
+// remain now. See PROJECT_STATUS.md for the removal note.
+//
+// Dev-only admin login bypass — re-keyed from phone to email (2026-08-06,
+// same removal) so it has no dependency on the now-deleted OTP/SMS stack.
+// Unblocks local Admin Panel testing without a password. Excluded from the
+// `providers` array entirely in production (not just refused at runtime),
+// and `authorize()` below re-checks it independently as a second guard.
+export const DEV_LOGIN_BYPASS_ENABLED = process.env.NODE_ENV !== "production";
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
   ...authConfig,
   adapter: PrismaAdapter(prisma) as ReturnType<typeof PrismaAdapter>,
   // Separate accounts unless a user explicitly links them — avoids silently
-  // merging a Google sign-in into an existing OTP account on email match.
+  // merging a Google sign-in into an existing email+password account on
+  // email match.
   providers: [
     Google({
       clientId: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
       allowDangerousEmailAccountLinking: false,
-    }),
-    Credentials({
-      id: "otp",
-      name: "Phone OTP",
-      credentials: {
-        phone: { label: "Phone", type: "text" },
-        otp: { label: "OTP", type: "text" },
-      },
-      async authorize(raw) {
-        const parsed = verifyOtpSchema.safeParse(raw);
-        if (!parsed.success) return null;
-
-        const { phone: localPhone, otp } = parsed.data;
-        const phone = localPhone.startsWith("+91") ? localPhone : `+91${localPhone}`;
-
-        const record = await prisma.otpRequest.findFirst({
-          where: { phone, consumedAt: null },
-          orderBy: { createdAt: "desc" },
-        });
-        if (!record) return null;
-        if (record.expiresAt < new Date()) return null;
-        if (record.attempts >= MAX_OTP_ATTEMPTS) return null;
-
-        const otpHash = crypto.createHash("sha256").update(otp).digest("hex");
-        if (otpHash !== record.otpHash) {
-          await prisma.otpRequest.update({
-            where: { id: record.id },
-            data: { attempts: { increment: 1 } },
-          });
-          return null;
-        }
-
-        await prisma.otpRequest.update({
-          where: { id: record.id },
-          data: { consumedAt: new Date() },
-        });
-
-        const existing = await prisma.user.findUnique({
-          where: { phone },
-          include: { profile: true },
-        });
-
-        if (existing) {
-          return {
-            id: existing.id,
-            name: existing.name,
-            email: existing.email,
-            phone: existing.phone,
-            onboardingCompleted: !!existing.profile?.onboardingCompletedAt,
-            role: existing.role,
-          };
-        }
-
-        const created = await prisma.user.create({
-          data: {
-            phone,
-            phoneVerified: new Date(),
-            profile: { create: {} },
-          },
-          include: { profile: true },
-        });
-
-        // Routed through the engine (not a bare CreditAccount.create) so the
-        // signup bonus is auditable — see lib/credits/engine.ts. Amount is
-        // admin-configurable (SIGNUP_BONUS_CREDITS), not hardcoded.
-        const signupBonus = await getConfig("SIGNUP_BONUS_CREDITS");
-        await grantCredits({
-          userId: created.id,
-          lotType: "SIGNUP_BONUS",
-          transactionType: "SIGNUP_BONUS",
-          amount: signupBonus,
-          description: `Welcome bonus — ${signupBonus} free credit(s)`,
-        });
-
-        return {
-          id: created.id,
-          name: created.name,
-          email: created.email,
-          phone: created.phone,
-          onboardingCompleted: false,
-          role: created.role,
-        };
-      },
     }),
     // MVP install-flow password login (2026-07-27) — the Installation
     // Wizard's Super Admin step creates the account directly (email +
@@ -124,8 +40,8 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
     // POST /api/install/create-admin, then signs in through this provider.
     // Also reachable from the main /login page for any account this
     // creates, so a password-based admin always has a durable way back in —
-    // unrelated accounts (phone-OTP, Google) have no passwordHash and can
-    // never authenticate through here.
+    // an unrelated Google-only account has no passwordHash and can never
+    // authenticate through here.
     Credentials({
       id: "password",
       name: "Email & Password",
@@ -158,28 +74,28 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       },
     }),
     // Dev-only admin login bypass (see DEV_LOGIN_BYPASS_ENABLED above).
-    // Skips OTP/rate-limit entirely — phone lookup only, and only for
-    // accounts that are already ADMIN. Never registered in production.
+    // Re-keyed from phone to email (2026-08-06, OTP removal) — email
+    // lookup only, and only for accounts that are already ADMIN. Never
+    // registered in production.
     ...(DEV_LOGIN_BYPASS_ENABLED
       ? [
           Credentials({
             id: "dev-bypass",
             name: "Dev Admin Bypass",
-            credentials: { phone: { label: "Phone", type: "text" } },
+            credentials: { email: { label: "Email", type: "email" } },
             async authorize(raw) {
               // Re-checked at call time, not just at provider-registration
               // time, in case a long-lived dev process's env changed
               // without a restart.
-              if (process.env.NODE_ENV === "production" || process.env.MSG91_AUTH_KEY) {
+              if (process.env.NODE_ENV === "production") {
                 return null;
               }
 
-              const parsed = sendOtpSchema.safeParse(raw);
+              const parsed = emailSchema.safeParse(raw?.email);
               if (!parsed.success) return null;
-              const phone = toE164Phone(parsed.data.phone);
 
               const user = await prisma.user.findUnique({
-                where: { phone },
+                where: { email: parsed.data },
                 include: { profile: true },
               });
               // Admin-only by design — this is an "admin login bypass" for
@@ -235,8 +151,8 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   },
   events: {
     // Fires exactly once when the adapter creates a new user — only the
-    // Google OAuth path goes through the adapter; the OTP path creates its
-    // own Profile/CreditAccount directly in authorize() above.
+    // Google OAuth path goes through the adapter; the Credentials providers
+    // above only ever look up an existing user, never create one.
     async createUser({ user }) {
       if (!user.id) return;
       await prisma.profile.upsert({

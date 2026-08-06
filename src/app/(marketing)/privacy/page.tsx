@@ -20,7 +20,7 @@ export default function PrivacyPage() {
         <h2>Information we collect</h2>
         <ul>
           <li>
-            <strong>Account information:</strong> name, phone number (used for OTP login), email address, and
+            <strong>Account information:</strong> name, email address (used for sign-in and password login), and
             business profile details you provide during onboarding (business name, city, vertical).
           </li>
           <li>
@@ -102,7 +102,7 @@ export default function PrivacyPage() {
         <p>
           We use industry-standard measures including encrypted credential storage, rate limiting, audit logging,
           and access controls to protect your data. No system is perfectly secure, and we encourage you to keep your
-          registered phone number and login OTPs private.
+          account password private and use a strong, unique password.
         </p>
       </div>
 

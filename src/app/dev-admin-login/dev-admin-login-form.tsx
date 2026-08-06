@@ -9,10 +9,12 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Container } from "@/components/shared/container";
 
+// Re-keyed from phone to email (2026-08-06, OTP removal) — see the
+// "dev-bypass" provider's own comment in lib/auth/index.ts.
 export function DevAdminLoginForm() {
   const router = useRouter();
 
-  const [phone, setPhone] = React.useState("");
+  const [email, setEmail] = React.useState("");
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -20,9 +22,9 @@ export function DevAdminLoginForm() {
     setError(null);
     setLoading(true);
     try {
-      const res = await signIn("dev-bypass", { phone, redirect: false });
+      const res = await signIn("dev-bypass", { email, redirect: false });
       if (res?.error) {
-        setError("No ADMIN account found for that number.");
+        setError("No ADMIN account found for that email.");
         return;
       }
       router.push("/admin");
@@ -40,8 +42,8 @@ export function DevAdminLoginForm() {
         <div className="w-full max-w-[420px] rounded-2xl bg-white p-6 shadow-lg sm:p-10">
           <h1 className="text-heading-1 text-neutral-900">Dev admin bypass</h1>
           <p className="mt-2 text-body-md text-neutral-500">
-            Local-only. Signs in an existing ADMIN account without OTP, bypassing the OTP
-            rate limit. Not linked from any page — never available in production.
+            Local-only. Signs in an existing ADMIN account by email, without a password.
+            Not linked from any page — never available in production.
           </p>
 
           {error && (
@@ -52,30 +54,24 @@ export function DevAdminLoginForm() {
 
           <div className="mt-6 flex flex-col gap-4">
             <div>
-              <label htmlFor="phone" className="mb-1.5 block text-label-md text-neutral-700">
-                Admin&apos;s mobile number
+              <label htmlFor="email" className="mb-1.5 block text-label-md text-neutral-700">
+                Admin&apos;s email
               </label>
-              <div className="flex items-center gap-2">
-                <span className="flex h-11 items-center rounded-md border border-neutral-300 px-3 text-body-md text-neutral-500">
-                  +91
-                </span>
-                <Input
-                  id="phone"
-                  inputMode="numeric"
-                  maxLength={10}
-                  placeholder="98765 43210"
-                  value={phone}
-                  onChange={(e) => setPhone(e.target.value.replace(/\D/g, "").slice(0, 10))}
-                  className="h-11 text-body-md"
-                />
-              </div>
+              <Input
+                id="email"
+                type="email"
+                placeholder="admin@company.com"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="h-11 text-body-md"
+              />
             </div>
             <Button
               type="button"
               variant="primary"
               size="lg"
               className="w-full"
-              disabled={phone.length !== 10 || loading}
+              disabled={!email || loading}
               onClick={devBypassLogin}
             >
               {loading && <Loader2 className="size-4 animate-spin" />}

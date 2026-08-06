@@ -26,8 +26,8 @@ export default function TermsPage() {
       <div className="flex flex-col gap-3">
         <h2>Accounts</h2>
         <p>
-          You sign in with a phone number and a one-time password (OTP). You&rsquo;re responsible for keeping access
-          to your registered phone number secure, and for all activity under your account.
+          You sign in with your Google account or an email and password. You&rsquo;re responsible for keeping access
+          to your account credentials secure, and for all activity under your account.
         </p>
       </div>
 

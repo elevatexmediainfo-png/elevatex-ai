@@ -11,7 +11,7 @@ A plan for a small (10–25 user) closed beta before public launch, building on 
 ## Recruitment
 
 - 10–25 users from the actual target segment (small business owners making marketing videos) — not internal team members who already know the product's shape.
-- Mix of phone-OTP signups (the only supported auth path) across at least 2 real carriers to catch SMS-deliverability issues `MSG91_AUTH_KEY` config alone won't surface.
+- Mix of Google sign-ins and email+password signups (the two supported auth paths).
 
 ## What to instrument before starting
 
