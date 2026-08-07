@@ -222,11 +222,24 @@ export function detectSilenceGapsAdaptive(words: TimedWord[], options: AdaptiveS
 // transcript's word timings, same "derived function, not a second provider
 // call" shape as detectSilenceGaps above. Two kinds:
 //  - "filler_word": a word that IS a filler ("um", "uh", "erm", "hmm" and
-//    their stretched spellings — "ummm", "uhhh").
+//    their stretched spellings — "ummm", "uhhh"; also elongated vowel
+//    fillers "aaa"/"ah"/"aah", added 2026-08-07 — see FILLER_WORD_RE's own
+//    doc comment for why a bare single "a" is deliberately excluded).
 //  - "repeated_word": the same word said twice in a row (a stumble/restart
 //    — "the the meeting", "and, and now") — the FIRST occurrence is the
 //    one flagged for removal, the second is the one that was actually
-//    meant.
+//    meant. This is also this module's answer to "false starts": a false
+//    start that repeats the SAME word before continuing differently ("I
+//    was— I was going to say...") is caught here; one that abandons a
+//    word entirely mid-sentence with no repetition ("I was go— actually,
+//    I went") has no reliable text-only signal to detect without real
+//    semantic understanding, and is deliberately NOT guessed at — a wrong
+//    guess here risks cutting real, meaningful words, which is a worse
+//    outcome than leaving a rare false start in. "Long breaths" are NOT a
+//    word-level pattern at all (ASR transcripts don't transcribe
+//    breathing) — they surface as a plain GAP between words instead,
+//    already handled by detectSilenceGapsAdaptive above, not by this
+//    function.
 // Both map onto AISceneRemovalReason's single "filler_word" value at the
 // scene-removal-proposer layer (lib/video-editor/ai-scene-removal-proposer.ts)
 // — this function keeps them distinguishable for testing/debugging, the
@@ -240,7 +253,12 @@ export interface DisfluencyMatch {
   word: string;
 }
 
-const FILLER_WORD_RE = /^(u+m+|u+h+|e+r+m*|h+m+)$/i;
+// `a{2,}` (2+ repeated a's, e.g. "aaa"/"aaaa") and `a+h+` (any a's followed
+// by at least one h, e.g. "ah"/"aah"/"aaah") both match the elongated
+// vowel-filler sound — deliberately NOT a bare single "a" alone, which is
+// the real English indefinite article ("a dog," "a moment") and must
+// never be treated as a disfluency.
+const FILLER_WORD_RE = /^(u+m+|u+h+|e+r+m*|h+m+|a{2,}|a+h+)$/i;
 
 function normalizeWord(raw: string): string {
   return raw.trim().replace(/^[.,!?…"'()[\]]+|[.,!?…"'()[\]]+$/g, "").toLowerCase();

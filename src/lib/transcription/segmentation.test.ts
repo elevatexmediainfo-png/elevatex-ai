@@ -213,6 +213,24 @@ describe("detectFillerWords", () => {
     expect(detectFillerWords(words)).toEqual([]);
   });
 
+  // Fix (2026-08-07, TASK 7 — "remove aaa") — elongated vowel filler.
+  it("detects elongated vowel fillers (aaa, ah, aah)", () => {
+    const words = [
+      { word: "aaa", startMs: 0, endMs: 200 },
+      { word: "ah", startMs: 300, endMs: 500 },
+      { word: "aah", startMs: 600, endMs: 800 },
+    ];
+    expect(detectFillerWords(words).map((m) => m.kind)).toEqual(["filler_word", "filler_word", "filler_word"]);
+  });
+
+  it("does NOT flag the bare indefinite article 'a' as a filler", () => {
+    const words = [
+      { word: "a", startMs: 0, endMs: 100 },
+      { word: "dog", startMs: 100, endMs: 300 },
+    ];
+    expect(detectFillerWords(words)).toEqual([]);
+  });
+
   it("detects a repeated-word stumble, flagging the FIRST occurrence", () => {
     const words = [
       { word: "the", startMs: 0, endMs: 100 },

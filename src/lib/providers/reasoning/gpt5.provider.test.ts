@@ -1,7 +1,41 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { GPT5ReasoningProvider, resolveCaptionTiming } from "./gpt5.provider";
+import { computeBrollTargetRange, GPT5ReasoningProvider, resolveCaptionTiming } from "./gpt5.provider";
 import type { ReasoningPlanRequest, ReasoningReeditRequest } from "./types";
+
+// TASK 1 (2026-08-07 — "heavy density should visually change the video
+// every few seconds").
+describe("computeBrollTargetRange", () => {
+  it("scales HEAVY (6-12/min) proportionally for a 60s video", () => {
+    expect(computeBrollTargetRange(60_000, "HEAVY")).toEqual({ min: 6, max: 12 });
+  });
+
+  it("scales HEAVY proportionally for a 30s video, not the full per-minute rate", () => {
+    expect(computeBrollTargetRange(30_000, "HEAVY")).toEqual({ min: 3, max: 6 });
+  });
+
+  it("scales MEDIUM (BALANCED, 3-6/min) proportionally for a 60s video", () => {
+    expect(computeBrollTargetRange(60_000, "BALANCED")).toEqual({ min: 3, max: 6 });
+  });
+
+  it("scales LIGHT (MINIMAL, 1-3/min) proportionally for a 60s video", () => {
+    expect(computeBrollTargetRange(60_000, "MINIMAL")).toEqual({ min: 1, max: 3 });
+  });
+
+  it("never returns a range below 1-1, even for a very short video", () => {
+    const { min, max } = computeBrollTargetRange(5_000, "MINIMAL");
+    expect(min).toBeGreaterThanOrEqual(1);
+    expect(max).toBeGreaterThanOrEqual(min);
+  });
+
+  it("defaults to the MEDIUM/BALANCED rate when density is undefined", () => {
+    expect(computeBrollTargetRange(60_000, undefined)).toEqual({ min: 3, max: 6 });
+  });
+
+  it("scales up for a longer, multi-minute video", () => {
+    expect(computeBrollTargetRange(180_000, "HEAVY")).toEqual({ min: 18, max: 36 });
+  });
+});
 
 function chatResponse(content: string, ok = true) {
   return {
@@ -397,6 +431,82 @@ describe("GPT5ReasoningProvider.plan", () => {
     expect(userMessage).toContain("a stock library almost never carries real licensed footage of a named brand");
   });
 
+  // TASKS 1/2/3/4/5/6/8/9/10 (2026-08-07 — "upgrade the entire AI Auto-Edit
+  // pipeline").
+  it("instructs viral hook-style captions, Roman-script Hinglish default, power words, and CTA generation", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.plan(BASE_REQUEST);
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const userMessage = body.messages.find((m: { role: string }) => m.role === "user").content as string;
+    expect(userMessage).toContain("viral, hook-style captions");
+    expect(userMessage).toContain("WARNING, STOP, SAVE, SECRET, PRO TIP, DON'T, BIGGEST, WHY, HOW, TOP 3, IMPORTANT, NEVER");
+    expect(userMessage).toContain("Roman-script Hinglish");
+    expect(userMessage).toContain("NEVER Devanagari script");
+    expect(userMessage).toContain("Follow For More");
+    expect(userMessage).toContain("highlightWords");
+    expect(userMessage).toContain("#FF3B30");
+  });
+
+  it("instructs zoom triggers based on questions/numbers/emphasis with anti-repetition guidance", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.plan(BASE_REQUEST);
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const userMessage = body.messages.find((m: { role: string }) => m.role === "user").content as string;
+    expect(userMessage).toContain("A question being asked");
+    expect(userMessage).toContain("A specific number, statistic, or list item");
+    expect(userMessage).toContain("AVOID REPETITIVE RHYTHM");
+  });
+
+  it("instructs topic-based stickers, music category detection, and event-based sfx", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.plan(BASE_REQUEST);
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const userMessage = body.messages.find((m: { role: string }) => m.role === "user").content as string;
+    expect(userMessage).toContain("based on the TOPIC actually being discussed, not random decorative emoji");
+    expect(userMessage).toContain("business, corporate, finance, motivational, healthcare, calm, podcast, minimal, comedy, fun, travel, or cinematic");
+    expect(userMessage).toContain("NEVER SPAM");
+  });
+
+  it("instructs b-roll query expansion (searchQueries) and topic-change-driven placement", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.plan(BASE_REQUEST);
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const userMessage = body.messages.find((m: { role: string }) => m.role === "user").content as string;
+    expect(userMessage).toContain("searchQueries");
+    expect(userMessage).toContain("a topic change");
+    expect(userMessage).toContain("hospital");
+    expect(userMessage).toContain("blood test");
+  });
+
+  it("includes the story-rhythm pacing preamble", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.plan(BASE_REQUEST);
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const userMessage = body.messages.find((m: { role: string }) => m.role === "user").content as string;
+    expect(userMessage).toContain("STORY RHYTHM");
+    expect(userMessage).toContain("HOOK (first 1-3 seconds");
+  });
+
   it("strengthens the b-roll stock-vs-generate bias in TASK 3's prompt (real cost, generate as last resort)", async () => {
     const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
     vi.stubGlobal("fetch", fetchMock);
@@ -628,6 +738,13 @@ describe("resolveCaptionTiming (pure)", () => {
   it("resolves a single-word caption to that word's own span, with proper terminal punctuation added (FIX 5)", () => {
     const result = resolveCaptionTiming([{ text: "a", sourceWordStartIndex: 0, sourceWordEndIndex: 0 }], words);
     expect(result).toEqual([{ text: "a.", startMs: 0, endMs: 100, style: undefined, reveal: undefined }]);
+  });
+
+  // TASK 3 (2026-08-07, AI Auto-Edit power-word highlighting).
+  it("carries highlightWords through unchanged to the resolved caption", () => {
+    const highlightWords = [{ word: "b", color: "#FFD60A" }];
+    const result = resolveCaptionTiming([{ text: "a b c", sourceWordStartIndex: 0, sourceWordEndIndex: 2, highlightWords }], words);
+    expect(result[0].highlightWords).toEqual(highlightWords);
   });
 
   it("returns an empty array when there are no real transcript words to anchor to", () => {

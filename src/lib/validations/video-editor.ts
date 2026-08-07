@@ -165,13 +165,17 @@ function keyframeableSchema<T extends z.ZodTypeAny>(valueSchema: T) {
 
 // Module 7 — one bold/italic/underline run over a [start, end) character
 // range of `content.text`. Mirrors lib/video-editor/text-style.ts's
-// RichTextRun.
+// RichTextRun. `color` (2026-08-07, AI Auto-Edit power-word highlighting)
+// is an explicit literal color override for this run — see that file's
+// own doc comment for why this is distinct from the Highlight Engine's
+// theme-driven color mixing.
 const richTextRunSchema = z.object({
   start: z.number().int().min(0),
   end: z.number().int().min(0),
   bold: z.boolean().optional(),
   italic: z.boolean().optional(),
   underline: z.boolean().optional(),
+  color: z.string().min(1).max(20).optional(),
 });
 
 // Module 7 — word/character/karaoke reveal config. Mirrors
@@ -229,8 +233,18 @@ export const editorClipContentSchema = z
     fadeOutMs: z.number().int().min(0).max(60_000),
     pitchSemitones: z.number().min(-12).max(12),
     speed: z.number().min(0.25).max(4),
+    // Theme selection persistence (2026-07-28) — see ClipContent's matching
+    // fields in app/editor/types.ts for the full reasoning. Storage only;
+    // nothing reads these to change rendering yet.
+    themeId: z.string().min(1).max(60),
+    themeVersion: z.number().int().positive(),
+    brandStyleId: z.string().min(1).max(60),
   })
-  .partial();
+  .partial()
+  .refine((data) => (data.themeId === undefined) === (data.themeVersion === undefined), {
+    message: "themeVersion is required whenever themeId is set, and vice versa — a theme reference must always be pinned to an exact version.",
+    path: ["themeVersion"],
+  });
 
 // Module 4 — universal per-clip transform. Mirrors the hand-written
 // ClipTransform type in lib/video-editor/transform.ts (same

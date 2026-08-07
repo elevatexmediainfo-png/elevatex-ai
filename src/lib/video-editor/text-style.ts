@@ -14,6 +14,14 @@
 //    between two user-placed keyframes. Different shape, different math,
 //    kept as its own small function (resolveRevealUnits below) rather than
 //    forced into the Motion Engine's keyframe model.
+//
+// Subtitle Compiler migration (2026-07-28) — this file now only exposes
+// primitives (tokenize/resolveRevealUnits/richFormattingAt); the actual
+// per-unit render decisions this module used to also own
+// (resolveTextRenderUnits, deleted) now live in the Legacy Adapter
+// (lib/video-editor/subtitles/legacy-adapter.ts), which routes them through
+// the same Style/Highlight/Animation Engines every AI-generated caption
+// uses. This is the ONLY subtitle decision system left in the repository.
 
 export interface RichTextRun {
   // Character offsets into the clip's plain-text `content.text`, half-open
@@ -24,6 +32,17 @@ export interface RichTextRun {
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
+  // AI Auto-Edit power-word highlighting (2026-08-07) — an explicit literal
+  // color for this run, distinct from the Highlight Engine's theme-driven
+  // CURRENT_WORD/KEYWORD color mixing (subtitles/style-engine.ts): this is
+  // a direct override an AI caption (or a manual user) can set per word/
+  // phrase, e.g. "DON'T" red + "IGNORE" yellow + the rest white, all
+  // simultaneously visible — the Highlight Engine's own single
+  // highlightColor can't express two different colors on screen at once.
+  // Threaded through richFormattingAt -> legacy-adapter.ts's buildLegacyWords
+  // -> style-engine.ts's buildRenderWords, which uses it as a hard override
+  // ahead of any highlight-driven color when present.
+  color?: string;
 }
 
 export interface RichTextSegment {
@@ -70,12 +89,19 @@ export function splitRichTextSegments(text: string, runs: RichTextRun[] | undefi
 // bold/italic/underline: rich runs and reveal units partition the same
 // string differently, so this checks whether ANY run overlaps the unit's
 // char range rather than requiring an exact boundary match.
-export function richFormattingAt(runs: RichTextRun[] | undefined, charStart: number, charEnd: number): { bold: boolean; italic: boolean; underline: boolean } {
+export function richFormattingAt(runs: RichTextRun[] | undefined, charStart: number, charEnd: number): { bold: boolean; italic: boolean; underline: boolean; color?: string } {
   const overlapping = (runs ?? []).filter((r) => r.start < charEnd && r.end > charStart);
+  // First run with an explicit color wins — a reveal unit is never covered
+  // by two DIFFERENT color runs in practice (power-word runs are built
+  // from non-overlapping word matches, see ai-timeline-translator.ts's
+  // resolveCaptionHighlightRuns), so "first" is just a deterministic
+  // tie-break, not a real design decision.
+  const colored = overlapping.find((r) => r.color);
   return {
     bold: overlapping.some((r) => r.bold),
     italic: overlapping.some((r) => r.italic),
     underline: overlapping.some((r) => r.underline),
+    color: colored?.color,
   };
 }
 
@@ -120,11 +146,20 @@ export interface RevealUnit {
   isCurrent: boolean;
 }
 
+export interface TextToken {
+  text: string;
+  isWhitespace: boolean;
+  charStart: number;
+  charEnd: number;
+}
+
 // CHARACTER mode splits every character (including spaces) into its own
 // unit; WORD/KARAOKE split on whitespace runs, keeping the whitespace
 // itself as separate always-visible units so multi-word spacing survives
-// unchanged in the rendered output.
-function tokenize(text: string, mode: RevealMode): { text: string; isWhitespace: boolean; charStart: number; charEnd: number }[] {
+// unchanged in the rendered output. Exported for the Legacy Subtitle
+// Adapter (lib/video-editor/subtitles/legacy-adapter.ts), which reuses this
+// exact tokenization rather than re-deriving its own.
+export function tokenize(text: string, mode: RevealMode): TextToken[] {
   if (mode === "CHARACTER") {
     return [...text].map((c, i) => ({ text: c, isWhitespace: /\s/.test(c), charStart: i, charEnd: i + 1 }));
   }

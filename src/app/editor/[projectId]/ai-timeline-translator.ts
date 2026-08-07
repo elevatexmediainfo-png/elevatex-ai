@@ -37,7 +37,7 @@ import {
 import type { AddClipPatch } from "./queries";
 import type { ClipContent, ClipView, TrackView } from "../types";
 import { DEFAULT_CLIP_TRANSFORM, DEFAULT_KEYFRAME_EASING, type ClipTransform } from "@/lib/video-editor/transform";
-import { DEFAULT_REVEAL_CONFIG } from "@/lib/video-editor/text-style";
+import { DEFAULT_REVEAL_CONFIG, type RichTextRun } from "@/lib/video-editor/text-style";
 import {
   AI_TRANSITION_SEGMENT_PLACEHOLDER_PREFIX,
   type AIBroll,
@@ -412,6 +412,33 @@ function translateSceneRemoval(
   return { commands, consumedZoomClipIds, consumedTransitionIndices, removalTarget };
 }
 
+// Fix (2026-08-07) — turns the AI's word-level highlightWords proposal
+// (aiCaptionHighlightWordSchema — "word": "DON'T", "color": "#FF3B30")
+// into real character-offset RichTextRuns against THIS caption's own
+// text. The AI names semantics (which word, what color); this is the
+// deterministic mechanics layer that finds exactly where that word sits
+// — same "AI proposes, app computes the precise part" split as
+// sourceWordStartIndex/sourceWordEndIndex already established for
+// caption timing one layer up (resolveCaptionTiming, gpt5.provider.ts).
+// Case-insensitive, first occurrence only (a word named twice in one
+// short caption is rare, and highlighting only the first instance is a
+// reasonable, deterministic choice rather than highlighting every
+// occurrence indiscriminately). A highlight word that doesn't actually
+// appear in this caption's text (can happen when an oversized caption
+// was split into multiple chunks — see resolveCaptionTiming's own doc
+// comment) simply produces no run for this chunk — never an error.
+function resolveCaptionHighlightRuns(text: string, highlightWords: AICaption["highlightWords"]): RichTextRun[] {
+  if (!highlightWords || highlightWords.length === 0) return [];
+  const lowerText = text.toLowerCase();
+  const runs: RichTextRun[] = [];
+  for (const { word, color } of highlightWords) {
+    const idx = lowerText.indexOf(word.toLowerCase());
+    if (idx === -1) continue;
+    runs.push({ start: idx, end: idx + word.length, color });
+  }
+  return runs;
+}
+
 // Pure — computes the clip inputs a set of AI captions would produce,
 // with no track-resolution decision baked in. Extracted (2026-07-19) so
 // the "both SUBTITLE and OVERLAY need fresh creation" coordination case
@@ -421,6 +448,7 @@ function translateSceneRemoval(
 function buildCaptionClipInputs(items: AICaption[]): Omit<AddClipPatch, "trackId">[] {
   return items.map((caption) => {
     const reveal = caption.reveal ?? { ...DEFAULT_REVEAL_CONFIG, mode: "WORD" as const };
+    const richRuns = resolveCaptionHighlightRuns(caption.text, caption.highlightWords);
     const content: ClipContent = {
       text: caption.text,
       fontFamily: caption.style?.fontFamily,
@@ -429,6 +457,7 @@ function buildCaptionClipInputs(items: AICaption[]): Omit<AddClipPatch, "trackId
       color: caption.style?.color,
       y: resolveCaptionY(caption.style?.position),
       reveal,
+      ...(richRuns.length > 0 ? { richRuns } : {}),
     };
     return {
       startMs: caption.startMs,

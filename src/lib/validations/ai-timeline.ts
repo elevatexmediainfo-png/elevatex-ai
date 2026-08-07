@@ -106,6 +106,21 @@ export const aiCaptionStyleSchema = z.object({
   position: z.enum(["top", "center", "bottom"]).optional(),
 });
 
+// Power-word highlighting (2026-08-07) — the AI names WHICH word(s) in this
+// caption's own `text` deserve a distinct color and what color, rather than
+// producing character offsets itself (error-prone for a model to get
+// exactly right character-for-character). ai-timeline-translator.ts
+// resolves each `word` to its real character range within `text` (case-
+// insensitive, first occurrence) and builds a real RichTextRun from it —
+// the AI never touches offsets directly, same "AI proposes semantics, app
+// computes the precise mechanics" convention captions' own
+// sourceWordStartIndex/sourceWordEndIndex already established one layer up.
+export const aiCaptionHighlightWordSchema = z.object({
+  word: z.string().min(1).max(30),
+  color: z.string().min(1).max(20),
+});
+export type AICaptionHighlightWord = z.infer<typeof aiCaptionHighlightWordSchema>;
+
 export const aiCaptionSchema = z
   .object({
     text: z.string().min(1),
@@ -117,6 +132,9 @@ export const aiCaptionSchema = z
     // Auto-Editor default) when omitted, not a hard requirement on every
     // caption item.
     reveal: aiCaptionRevealSchema.optional(),
+    // Power-word highlighting — capped at a small number so a caption
+    // never becomes a wall of competing colors; most captions have zero.
+    highlightWords: z.array(aiCaptionHighlightWordSchema).max(4).optional(),
   })
   .refine(isValidRange, RANGE_ERROR);
 export type AICaption = z.infer<typeof aiCaptionSchema>;
@@ -166,6 +184,20 @@ export const aiBrollSchema = z
     trackHint: z.string().min(1),
     source: z.enum(AI_BROLL_SOURCES),
     searchQuery: z.string().min(1).optional(),
+    // Query expansion (2026-08-07) — semantic/synonym/category-expanded
+    // variants of `searchQuery` (e.g. "doctor" -> ["doctor consultation",
+    // "hospital", "patient", "clinic", "stethoscope"]), tried IN ORDER by
+    // the resolver (ai-broll-resolver.ts's resolveStockBroll) before it
+    // falls back to its own token-dropping broadening — a semantically
+    // related query ("hospital") finds real, relevant stock footage far
+    // more often than a purely narrower/broader phrasing of the SAME
+    // literal words ever could. `searchQuery` stays the PRIMARY query
+    // (first tried, and what relevance is always scored against — see
+    // buildBroadenedQueries' own doc comment for why scoring stays
+    // anchored to one fixed query even as the search text varies);
+    // `searchQueries` is additive, optional, and empty/absent means
+    // "behave exactly as before this field existed."
+    searchQueries: z.array(z.string().min(1)).max(8).optional(),
     generation: z
       .object({
         kind: z.enum(AI_GENERATION_KINDS),
@@ -317,6 +349,20 @@ export const aiCostSummarySchema = z.object({
 });
 export type AICostSummary = z.infer<typeof aiCostSummarySchema>;
 
+// TASK 12 (2026-08-07) — same "no separate DB column, persisted onto the
+// plan's own Json blob" convention as `cost` above. See
+// lib/video-editor/ai-edit-quality-scoring.ts for how these are computed
+// and what each one means. Absent on any plan persisted before this field
+// existed, same "shows 'not available,' never a fabricated retrofit"
+// convention.
+export const aiQualityScoresSchema = z.object({
+  editingScore: z.number().min(0).max(100),
+  captionScore: z.number().min(0).max(100),
+  visualScore: z.number().min(0).max(100),
+  pacingScore: z.number().min(0).max(100),
+});
+export type AIQualityScores = z.infer<typeof aiQualityScoresSchema>;
+
 // ---------------------------------------------------------------------
 // The full plan
 // ---------------------------------------------------------------------
@@ -333,5 +379,6 @@ export const aiTimelinePlanSchema = z.object({
   sfx: z.array(aiSfxSchema).default([]),
   transitions: z.array(aiTransitionSchema).default([]),
   cost: aiCostSummarySchema.optional(),
+  qualityScores: aiQualityScoresSchema.optional(),
 });
 export type AITimelinePlan = z.infer<typeof aiTimelinePlanSchema>;

@@ -18,6 +18,7 @@ import { checkVideoActionAccess, convertUsdToCredits } from "@/lib/credits/video
 import { InvalidStateError } from "./errors";
 import { getOwnedProject } from "./projects";
 import { mergeSceneRemovalCandidates, proposeSceneRemovals } from "./ai-scene-removal-proposer";
+import { scoreAiTimelinePlan, AI_EDIT_QUALITY_RETRY_THRESHOLD } from "./ai-edit-quality-scoring";
 import {
   aiTimelinePlanSchema,
   AI_TIMELINE_SCHEMA_VERSION,
@@ -403,6 +404,17 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     let transitions: AITransitionPlan[] = [];
     let planningError: string | null = null;
     let reasoningCostUsd = 0;
+    // TASK 12 (2026-08-07, "quality scoring") — scored on the PROPOSED
+    // (pre-resolution) plan, immediately after planTimeline() returns,
+    // deliberately BEFORE broll resolution runs: resolution makes real
+    // stock-search/materialize calls, so scoring first and only retrying
+    // planTimeline() itself (never re-resolving broll twice) keeps the
+    // bounded retry cheap. resolvedCount isn't known yet at this point, so
+    // scoreAiTimelinePlan's visualScore uses the PROPOSED broll count as
+    // its own resolution-count proxy here — a reasonable approximation
+    // given stock resolution's real success rate, not the final, more
+    // precise number computed after RESOLVING_ASSETS below.
+    let attemptScores: ReturnType<typeof scoreAiTimelinePlan> | null = null;
     // Founder request (2026-07-30) — module selection. captions/zoom/broll/
     // stickers/music/sfx/transitions all come back from this ONE planTimeline()
     // call — there's no way to ask GPT for a subset, so the call itself only
@@ -410,29 +422,38 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     // of its 7 output sections weren't selected are discarded immediately
     // below, before they ever reach asset resolution or the assembled plan.
     if (TIMELINE_PLANNING_MODULES.some(wantsModule)) {
-      try {
-        const repairMaxAttempts = await getConfig("AI_EDIT_REASONING_REPAIR_MAX_ATTEMPTS");
-        const planResult = await planTimeline(
-          {
-            words: transcript.words,
-            videoAnalysis: videoAnalysis
-              ? {
-                  emphasisMoments: videoAnalysis.emphasisMoments,
-                  emotionBeats: videoAnalysis.emotionBeats,
-                  visualContext: videoAnalysis.visualContext,
-                }
-              : null,
-            stylePreset: job.stylePreset ?? undefined,
-            brollDensity: (job.brollDensity as ReasoningPlanRequest["brollDensity"]) ?? undefined,
-            brollStockOnly: job.brollStockOnly,
-            referenceScript: job.script ?? undefined,
-            sourceDurationMs,
-            survivingSegmentCount,
-            repairMaxAttempts,
-          },
-          { userId: job.userId }
-        );
-        captions = wantsModule("captions") ? planResult.captions : [];
+      const repairMaxAttempts = await getConfig("AI_EDIT_REASONING_REPAIR_MAX_ATTEMPTS");
+      const planRequest: ReasoningPlanRequest = {
+        words: transcript.words,
+        videoAnalysis: videoAnalysis
+          ? { emphasisMoments: videoAnalysis.emphasisMoments, emotionBeats: videoAnalysis.emotionBeats, visualContext: videoAnalysis.visualContext }
+          : null,
+        stylePreset: job.stylePreset ?? undefined,
+        brollDensity: (job.brollDensity as ReasoningPlanRequest["brollDensity"]) ?? undefined,
+        brollStockOnly: job.brollStockOnly,
+        referenceScript: job.script ?? undefined,
+        sourceDurationMs,
+        survivingSegmentCount,
+        repairMaxAttempts,
+      };
+
+      // Re-bound to plain consts — TypeScript's control-flow narrowing
+      // from processAiEditJob's own `if (!job) return;` guard doesn't
+      // propagate into the nested attemptPlanning function declaration
+      // below (a closure over a differently-scoped outer binding), same
+      // "fight the narrowing with an explicit rebind" pattern already
+      // used in ai-broll-resolver.ts's resolveStockBroll.
+      const jobUserId = job.userId;
+      const jobBrollDensity = job.brollDensity as "MINIMAL" | "BALANCED" | "HEAVY" | undefined;
+
+      // One planning attempt -> the module-filtered sections + this
+      // attempt's own quality scores, or null on a hard failure (network/
+      // auth/unrecoverable JSON — see planTimeline's own error contract).
+      // Extracted so the bounded retry below can call it a second time
+      // without duplicating the module-filtering logic.
+      async function attemptPlanning() {
+        const planResult = await planTimeline(planRequest, { userId: jobUserId });
+        const attemptCaptions = wantsModule("captions") ? planResult.captions : [];
         // zoom comes back clipId-less (see AI_ZOOM_SOURCE_CLIP_PLACEHOLDER's
         // own doc comment) — the real clip id is only known client-side, at
         // apply time (ai-auto-edit-panel.tsx), same as sceneRemoval's own
@@ -441,16 +462,68 @@ export async function processAiEditJob(jobId: string): Promise<void> {
         // (AI_TRANSITION_SEGMENT_PLACEHOLDER_PREFIX) — resolved client-side
         // too, inside the translator itself this time (no apply-time panel
         // remap needed, unlike zoom/broll — see mapTransitionsToSegmentBoundaries).
-        zoom = wantsModule("zoom") ? planResult.zoom.map((z) => ({ ...z, clipId: AI_ZOOM_SOURCE_CLIP_PLACEHOLDER })) : [];
-        brollProposals = wantsModule("broll") ? planResult.broll : [];
-        stickers = wantsModule("stickers") ? (planResult.stickers ?? []) : [];
-        music = wantsModule("music") ? planResult.music : undefined;
-        sfx = wantsModule("sfx") ? (planResult.sfx ?? []) : [];
-        transitions = wantsModule("transitions") ? (planResult.transitions ?? []) : [];
-        reasoningCostUsd = planResult.costUsd ?? 0;
-        if (planResult.warnings && planResult.warnings.length > 0) {
-          planningError = `Some items in the AI's plan were invalid and were skipped, everything else still applied: ${planResult.warnings.join(" ")}`;
-          logger.warn({ jobId, warnings: planResult.warnings }, "[ai edit job] timeline planning partially degraded — some items dropped, continuing with the rest");
+        const attemptZoom = wantsModule("zoom") ? planResult.zoom.map((z) => ({ ...z, clipId: AI_ZOOM_SOURCE_CLIP_PLACEHOLDER })) : [];
+        const attemptBroll = wantsModule("broll") ? planResult.broll : [];
+        const attemptStickers = wantsModule("stickers") ? (planResult.stickers ?? []) : [];
+        const attemptMusic = wantsModule("music") ? planResult.music : undefined;
+        const attemptSfx = wantsModule("sfx") ? (planResult.sfx ?? []) : [];
+        const attemptTransitions = wantsModule("transitions") ? (planResult.transitions ?? []) : [];
+        const scores = scoreAiTimelinePlan(
+          { sceneRemoval, captions: attemptCaptions, zoom: attemptZoom, broll: attemptBroll, stickers: attemptStickers },
+          {
+            sourceDurationMs,
+            brollDensity: jobBrollDensity,
+            captionsInScope: wantsModule("captions"),
+            visualInScope: wantsModule("broll") || wantsModule("zoom") || wantsModule("stickers"),
+            pacingInScope: wantsModule("sceneRemoval") || wantsModule("captions"),
+          }
+        );
+        return {
+          captions: attemptCaptions,
+          zoom: attemptZoom,
+          brollProposals: attemptBroll,
+          stickers: attemptStickers,
+          music: attemptMusic,
+          sfx: attemptSfx,
+          transitions: attemptTransitions,
+          reasoningCostUsd: planResult.costUsd ?? 0,
+          warnings: planResult.warnings,
+          scores,
+        };
+      }
+
+      try {
+        let best = await attemptPlanning();
+        // Bounded single retry — "if score is poor, automatically
+        // regenerate... never regenerate the whole edit": this re-runs
+        // ONLY the reasoning call (never transcription/scene-removal/
+        // broll resolution), and only ONCE, keeping whichever of the two
+        // attempts scored higher — never a loop, never unbounded vendor
+        // spend.
+        if (best.scores.editingScore < AI_EDIT_QUALITY_RETRY_THRESHOLD) {
+          logger.info({ jobId, scores: best.scores }, "[ai edit job] first planning attempt scored below the quality threshold — retrying once");
+          try {
+            const retry = await attemptPlanning();
+            if (retry.scores.editingScore > best.scores.editingScore) best = retry;
+          } catch (retryErr) {
+            // The retry failing is never fatal — the FIRST attempt already
+            // succeeded and is still fully usable, just lower-scoring.
+            logger.warn({ err: retryErr, jobId }, "[ai edit job] quality-triggered planning retry failed — keeping the first (already-valid) attempt");
+          }
+        }
+
+        captions = best.captions;
+        zoom = best.zoom;
+        brollProposals = best.brollProposals;
+        stickers = best.stickers;
+        music = best.music;
+        sfx = best.sfx;
+        transitions = best.transitions;
+        reasoningCostUsd = best.reasoningCostUsd;
+        attemptScores = best.scores;
+        if (best.warnings && best.warnings.length > 0) {
+          planningError = `Some items in the AI's plan were invalid and were skipped, everything else still applied: ${best.warnings.join(" ")}`;
+          logger.warn({ jobId, warnings: best.warnings }, "[ai edit job] timeline planning partially degraded — some items dropped, continuing with the rest");
         }
       } catch (err) {
         planningError = err instanceof Error ? err.message : "Timeline planning (captions/zoom/broll/stickers/music/sfx/transitions) failed.";
@@ -531,6 +604,11 @@ export async function processAiEditJob(jobId: string): Promise<void> {
       sfx: resolvedSfx,
       transitions,
       cost,
+      // TASK 12 — computed pre-resolution (see attemptPlanning above),
+      // absent when the reasoning call never ran at all (e.g. no TIMELINE_
+      // PLANNING_MODULES selected) — same "absent means not computed,
+      // never a fabricated retrofit" convention as `cost`.
+      qualityScores: attemptScores ?? undefined,
     };
     // Defense in depth: every piece (sceneRemoval/captions/zoom) was
     // already validated at its own source (mergeSceneRemovalCandidates'

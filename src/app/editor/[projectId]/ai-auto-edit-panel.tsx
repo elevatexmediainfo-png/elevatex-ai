@@ -6,6 +6,8 @@ import {
   ArrowRightLeft,
   CaptionsIcon,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Clock,
   Copy,
   Film,
@@ -235,6 +237,47 @@ const AI_EDIT_ASSET_STATUS_SUFFIX: Partial<Record<AssetView["status"], string>> 
   NORMALIZING: " (Preparing…)",
   FAILED: " (Failed)",
 };
+
+// TASK 11 (2026-08-07) — the panel's own light collapsible-section
+// primitive, deliberately NOT the shared components/ui/accordion.tsx: that
+// component ships shadcn's own default theme classes (text-sm, ring-3,
+// rounded-lg, ...), while every other control in this panel uses the
+// editor's own bespoke design tokens (text-caption/text-micro/
+// bg-editor-surface-1/border-editor-line/etc.) — reusing it here would
+// mean fighting its defaults with overrides on every element rather than
+// a clean win. This is a plain, minimal open/close toggle with no
+// animation library dependency, matching this file's own existing
+// "small local component" convention (see CancelJobButton below).
+// Defaults OPEN (never `defaultOpen={false}` anywhere this is used) per
+// the founder's own "no hidden controls" requirement — collapsing is
+// something the USER chooses to do, never something that greets them
+// with controls already hidden away.
+function CollapsibleSection({
+  title,
+  defaultOpen = true,
+  children,
+}: {
+  title: string;
+  defaultOpen?: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = React.useState(defaultOpen);
+  return (
+    <div className="space-y-2">
+      <button
+        type="button"
+        data-ai-edit-section-toggle={title}
+        data-ai-edit-section-open={open}
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 text-label-sm text-neutral-300 hover:text-white"
+      >
+        {open ? <ChevronDown className="size-3.5 shrink-0" /> : <ChevronRight className="size-3.5 shrink-0" />}
+        {title}
+      </button>
+      {open && <div className="space-y-3">{children}</div>}
+    </div>
+  );
+}
 
 export function AiAutoEditPanel({
   projectId,
@@ -564,6 +607,27 @@ export function AiAutoEditPanel({
     }
   }
 
+  // TASK 11 (2026-08-07) — full panel restructure. Root causes of the
+  // reported UX complaints, confirmed by reading the PRE-existing layout
+  // above (now replaced): (1) "panel scroll must always work" — the intake
+  // form lived in a plain, non-scrolling block ABOVE the only
+  // `overflow-y-auto` region (the Jobs list); on a short viewport with a
+  // long intake form + many jobs, there was no single scroll container
+  // covering everything, and the flex child that DID have overflow-y-auto
+  // was missing `min-h-0` (a classic flexbox-scroll footgun — without it,
+  // a `flex-1 overflow-y-auto` child doesn't reliably clip/scroll, it just
+  // grows to fit its content instead). (2) "sticky Run button" — the Run
+  // button used to be inline at the bottom of the intake form, scrolling
+  // away with everything else. (3) "collapsible Jobs / Advanced settings,
+  // no hidden controls" — nothing was collapsible before; every field was
+  // always fully expanded. Fixed by: ONE real scroll container (this outer
+  // div, `min-h-0` + `overflow-y-auto`) holding the always-visible source-
+  // asset picker, an "Advanced settings" CollapsibleSection (aspect ratio/
+  // style preset/b-roll density/script/module selection), and a "Jobs"
+  // CollapsibleSection — both default OPEN, so nothing is hidden on first
+  // load, only collapsible afterward; the Run button moves to a real
+  // sticky footer (`shrink-0`, outside the scroll container, always
+  // visible regardless of scroll position).
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="flex flex-col bg-editor-panel text-white sm:max-w-md">
@@ -577,44 +641,8 @@ export function AiAutoEditPanel({
           </SheetDescription>
         </SheetHeader>
 
-        <div className="space-y-3 border-b border-editor-line px-4 pb-4">
-          <div className="space-y-1">
-            <span className="text-caption text-neutral-500">Aspect ratio</span>
-            {/* Phase 12 Module 8 — the SAME real project.aspectRatio PATCH
-                preview-window.tsx's own quick-switch already uses, not a
-                separate AI-only "framing preference": zoom/crop reasoning
-                only makes sense against the canvas the export actually
-                renders at, so this has to be the one real setting, not a
-                second disconnected concept of aspect ratio. */}
-            <div className="flex items-center gap-1.5">
-              {ASPECT_SWITCH_OPTIONS.map(({ ratio, label, Icon }) => {
-                const active = project.aspectRatio === ratio;
-                return (
-                  <Tooltip key={ratio}>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        data-ai-edit-aspect-ratio={ratio}
-                        data-ai-edit-aspect-ratio-active={active}
-                        disabled={updateAspectRatioMutation.isPending}
-                        onClick={() => updateAspectRatioMutation.mutate(ratio)}
-                        className={cn(
-                          "flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md border text-micro transition-colors disabled:opacity-50",
-                          active
-                            ? "border-editor-accent/50 bg-editor-accent/15 text-editor-accent"
-                            : "border-editor-line bg-editor-surface-1 text-neutral-400 hover:text-white"
-                        )}
-                      >
-                        <Icon className="size-3.5" />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent side="bottom">{label}</TooltipContent>
-                  </Tooltip>
-                );
-              })}
-            </div>
-          </div>
-          <div className="space-y-1">
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 pb-4">
+          <div className="space-y-1 pt-3">
             <span className="text-caption text-neutral-500">Source asset</span>
             <select
               className="h-8 w-full rounded-md border border-editor-line bg-editor-surface-1 px-2 text-caption text-neutral-100"
@@ -630,83 +658,111 @@ export function AiAutoEditPanel({
               ))}
             </select>
           </div>
-          <div className="space-y-1">
-            <span className="text-caption text-neutral-500">Style preset (optional)</span>
-            <select
-              data-ai-edit-style-preset
-              className="h-8 w-full rounded-md border border-editor-line bg-editor-surface-1 px-2 text-caption text-neutral-100"
-              value={stylePreset}
-              onChange={(e) => setStylePreset(e.target.value)}
-            >
-              <option value="">No preference</option>
-              {AI_STYLE_PRESETS.map((preset) => (
-                <option key={preset.id} value={preset.value} title={preset.description}>
-                  {preset.label}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="space-y-1">
-            <span className="text-caption text-neutral-500">B-roll density</span>
-            {/* Founder request (2026-07-18) — control over how aggressively
-                b-roll gets proposed, alongside aspect ratio/style preset
-                above. A select matches this panel's own existing pattern
-                (Style preset) rather than a slider — consistent, and this
-                is a 3-way categorical choice, not a continuous one. */}
-            <select
-              data-ai-edit-broll-density
-              className="h-8 w-full rounded-md border border-editor-line bg-editor-surface-1 px-2 text-caption text-neutral-100"
-              value={brollDensity}
-              onChange={(e) => setBrollDensity(e.target.value as typeof brollDensity)}
-            >
-              <option value="">Balanced (default)</option>
-              {AI_BROLL_DENSITIES.filter((d) => d !== "BALANCED").map((d) => (
-                <option key={d} value={d}>
-                  {d === "MINIMAL" ? "Minimal" : "Heavy"}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="space-y-1">
-            <span className="text-caption text-neutral-500">Reference script (optional)</span>
-            <Textarea
-              data-ai-edit-script
-              placeholder="Paste a script if you have one — used to correct near-miss caption text, never as a timing source."
-              value={script}
-              onChange={(e) => setScript(e.target.value)}
-              className="min-h-16 resize-y bg-editor-surface-1 text-caption text-neutral-100"
-            />
-          </div>
-          <div className="space-y-1.5">
-            <span className="text-caption text-neutral-500">What to run</span>
-            {/* Founder request (2026-07-30) — module selection. All checked
-                by default (a run with no interaction here still produces
-                every section, exactly as before this control existed).
-                sceneRemoval/captions/etc. all reuse the SAME job/pipeline —
-                this only narrows which sections it proposes, never spins up
-                a second pipeline. */}
-            <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
-              {MODULE_CHECKBOX_ORDER.map((module) => (
-                <label key={module} className="flex items-center gap-2 text-caption text-neutral-300">
-                  <Checkbox checked={selectedModules.has(module)} onCheckedChange={() => toggleModule(module)} />
-                  {MODULE_LABELS[module]}
-                </label>
-              ))}
-            </div>
-          </div>
-          <Button
-            type="button"
-            className="w-full"
-            disabled={!selectedAssetId || preparingRun || createJobMutation.isPending || selectedModules.size === 0}
-            onClick={() => void handleRun()}
-          >
-            {preparingRun || createJobMutation.isPending ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
-            Run AI Auto-Edit
-          </Button>
-        </div>
 
-        <div className="flex-1 space-y-3 overflow-y-auto px-4 pb-4">
-          <p className="pt-3 text-label-sm text-neutral-300">Jobs</p>
+          <CollapsibleSection title="Advanced settings">
+            <div className="space-y-1">
+              <span className="text-caption text-neutral-500">Aspect ratio</span>
+              {/* Phase 12 Module 8 — the SAME real project.aspectRatio PATCH
+                  preview-window.tsx's own quick-switch already uses, not a
+                  separate AI-only "framing preference": zoom/crop reasoning
+                  only makes sense against the canvas the export actually
+                  renders at, so this has to be the one real setting, not a
+                  second disconnected concept of aspect ratio. */}
+              <div className="flex items-center gap-1.5">
+                {ASPECT_SWITCH_OPTIONS.map(({ ratio, label, Icon }) => {
+                  const active = project.aspectRatio === ratio;
+                  return (
+                    <Tooltip key={ratio}>
+                      <TooltipTrigger asChild>
+                        <button
+                          type="button"
+                          data-ai-edit-aspect-ratio={ratio}
+                          data-ai-edit-aspect-ratio-active={active}
+                          disabled={updateAspectRatioMutation.isPending}
+                          onClick={() => updateAspectRatioMutation.mutate(ratio)}
+                          className={cn(
+                            "flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md border text-micro transition-colors disabled:opacity-50",
+                            active
+                              ? "border-editor-accent/50 bg-editor-accent/15 text-editor-accent"
+                              : "border-editor-line bg-editor-surface-1 text-neutral-400 hover:text-white"
+                          )}
+                        >
+                          <Icon className="size-3.5" />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom">{label}</TooltipContent>
+                    </Tooltip>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="space-y-1">
+              <span className="text-caption text-neutral-500">Style preset (optional)</span>
+              <select
+                data-ai-edit-style-preset
+                className="h-8 w-full rounded-md border border-editor-line bg-editor-surface-1 px-2 text-caption text-neutral-100"
+                value={stylePreset}
+                onChange={(e) => setStylePreset(e.target.value)}
+              >
+                <option value="">No preference</option>
+                {AI_STYLE_PRESETS.map((preset) => (
+                  <option key={preset.id} value={preset.value} title={preset.description}>
+                    {preset.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="space-y-1">
+              <span className="text-caption text-neutral-500">B-roll density</span>
+              {/* Founder request (2026-07-18) — control over how aggressively
+                  b-roll gets proposed, alongside aspect ratio/style preset
+                  above. A select matches this panel's own existing pattern
+                  (Style preset) rather than a slider — consistent, and this
+                  is a 3-way categorical choice, not a continuous one. */}
+              <select
+                data-ai-edit-broll-density
+                className="h-8 w-full rounded-md border border-editor-line bg-editor-surface-1 px-2 text-caption text-neutral-100"
+                value={brollDensity}
+                onChange={(e) => setBrollDensity(e.target.value as typeof brollDensity)}
+              >
+                <option value="">Balanced (default)</option>
+                {AI_BROLL_DENSITIES.filter((d) => d !== "BALANCED").map((d) => (
+                  <option key={d} value={d}>
+                    {d === "MINIMAL" ? "Minimal" : "Heavy"}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="space-y-1">
+              <span className="text-caption text-neutral-500">Reference script (optional)</span>
+              <Textarea
+                data-ai-edit-script
+                placeholder="Paste a script if you have one — used to correct near-miss caption text, never as a timing source."
+                value={script}
+                onChange={(e) => setScript(e.target.value)}
+                className="min-h-16 resize-y bg-editor-surface-1 text-caption text-neutral-100"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <span className="text-caption text-neutral-500">What to run</span>
+              {/* Founder request (2026-07-30) — module selection. All checked
+                  by default (a run with no interaction here still produces
+                  every section, exactly as before this control existed).
+                  sceneRemoval/captions/etc. all reuse the SAME job/pipeline —
+                  this only narrows which sections it proposes, never spins up
+                  a second pipeline. */}
+              <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
+                {MODULE_CHECKBOX_ORDER.map((module) => (
+                  <label key={module} className="flex items-center gap-2 text-caption text-neutral-300">
+                    <Checkbox checked={selectedModules.has(module)} onCheckedChange={() => toggleModule(module)} />
+                    {MODULE_LABELS[module]}
+                  </label>
+                ))}
+              </div>
+            </div>
+          </CollapsibleSection>
+
+          <CollapsibleSection title={`Jobs${jobsQuery.data && jobsQuery.data.length > 0 ? ` (${jobsQuery.data.length})` : ""}`}>
           {jobsQuery.isLoading && <p className="text-caption text-neutral-500">Loading…</p>}
           {!jobsQuery.isLoading && (jobsQuery.data?.length ?? 0) === 0 && <p className="text-caption text-neutral-500">No jobs yet.</p>}
           {jobsQuery.data?.map((job) => {
@@ -1047,6 +1103,22 @@ export function AiAutoEditPanel({
               </div>
             );
           })}
+          </CollapsibleSection>
+        </div>
+
+        {/* TASK 11 — sticky footer: outside the scrollable region above
+            (`shrink-0`, not `flex-1`), so the Run button stays reachable
+            regardless of how far the intake form or job list scrolls. */}
+        <div className="shrink-0 border-t border-editor-line bg-editor-panel px-4 py-3">
+          <Button
+            type="button"
+            className="w-full"
+            disabled={!selectedAssetId || preparingRun || createJobMutation.isPending || selectedModules.size === 0}
+            onClick={() => void handleRun()}
+          >
+            {preparingRun || createJobMutation.isPending ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
+            Run AI Auto-Edit
+          </Button>
         </div>
       </SheetContent>
     </Sheet>

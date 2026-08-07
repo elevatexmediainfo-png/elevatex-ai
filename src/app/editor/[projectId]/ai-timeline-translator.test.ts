@@ -592,6 +592,60 @@ describe("translateAITimelinePlan", () => {
     expect(deps.addTrackAndClip.addTrack).not.toHaveBeenCalled();
   });
 
+  // TASK 3 (2026-08-07, AI Auto-Edit power-word highlighting).
+  it("resolves highlightWords into real character-offset richRuns on the caption's content", async () => {
+    const subtitleTrack = makeTrack({ id: "sub-1", kind: "SUBTITLE" });
+    const project = baseProject({ tracks: [subtitleTrack] });
+    const plan = emptyPlan({
+      captions: [{ text: "DON'T IGNORE DIABETES", startMs: 0, endMs: 2000, highlightWords: [{ word: "DON'T", color: "#FF3B30" }, { word: "IGNORE", color: "#FFD60A" }] }],
+    });
+    const deps = makeFakeDeps();
+
+    const result = translateAITimelinePlan(plan, project, deps);
+    await result.command!.execute();
+
+    expect(deps.clip.addClip).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: expect.objectContaining({
+          richRuns: [
+            { start: 0, end: 5, color: "#FF3B30" },
+            { start: 6, end: 12, color: "#FFD60A" },
+          ],
+        }),
+      })
+    );
+  });
+
+  it("a highlight word that isn't actually present in the caption's own text produces no run for it (no error)", async () => {
+    const subtitleTrack = makeTrack({ id: "sub-1", kind: "SUBTITLE" });
+    const project = baseProject({ tracks: [subtitleTrack] });
+    const plan = emptyPlan({
+      captions: [{ text: "hello world", startMs: 0, endMs: 2000, highlightWords: [{ word: "nonexistent", color: "#FF3B30" }] }],
+    });
+    const deps = makeFakeDeps();
+
+    const result = translateAITimelinePlan(plan, project, deps);
+    await result.command!.execute();
+
+    expect(deps.clip.addClip).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.not.objectContaining({ richRuns: expect.anything() }) })
+    );
+  });
+
+  it("omits richRuns entirely when no highlightWords were proposed (unchanged pre-existing behavior)", async () => {
+    const subtitleTrack = makeTrack({ id: "sub-1", kind: "SUBTITLE" });
+    const project = baseProject({ tracks: [subtitleTrack] });
+    const plan = emptyPlan({ captions: [{ text: "plain caption", startMs: 0, endMs: 2000 }] });
+    const deps = makeFakeDeps();
+
+    const result = translateAITimelinePlan(plan, project, deps);
+    await result.command!.execute();
+
+    expect(deps.clip.addClip).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.not.objectContaining({ richRuns: expect.anything() }) })
+    );
+  });
+
   it("captions with NO existing SUBTITLE track create one via createAddTrackWithClipsCommand", async () => {
     const project = baseProject({ tracks: [] });
     const plan = emptyPlan({ captions: [{ text: "Hello world", startMs: 0, endMs: 2000 }] });

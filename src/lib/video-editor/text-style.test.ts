@@ -104,6 +104,14 @@ describe("resolveRevealUnits", () => {
   });
 });
 
+// Subtitle Compiler migration (2026-07-28) — resolveTextRenderUnits()
+// (and its golden tests, formerly here) is deleted; the render-decision
+// logic it owned now lives in the Legacy Adapter
+// (lib/video-editor/subtitles/legacy-adapter.ts), whose own golden tests
+// (legacy-adapter.test.ts) cover every one of the same scenarios at the
+// new adapter/Compiler boundary — cross-checked against the exact values
+// these tests used to assert, so no real coverage was lost.
+
 describe("richFormattingAt", () => {
   it("returns all-false when no runs overlap", () => {
     expect(richFormattingAt([{ start: 10, end: 20, bold: true }], 0, 3)).toEqual({ bold: false, italic: false, underline: false });
@@ -115,5 +123,27 @@ describe("richFormattingAt", () => {
 
   it("handles an undefined runs array", () => {
     expect(richFormattingAt(undefined, 0, 3)).toEqual({ bold: false, italic: false, underline: false });
+  });
+
+  // TASK 3 (2026-08-07, AI Auto-Edit power-word highlighting).
+  it("returns the color of an overlapping colored run", () => {
+    expect(richFormattingAt([{ start: 0, end: 5, color: "#FF3B30" }], 0, 3).color).toBe("#FF3B30");
+  });
+
+  it("omits color when no overlapping run has one", () => {
+    expect(richFormattingAt([{ start: 0, end: 5, bold: true }], 0, 3).color).toBeUndefined();
+  });
+
+  it("returns the FIRST colored run's color when two colored runs both overlap (deterministic tie-break)", () => {
+    expect(
+      richFormattingAt(
+        [
+          { start: 0, end: 10, color: "#FF3B30" },
+          { start: 0, end: 10, color: "#FFD60A" },
+        ],
+        0,
+        3
+      ).color
+    ).toBe("#FF3B30");
   });
 });

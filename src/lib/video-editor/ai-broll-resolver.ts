@@ -113,18 +113,35 @@ function relevanceScore(query: string, title: string): number {
 // overlap score, exposed so callers can decide whether a "best available"
 // match is actually good enough (see BrollResolutionContext.relevanceFallbackThreshold)
 // rather than just trusting that SOME result was returned.
+//
+// `preferPortrait` (2026-08-07) — a small scoring bonus (below the kind
+// bonus, so it only breaks ties between otherwise-similar matches, never
+// overrides genuine relevance) for a portrait-oriented result
+// (heightPx > widthPx) when the project being edited is itself portrait
+// (RATIO_9_16 — Reels/Shorts/TikTok). A landscape clip letterboxed into a
+// 9:16 canvas reads as visibly lower-quality than a real portrait shot.
+// `excludeExternalIds` (2026-08-07) — "never reuse the exact same stock
+// clip multiple times": candidates already claimed by an earlier b-roll
+// slot in this same job are filtered out entirely before scoring, keyed
+// by `${providerId}:${externalId}` (the one identifier that's stable
+// PRE-materialization — resolvedAssetId is a NEW EditorAsset minted per
+// materialize call, even for the identical source clip, so it can't be
+// used to detect a repeat).
 export function pickBestStockResult(
   outcomes: StockSearchProviderOutcome[],
   preferredKind: StockSearchResult["kind"],
-  query: string
+  query: string,
+  options: { preferPortrait?: boolean; excludeExternalIds?: Set<string> } = {}
 ): { providerId: string; result: StockSearchResult; relevanceScore: number } | null {
   const candidates: ScoredStockResult[] = [];
   for (const outcome of outcomes) {
     if (outcome.error) continue;
     outcome.results.forEach((result, index) => {
+      if (options.excludeExternalIds?.has(`${outcome.providerId}:${result.externalId}`)) return;
       const relevance = relevanceScore(query, result.title);
       const kindBonus = result.kind === preferredKind ? 50 : 0;
-      candidates.push({ providerId: outcome.providerId, result, score: relevance * 1000 + kindBonus - index, relevanceScore: relevance });
+      const portraitBonus = options.preferPortrait && result.widthPx && result.heightPx && result.heightPx > result.widthPx ? 10 : 0;
+      candidates.push({ providerId: outcome.providerId, result, score: relevance * 1000 + kindBonus + portraitBonus - index, relevanceScore: relevance });
     });
   }
   if (candidates.length === 0) return null;
@@ -179,7 +196,13 @@ export function buildBroadenedQueries(query: string): string[] {
 // stockOnly fallback-to-generation branch already treats "no
 // resolvedAssetId" as its trigger, so a low-relevance match and a missing
 // one are handled identically with no new branching there.
-async function resolveStockBroll(item: AIBroll, ctx: BrollResolutionContext, queryOverride?: string, minRelevanceScore?: number): Promise<AIBroll> {
+async function resolveStockBroll(
+  item: AIBroll,
+  ctx: BrollResolutionContext,
+  queryOverride?: string,
+  minRelevanceScore?: number,
+  usedExternalIds?: Set<string>
+): Promise<AIBroll> {
   const queryOrUndefined = queryOverride ?? item.searchQuery;
   if (!queryOrUndefined) return { ...item, resolutionNote: 'source:"stock" but no searchQuery was provided.' };
   // Re-bound to a plain `string` const — TypeScript's control-flow
@@ -188,6 +211,7 @@ async function resolveStockBroll(item: AIBroll, ctx: BrollResolutionContext, que
   // differently-named outer binding), so this makes the non-optional type
   // explicit rather than fighting the narrowing.
   const query: string = queryOrUndefined;
+  const preferPortrait = ctx.aspectRatio === "RATIO_9_16";
 
   async function searchAndPick(searchText: string) {
     // Search both kinds in parallel — b-roll is conventionally VIDEO
@@ -199,22 +223,45 @@ async function resolveStockBroll(item: AIBroll, ctx: BrollResolutionContext, que
     ]);
     // Relevance is ALWAYS scored against the ORIGINAL query (`query`),
     // never `searchText` — see buildBroadenedQueries' own doc comment.
-    return pickBestStockResult([...videoOutcomes.outcomes, ...imageOutcomes.outcomes], "VIDEO", query);
+    return pickBestStockResult([...videoOutcomes.outcomes, ...imageOutcomes.outcomes], "VIDEO", query, { preferPortrait, excludeExternalIds: usedExternalIds });
   }
 
   let picked = await searchAndPick(query);
+  let searchedWith = query;
 
-  // Fix (2026-08-06, FIX 4) — the ORIGINAL query found literally NOTHING
-  // (not "found a weak match" — that's the separate, already-existing
-  // relevance-threshold path below) across every enabled provider. Only
-  // THIS case triggers broadening: a specific query that already found
-  // something is never second-guessed, so an already-working query never
-  // pays the extra round-trip cost.
+  // Query expansion (2026-08-07) — semantic/synonym/category variants of
+  // the primary query (item.searchQueries, aiBrollSchema's own doc
+  // comment), tried in the AI's own priority order BEFORE this file's
+  // token-dropping broadening below — a semantically related query
+  // ("hospital" for a "doctor" moment) finds real, on-topic footage far
+  // more reliably than a narrower/broader phrasing of the same literal
+  // words. Also used when the primary query found something but every
+  // candidate was already claimed by an earlier b-roll slot (dedup) —
+  // trying a related query is a better next step than giving up outright.
+  if ((!picked || (usedExternalIds && picked)) && item.searchQueries && item.searchQueries.length > 0) {
+    for (const expanded of item.searchQueries) {
+      if (expanded.trim().toLowerCase() === query.trim().toLowerCase()) continue; // already tried as the primary query
+      const candidate = await searchAndPick(expanded);
+      if (candidate) {
+        picked = candidate;
+        searchedWith = expanded;
+        break;
+      }
+    }
+  }
+
+  // Fix (2026-08-06, FIX 4) — the ORIGINAL (and any expanded) query found
+  // literally NOTHING (not "found a weak match" — that's the separate,
+  // already-existing relevance-threshold path below) across every enabled
+  // provider. Only THIS case triggers token-broadening: a specific query
+  // that already found something is never second-guessed, so an already-
+  // working query never pays the extra round-trip cost.
   if (!picked) {
     const broadenedCandidates = buildBroadenedQueries(query).slice(1);
     for (const broader of broadenedCandidates) {
       picked = await searchAndPick(broader);
       if (picked) {
+        searchedWith = broader;
         logger.info({ originalQuery: query, widenedQuery: broader }, "[ai broll resolver] original query found nothing — a broadened phrasing found a usable match");
         break;
       }
@@ -222,18 +269,25 @@ async function resolveStockBroll(item: AIBroll, ctx: BrollResolutionContext, que
   }
 
   if (!picked) {
-    const wasBroadened = buildBroadenedQueries(query).length > 1;
+    const wasBroadened = buildBroadenedQueries(query).length > 1 || (item.searchQueries?.length ?? 0) > 0;
     return {
       ...item,
-      resolutionNote: `No stock results found for "${query}"${wasBroadened ? ", even after broadening the search to simpler phrasings" : ""}.`,
+      resolutionNote: `No stock results found for "${query}"${wasBroadened ? ", even after trying related queries and broader phrasings" : ""}.`,
     };
   }
   if (minRelevanceScore != null && picked.relevanceScore < minRelevanceScore) {
     return {
       ...item,
-      resolutionNote: `Best stock match ("${picked.result.title}") scored ${picked.relevanceScore.toFixed(2)} relevance for "${query}", below the ${minRelevanceScore} confidence threshold.`,
+      resolutionNote: `Best stock match ("${picked.result.title}") scored ${picked.relevanceScore.toFixed(2)} relevance for "${searchedWith}", below the ${minRelevanceScore} confidence threshold.`,
     };
   }
+
+  // Claim this candidate BEFORE the async materialize call below — see
+  // pickBestStockResult's own doc comment on `excludeExternalIds` for why
+  // externalId (not resolvedAssetId) is the stable dedup key, and this
+  // file's own header comment on resolveBrollItems for the "synchronous
+  // claim, still-parallel resolution" reasoning.
+  usedExternalIds?.add(`${picked.providerId}:${picked.result.externalId}`);
 
   const materialized = await materializeStockAsset(ctx.userId, picked.providerId, "STOCK_MEDIA", picked.result);
   return { ...item, resolvedAssetId: materialized.id, resolvedAssetUrl: materialized.thumbnailUrl ?? materialized.url, costUsd: 0 };
@@ -341,10 +395,10 @@ async function resolveGeneratedBroll(item: AIBroll, ctx: BrollResolutionContext)
   return { ...item, resolvedAssetId: asset.id, resolvedAssetUrl: asset.thumbnailUrl ?? asset.url, costUsd: result.costUsd ?? 0 };
 }
 
-export async function resolveBrollItem(item: AIBroll, ctx: BrollResolutionContext): Promise<AIBroll> {
+export async function resolveBrollItem(item: AIBroll, ctx: BrollResolutionContext, usedExternalIds?: Set<string>): Promise<AIBroll> {
   try {
     if (!ctx.stockOnly) {
-      return item.source === "stock" ? await resolveStockBroll(item, ctx) : await resolveGeneratedBroll(item, ctx);
+      return item.source === "stock" ? await resolveStockBroll(item, ctx, undefined, undefined, usedExternalIds) : await resolveGeneratedBroll(item, ctx);
     }
     // Founder policy (2026-07-18) — hard backstop, independent of
     // item.source: always try stock first, using item.searchQuery if
@@ -352,7 +406,7 @@ export async function resolveBrollItem(item: AIBroll, ctx: BrollResolutionContex
     // as a literal search phrase (covers a model that didn't comply with
     // the prompt's stock-only instruction and still proposed "generate").
     // Generation only fires if that stock attempt found literally nothing.
-    const stockResult = await resolveStockBroll(item, ctx, item.searchQuery ?? item.generation?.prompt, ctx.relevanceFallbackThreshold);
+    const stockResult = await resolveStockBroll(item, ctx, item.searchQuery ?? item.generation?.prompt, ctx.relevanceFallbackThreshold, usedExternalIds);
     if (stockResult.resolvedAssetId) return stockResult;
     if (!item.generation) {
       return { ...stockResult, resolutionNote: `${stockResult.resolutionNote ?? "No stock results found."} (stock-only policy active — no generation prompt was available to fall back to.)` };
@@ -372,7 +426,14 @@ export async function resolveBrollItem(item: AIBroll, ctx: BrollResolutionContex
 // Runs every item's resolution independently and in parallel — one slow
 // or failing item never blocks/breaks another (each is already its own
 // try/catch inside resolveBrollItem, so Promise.all here can never
-// reject).
+// reject). `usedExternalIds` (2026-08-07) — ONE shared Set across every
+// item in this job, so "never reuse the exact same stock clip multiple
+// times" holds across the WHOLE video, not just within one slot's own
+// query-expansion/broadening attempts. Real-time-safe under parallel
+// resolution because each item claims its own pick (adds to the set)
+// SYNCHRONOUSLY, before its own async materialize call — see
+// resolveStockBroll's own doc comment.
 export async function resolveBrollItems(items: AIBroll[], ctx: BrollResolutionContext): Promise<AIBroll[]> {
-  return Promise.all(items.map((item) => resolveBrollItem(item, ctx)));
+  const usedExternalIds = new Set<string>();
+  return Promise.all(items.map((item) => resolveBrollItem(item, ctx, usedExternalIds)));
 }
