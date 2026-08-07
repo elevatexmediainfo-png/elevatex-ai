@@ -94,6 +94,16 @@ export interface ReasoningPlanRequest {
   // already established). Defaults to 1 (the founder's own "retry once"
   // spec) if omitted.
   repairMaxAttempts?: number;
+  // Editing-density calibration (2026-08-08) — pre-computed by
+  // ai-edit-jobs.ts from THIS video's own real transcript/video-
+  // understanding characteristics (editing-density.ts's
+  // describeDensityGuidanceForPrompt), replacing the old flat "N slots for
+  // this video's length" framing with a rhythm target already adapted for
+  // this speaker's pace, the raw footage's own visual variety, and the
+  // content's emotional/lexical density. Optional so a caller that hasn't
+  // computed it (e.g. an older test fixture) falls back to the prompt's
+  // own static defaults, never a hard requirement.
+  densityGuidance?: string;
 }
 
 // zoom comes back WITHOUT clipId — see AI_ZOOM_SOURCE_CLIP_PLACEHOLDER's
@@ -396,6 +406,8 @@ export interface ReasoningVisualsRequest {
   usedStickerQueries?: string[];
   usedBrollStyles?: string[];
   repairMaxAttempts?: number;
+  // See ReasoningPlanRequest.densityGuidance's own doc comment.
+  densityGuidance?: string;
 }
 
 export const reasoningVisualsOutputSchema = z.object({
@@ -430,6 +442,8 @@ export interface ReasoningAudioRequest {
   sourceDurationMs: number;
   usedSfxQueries?: string[];
   repairMaxAttempts?: number;
+  // See ReasoningPlanRequest.densityGuidance's own doc comment.
+  densityGuidance?: string;
 }
 
 export const reasoningAudioOutputSchema = z.object({

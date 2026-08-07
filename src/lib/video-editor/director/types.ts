@@ -34,6 +34,12 @@ export interface DirectorJobMeta {
   brollStockOnly?: boolean;
   referenceScript?: string;
   repairMaxAttempts: number;
+  // Editing-density calibration (2026-08-08) — see
+  // ReasoningPlanRequest.densityGuidance's own doc comment
+  // (providers/reasoning/types.ts). Computed once by ai-edit-jobs.ts
+  // before branching into either pipeline, so both get the same
+  // this-video-specific rhythm calibration.
+  densityGuidance?: string;
 }
 
 // Visual-variety dedup ledger (variety-ledger.ts, step 5) — tracked here

@@ -87,6 +87,7 @@ async function runVisualsAgent(ctx: DirectorContext): Promise<DirectorContext> {
     usedStickerQueries: ctx.varietyLedger.stickerQueries,
     usedBrollStyles: ctx.varietyLedger.brollStyles,
     repairMaxAttempts: ctx.jobMeta.repairMaxAttempts,
+    densityGuidance: ctx.jobMeta.densityGuidance,
   };
   const result = await planVisualsAgent(req, { userId: ctx.jobMeta.userId });
   const zoom = ctx.wantsModule("zoom") ? result.zoom : [];
@@ -144,6 +145,7 @@ async function runAudioAgent(ctx: DirectorContext): Promise<DirectorContext> {
     sourceDurationMs: ctx.speech.sourceDurationMs,
     usedSfxQueries: ctx.varietyLedger.sfxQueries,
     repairMaxAttempts: ctx.jobMeta.repairMaxAttempts,
+    densityGuidance: ctx.jobMeta.densityGuidance,
   };
   const result = await planAudioAgent(req, { userId: ctx.jobMeta.userId });
   // TASK 7 (2026-08-07, "music should evolve") — deterministic, computed

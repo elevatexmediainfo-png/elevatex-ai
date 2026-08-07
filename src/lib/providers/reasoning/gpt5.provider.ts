@@ -223,13 +223,34 @@ Visual context: ${JSON.stringify(req.videoAnalysis.visualContext)}`
   // HEAVY video should feel as visually restless as a 30-second one, not
   // hit the same absolute cap. computeBrollTargetRange (below) is the
   // real, testable math; this string is just its English restatement.
+  // Editing-density calibration (2026-08-08, founder request — "stop
+  // optimizing prompts in isolation, calibrate against measurable editing
+  // density... target editing rhythm instead of target clip counts").
+  // When ai-edit-jobs.ts has computed a densityGuidance string (this
+  // video's own real speaking-pace/footage/content-adapted rhythm target —
+  // see editing-density.ts), that's the authoritative numeric target and
+  // this section only needs to defer to it. The OLD flat "N slots for this
+  // video's length" framing (computeBrollTargetRange) is kept as the
+  // fallback for any caller that hasn't computed density guidance yet
+  // (older tests, or a request built before this field existed) — never a
+  // hard requirement, so nothing breaks for a caller that omits it.
   const brollRange = computeBrollTargetRange(req.sourceDurationMs, req.brollDensity);
-  const brollDensityGuidance =
-    req.brollDensity === "MINIMAL"
+  const brollDensityGuidance = req.densityGuidance
+    ? `Follow the EDITING RHYTHM guidance above for how MANY b-roll slots to aim for and how far apart to space them — this section is about WHAT makes a good one, not the count.`
+    : req.brollDensity === "MINIMAL"
       ? `B-roll density: LIGHT. Aim for roughly ${brollRange.min}-${brollRange.max} b-roll slots for this video's length (~1-3 per minute) — only for moments that clearly stand out; when in doubt, propose fewer.`
       : req.brollDensity === "HEAVY"
         ? `B-roll density: HEAVY. Aim for roughly ${brollRange.min}-${brollRange.max} b-roll slots for this video's length (~6-12 per minute — the video's visual should genuinely change every few seconds, the way a fast-cut Reel/Short does) — actively look for supporting-shot opportunities, including moments you'd otherwise consider borderline. It is a real failure mode to land far below this range (e.g. proposing only one slot for a full minute of HEAVY content) — if you're short of the target, look again at EVERY sentence for a noun/location/product/action/person/brand you skipped the first pass, per the six categories below. Still propose fewer only if the content genuinely, truly has nothing left to illustrate — never pad with irrelevant cutaways just to hit a count.`
         : `B-roll density: MEDIUM (default). Aim for roughly ${brollRange.min}-${brollRange.max} b-roll slots for this video's length (~3-6 per minute).`;
+  // Same defer-to-densityGuidance pattern for zoom/SFX counts (legacy
+  // buildPrompt() only — Director's buildVisualsPrompt()/buildAudioPrompt()
+  // get their own analogous variables where they build their own prompts).
+  const zoomCountGuidance = req.densityGuidance
+    ? "Follow the EDITING RHYTHM guidance above for roughly how often to reach for a zoom."
+    : "Propose 0 to 5 zoom windows total depending on how many of the above genuinely occur — it's fine to propose zero for a video with no real emphasis moments, questions, or numbers.";
+  const sfxCountGuidance = req.densityGuidance
+    ? "Follow the EDITING RHYTHM guidance above for the maximum SFX count for this video."
+    : "Propose 0-4 short one-shot sound effects (most videos genuinely warrant 0-2, not the ceiling)";
 
   // Founder policy (2026-07-18) — generation is disabled for b-roll right
   // now; every proposal must be "stock". This is prompt-level guidance
@@ -259,6 +280,10 @@ Visual context: ${JSON.stringify(req.videoAnalysis.visualContext)}`
   // rigid structure imposed on top of them.
   const pacingGuidance = `\nSTORY RHYTHM — think of the edit as: HOOK (first 1-3 seconds must earn attention — the very first caption should be punchy, not a slow warm-up) -> fast pacing through the main content (short caption chunks, frequent visual changes) -> visual support (b-roll/zoom landing on the moments that most need it, not evenly spread on a timer) -> a clear finish, ideally with a call-to-action in the final ~15% of the video (see TASK 1's own CTA instruction below). Every task below should serve this shape, not just its own isolated rule.`;
 
+  // Editing-density calibration (2026-08-08) — see brollDensityGuidance's
+  // own doc comment above for why this defers/falls back the way it does.
+  const densitySection = req.densityGuidance ? `\n${req.densityGuidance}\n` : "";
+
   return `You are planning the captions, zoom effects, b-roll, stickers, music, sfx, and transitions for a video editor's AI Auto-Editor feature — the target quality bar is a modern short-form AI editor (Opus Clip / Vizard / CapCut Auto Edit style: punchy, fast-paced, visually restless, immediately publishable to Reels/Shorts/TikTok), not a plain transcript with a subtitle track laid under it. You are given the full transcript (word-level timestamps, in milliseconds from the start of the source media) and, if available, a video-understanding analysis.
 
 Transcript words (format "index:word@startMs-endMs" — each word is numbered 0 to ${req.words.length - 1} in order):
@@ -267,7 +292,7 @@ ${videoSection}
 ${styleSection}
 ${scriptSection}
 ${pacingGuidance}
-
+${densitySection}
 Source media duration: ${req.sourceDurationMs}ms. Every timestamp you produce (for zoom/broll/stickers/music/sfx/transitions — captions are the one exception, see TASK 1) must be within [0, ${req.sourceDurationMs}].
 
 TASK 1 — captions: Segment the transcript into natural caption chunks (roughly sentence or clause length, not single words, not the entire transcript as one giant caption). For each caption, set "sourceWordStartIndex" and "sourceWordEndIndex" to the FIRST and LAST numbered word index (from the list above) that caption covers — do NOT produce startMs/endMs yourself, the app computes the caption's real timing directly from the ORIGINAL transcript word timestamps at those indices, so just cite the correct index range and its timing will always be exactly right. This applies REGARDLESS of how the caption TEXT is rephrased below — rephrasing changes the WRITTEN TEXT only, never which original word range the caption's timing is derived from. Captions should not overlap (each word index belongs to at most one caption) and should be in chronological order (sourceWordStartIndex strictly increasing across captions).${
@@ -284,7 +309,7 @@ TASK 2 — zoom: Zoom should feel motivated by the SPEECH, not decorative or ran
 - A word or short phrase spoken with clear emotional emphasis (the video-understanding emotion beats above are a strong signal for this when available).
 Choose a named "style" for every zoom, matched to what's actually happening — never default to the same style repeatedly:
 ${ZOOM_STYLE_GUIDE}
-Vary the intensity by how strong the moment is — don't use the same scaleTo every time: a mild emphasis might be 105-110%, a stronger one 115%, a genuine peak moment up to 120% (never above 150 regardless; "pull_out" reverses scaleFrom/scaleTo instead). Keep scaleFrom around 100 (native size) except for "pull_out". AVOID REPETITIVE RHYTHM — never on a fixed interval, never the identical scale value or style for every window; if you're proposing several zooms across the video, vary spacing, intensity, AND style so it doesn't read as a metronome. Propose 0 to 5 zoom windows total depending on how many of the above genuinely occur — it's fine to propose zero for a video with no real emphasis moments, questions, or numbers; a zoom with no real motivation is worse than no zoom at all.
+Vary the intensity by how strong the moment is — don't use the same scaleTo every time: a mild emphasis might be 105-110%, a stronger one 115%, a genuine peak moment up to 120% (never above 150 regardless; "pull_out" reverses scaleFrom/scaleTo instead). Keep scaleFrom around 100 (native size) except for "pull_out". AVOID REPETITIVE RHYTHM — never on a fixed interval, never the identical scale value or style for every window; if you're proposing several zooms across the video, vary spacing, intensity, AND style so it doesn't read as a metronome. ${zoomCountGuidance} A zoom with no real motivation is worse than no zoom at all.
 
 TASK 3 — broll: ${brollDensityGuidance}${stockOnlyGuidance} understand what the speaker MEANS, not just the words they used — semantic intent, not literal keyword matching. Example: the phrase "I invested" should search concepts like "stock market", "investor", "finance", "money graph", "business growth" — NOT a literal, generic re-enactment like "person investing". EDITORIAL VALUE GATE — never propose a slot just because a word happened to match something photographable: before proposing one, ask "does cutting away HERE genuinely increase understanding (illustrating something abstract or hard to picture), emotion (reinforcing what the moment feels like), or retention (breaking up a stretch that would otherwise sit static too long)?" If the honest answer is "not really, it's just a keyword," skip it — a talking head holding for a few more seconds beats a pointless cutaway. Only propose a slot where the underlying idea is genuinely concrete and visualizable AND clears this bar.
 
@@ -307,7 +332,7 @@ TASK 4 — stickers: Propose 0-3 sticker/icon overlays based on the TOPIC actual
 TASK 5 — music and sfx:
 - music: propose AT MOST ONE background music bed for the whole video, only if the content genuinely calls for one (skip it for a plain talking-head clip with no clear mood to underscore — silence is a valid choice). First identify which CATEGORY the content actually fits — business, corporate, finance, motivational, healthcare, calm, podcast, minimal, comedy, fun, travel, or cinematic — then set "searchQuery" to a short mood/style/genre phrase matching that category (e.g. "upbeat corporate" for business, "calm ambient piano" for healthcare/calm, "motivational cinematic build" for motivational), informed by the style preset above if one was given. Leave "duckingEnabled" and "duckingVoiceTrackHint" unset unless you have a specific reason to override the defaults (duckingEnabled defaults to true — the music automatically ducks under speech and fades appropriately; omitting duckingVoiceTrackHint auto-ducks every voice track in the project, which is almost always what's wanted). Never set assetId, resolvedAssetUrl, or resolutionNote.
   MUSIC MUST EVOLVE — a flat, unchanging bed reads as robotic. Set "volumeEnvelope" to 3-6 points across the video's own timeline, each {"atFraction": a number 0-1 where 0=start and 1=end, "volumeLevel": a number 0-100}, shaping a real arc that MATCHES what's actually happening at each fraction: build through the hook/opening, briefly PULL BACK (a real dip, not just a smaller rise) right at any pattern-interrupt/topic-change moment so it doesn't fight the speaker, rise again into the next payoff, ease off during a moment that should breathe (a strong statement, a genuine pause), and lift toward the end for the CTA. Never a flat line (every point the same volumeLevel) and never a straight, one-directional ramp — real music breathes up AND down more than once. This envelope is on top of real-time ducking under speech, which still happens automatically regardless.
-- sfx: propose 0-4 short one-shot sound effects (most videos genuinely warrant 0-2, not the ceiling) tied to genuine TIMELINE EVENTS, not sprinkled arbitrarily — a whoosh or swipe at a b-roll cut or transition, a pop or click at a caption's punchy entrance or a sticker appearing, an impact or text-pop at the video's single strongest emphasis moment, a sparkle at a positive/success beat. Reuse the video-understanding emphasis moments given above as your primary cue for WHERE when available. Silence is often stronger than sound — the default answer to "should I add an SFX here" is no; NEVER SPAM, only propose more than 1-2 when there are truly that many distinct, real cut/emphasis events to accent, the way a real professional editor's SFX should feel INVISIBLE, felt more than consciously heard. Set "assetQuery" to a short literal sound description (e.g. "whoosh", "swipe", "click", "pop", "impact", "sparkle", "transition", "text pop") and "atMs" to the specific instant. Never set assetId, resolvedAssetUrl, or resolutionNote.
+- sfx: ${sfxCountGuidance} tied to genuine TIMELINE EVENTS, not sprinkled arbitrarily — a whoosh or swipe at a b-roll cut or transition, a pop or click at a caption's punchy entrance or a sticker appearing, an impact or text-pop at the video's single strongest emphasis moment, a sparkle at a positive/success beat. Reuse the video-understanding emphasis moments given above as your primary cue for WHERE when available. Silence is often stronger than sound — the default answer to "should I add an SFX here" is no; NEVER SPAM, only propose more than 1-2 when there are truly that many distinct, real cut/emphasis events to accent, the way a real professional editor's SFX should feel INVISIBLE, felt more than consciously heard. Set "assetQuery" to a short literal sound description (e.g. "whoosh", "swipe", "click", "pop", "impact", "sparkle", "transition", "text pop") and "atMs" to the specific instant. Never set assetId, resolvedAssetUrl, or resolutionNote.
 
 TASK 6 — transitions: ${boundaryGuidance} Propose a transition ONLY at a boundary that's a genuine scene change or beat-relevant moment (e.g. a cut immediately after a bad take or long silence was removed) — never on every single boundary reflexively; it's completely fine to propose zero. For each one, set "betweenClipIds" to EXACTLY ["__scene_segment_N__", "__scene_segment_N+1__"] (literal strings, substituting the real boundary index for N on both sides — e.g. ["__scene_segment_0__", "__scene_segment_1__"]), "type" to one of "CROSSFADE"|"DISSOLVE"|"WIPE"|"SLIDE"|"ZOOM"|"FLASH" (vary the TYPE across the video if you propose more than one — don't reuse the same one boundary after boundary), and "durationMs" (typically 300-800, genuinely varied per transition, not the identical value every time). Do NOT invent real-looking clip ids — only this exact "__scene_segment_N__" placeholder format is understood.
 
@@ -682,12 +707,19 @@ const ZOOM_STYLE_GUIDE = `- "fast_punch": a quick, snappy push-in (under ~200ms)
 // Agent 5 — "Visuals": B-roll + Motion (zoom/camera-punch) + Transitions.
 function buildVisualsPrompt(req: ReasoningVisualsRequest): string {
   const brollRange = computeBrollTargetRange(req.sourceDurationMs, req.brollDensity);
-  const brollDensityGuidance =
-    req.brollDensity === "MINIMAL"
+  // Same defer-to-densityGuidance pattern as legacy buildPrompt() — see
+  // that function's own comment for the full rationale.
+  const brollDensityGuidance = req.densityGuidance
+    ? `Follow the EDITING RHYTHM guidance above for how MANY b-roll slots to aim for and how far apart to space them — this section is about WHAT makes a good one, not the count.`
+    : req.brollDensity === "MINIMAL"
       ? `B-roll density: LIGHT. Aim for roughly ${brollRange.min}-${brollRange.max} b-roll slots for this video's length (~1-3 per minute) — only for moments that clearly stand out.`
       : req.brollDensity === "HEAVY"
         ? `B-roll density: HEAVY. Aim for roughly ${brollRange.min}-${brollRange.max} b-roll slots for this video's length (~6-12 per minute — the video's visual should genuinely change every few seconds). It is a real failure mode to land far below this range — if short of the target, look again at every sentence for a noun/location/product/action/person/brand you skipped.`
         : `B-roll density: MEDIUM (default). Aim for roughly ${brollRange.min}-${brollRange.max} b-roll slots for this video's length (~3-6 per minute).`;
+  const zoomCountGuidance = req.densityGuidance
+    ? "Follow the EDITING RHYTHM guidance above for roughly how often to reach for a zoom."
+    : "Propose 0-5 total — quality over quantity.";
+  const densitySection = req.densityGuidance ? `\n${req.densityGuidance}\n` : "";
   const stockOnlyGuidance = req.brollStockOnly
     ? `\nPOLICY OVERRIDE — generation is disabled. Every b-roll item MUST have "source": "stock" with a real "searchQuery" — never "generate".`
     : "";
@@ -713,7 +745,7 @@ ${buildVideoAnalysisFragment(req.videoAnalysis, "No video-understanding analysis
 Finalized captions (for real timing/pacing context): ${JSON.stringify(req.captions.map((c) => ({ text: c.text, startMs: c.startMs, endMs: c.endMs })))}
 Story beats (know where pattern-interrupt/visual-reward/proof moments land — anchor extra visual energy there): ${JSON.stringify(req.storyBeats)}
 ${varietySection}
-
+${densitySection}
 Source media duration: ${req.sourceDurationMs}ms. Every timestamp must be within [0, ${req.sourceDurationMs}].
 
 TASK — B-ROLL (semantic intent, not literal words — TASK 3): understand what the speaker MEANS, not just the words they used. Example: the phrase "I invested" should search concepts like "stock market", "investor", "finance", "money graph", "business growth" — NOT a literal, generic re-enactment like "person investing". Ask yourself what a professional editor would actually cut to for this moment's underlying IDEA. ${brollDensityGuidance}${stockOnlyGuidance}
@@ -722,7 +754,7 @@ EDITORIAL VALUE GATE — never propose a b-roll slot just because a word happene
 
 TASK — MOTION / SMART ZOOMS (TASK 5): propose a zoom window when the transcript signals a moment worth pushing in on. Choose a named "style" for every zoom from this set, matched to what's actually happening — never default to the same style repeatedly:
 ${ZOOM_STYLE_GUIDE}
-Vary both the style AND intensity (scaleTo 105-120% for most styles, keep scaleFrom around 100 except "pull_out" which reverses that) — AVOID REPETITIVE RHYTHM, both in spacing (don't zoom on a fixed interval) and in which style you reach for. Set a short "reason" naming which trigger justified this zoom AND why this style fits it. Propose 0-5 total — quality over quantity; a zoom with no real motivation is worse than no zoom at all.
+Vary both the style AND intensity (scaleTo 105-120% for most styles, keep scaleFrom around 100 except "pull_out" which reverses that) — AVOID REPETITIVE RHYTHM, both in spacing (don't zoom on a fixed interval) and in which style you reach for. Set a short "reason" naming which trigger justified this zoom AND why this style fits it. ${zoomCountGuidance} A zoom with no real motivation is worse than no zoom at all.
 
 TASK — TRANSITIONS: ${boundaryGuidance} Propose a transition ONLY at a genuine scene-change/beat-relevant boundary — never reflexively on every boundary. For each, set "betweenClipIds" to EXACTLY ["__scene_segment_N__", "__scene_segment_N+1__"], "type" (CROSSFADE|DISSOLVE|WIPE|SLIDE|ZOOM|FLASH — vary the TYPE across the video, don't reuse the same one boundary after boundary), "durationMs" (300-800, genuinely varied per transition — not the identical value every time), and a short "reason".
 
@@ -742,6 +774,10 @@ function buildAudioPrompt(req: ReasoningAudioRequest): string {
   const sfxVariety = req.usedSfxQueries?.length
     ? `\nAlready used this video: ${JSON.stringify(req.usedSfxQueries)} — vary your choices instead of repeating any of these.`
     : "";
+  const sfxCountGuidance = req.densityGuidance
+    ? "Follow the EDITING RHYTHM guidance above for the maximum SFX count for this video."
+    : "Propose 0-4 short one-shot sound effects (most videos genuinely warrant 0-2, not the ceiling),";
+  const densitySection = req.densityGuidance ? `\n${req.densityGuidance}\n` : "";
 
   return `You are the Audio agent (Music + Sound Effects) inside an AI Video Director. SFX must feel INVISIBLE to a professional editor — an amateur should just feel the edit is energetic, never notice individual effects landing.
 
@@ -751,12 +787,12 @@ B-roll cuts: ${JSON.stringify(req.broll.map((b) => ({ startMs: b.startMs, endMs:
 Transitions: ${JSON.stringify(req.transitions.map((t) => ({ durationMs: t.durationMs })))}
 Story beats: ${JSON.stringify(req.storyBeats)}
 ${sfxVariety}
-
+${densitySection}
 Source media duration: ${req.sourceDurationMs}ms.
 
 TASK — MUSIC: propose AT MOST ONE background music bed, only if the content genuinely calls for one (a plain talking-head clip with no clear mood is a valid case for none — silence is a valid choice). Identify the CATEGORY the content fits — business, corporate, finance, motivational, healthcare, calm, podcast, minimal, comedy, fun, travel, or cinematic — driven by the content's actual emotion, topic, energy, pacing, and likely audience, then set "searchQuery" to a short mood/style/genre phrase matching that category. This bed's energy will automatically behave like a real editor's mix downstream — building, pausing at a pattern interrupt, rising again into the payoff, releasing for proof, uplifting toward the CTA — NEVER a flat, unchanging level. Pick a track whose own character can support that real movement (has genuine dynamic range in the source track itself), not one that's already maxed-out/loud throughout. Leave "duckingEnabled"/"duckingVoiceTrackHint" unset unless you have a specific reason to override the defaults (ducking auto-enabled). Set a short "reason". Never set assetId/resolvedAssetUrl/resolutionNote.
 
-TASK — SFX (fire only on real events, use VERY sparingly — TASK 8): silence is often stronger than sound — the default answer to "should I add an SFX here" is no. Propose 0-4 short one-shot sound effects (most videos genuinely warrant 0-2, not the ceiling), EACH tied to one of exactly these timeline events — a zoom landing (whoosh/impact matching the zoom's own style), a number/statistic being said, an emoji/icon-style sticker appearing, a transition, a caption's punchy pop-in entrance, or a genuine reveal/surprise moment. Never propose one for any other reason, and never propose one just because a slot is available. NEVER SPAM; a real professional editor's SFX should feel INVISIBLE, felt more than consciously heard — if you're unsure whether a moment truly needs one, leave it out. Set "assetQuery" (e.g. "whoosh", "swipe", "click", "pop", "impact", "sparkle", "transition", "text pop"), "atMs", and a short "reason" naming which specific event above justified it and why the moment genuinely needed sound rather than silence. Never set assetId/resolvedAssetUrl/resolutionNote.
+TASK — SFX (fire only on real events, use VERY sparingly — TASK 8): silence is often stronger than sound — the default answer to "should I add an SFX here" is no. ${sfxCountGuidance} EACH tied to one of exactly these timeline events — a zoom landing (whoosh/impact matching the zoom's own style), a number/statistic being said, an emoji/icon-style sticker appearing, a transition, a caption's punchy pop-in entrance, or a genuine reveal/surprise moment. Never propose one for any other reason, and never propose one just because a slot is available. NEVER SPAM; a real professional editor's SFX should feel INVISIBLE, felt more than consciously heard — if you're unsure whether a moment truly needs one, leave it out. Set "assetQuery" (e.g. "whoosh", "swipe", "click", "pop", "impact", "sparkle", "transition", "text pop"), "atMs", and a short "reason" naming which specific event above justified it and why the moment genuinely needed sound rather than silence. Never set assetId/resolvedAssetUrl/resolutionNote.
 
 Respond with ONLY a single JSON object, no other text, matching exactly this shape:
 {

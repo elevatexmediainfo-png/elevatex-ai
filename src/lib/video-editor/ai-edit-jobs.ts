@@ -22,6 +22,7 @@ import { scoreAiTimelinePlan, AI_EDIT_QUALITY_RETRY_THRESHOLD } from "./ai-edit-
 import { runDirectorPipeline } from "./director/orchestrator";
 import { applyNoDeadScreenFixes, computeSourceSurvivingWindows, computeVisualCoverage, findDeadScreenGaps } from "./director/visual-coverage";
 import { createEmptyVarietyLedger } from "./director/variety-ledger";
+import { computeSpeechCharacteristics, computeFootageCharacteristics, computeAdaptiveDensityTargets, describeDensityGuidanceForPrompt, computeActualDensities, scoreDensityAlignment } from "./editing-density";
 import {
   aiTimelinePlanSchema,
   AI_TIMELINE_SCHEMA_VERSION,
@@ -435,6 +436,30 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     // runs at all if AT LEAST ONE of those 7 modules was selected; whichever
     // of its 7 output sections weren't selected are discarded immediately
     // below, before they ever reach asset resolution or the assembled plan.
+    // Editing-density calibration (2026-08-08, founder request — "calibrate
+    // against measurable editing density... target editing rhythm instead
+    // of target clip counts"). Computed ONCE here, from data this scope
+    // already has (no new vendor calls), and handed to BOTH the legacy and
+    // Director planning paths below so a single HEAVY/BALANCED/MINIMAL
+    // preset genuinely produces different real output depending on THIS
+    // video's own speaking pace, footage variety, emotional intensity, and
+    // vocabulary richness — never a fixed per-video slot count. See
+    // editing-density.ts's own doc comment for the full rationale.
+    const densityPreset = (job.brollDensity as "MINIMAL" | "BALANCED" | "HEAVY" | undefined) ?? undefined;
+    const speechCharacteristics = computeSpeechCharacteristics(transcript.words);
+    const footageCharacteristics = computeFootageCharacteristics(
+      videoAnalysis
+        ? { emphasisMoments: videoAnalysis.emphasisMoments, emotionBeats: videoAnalysis.emotionBeats, visualContext: videoAnalysis.visualContext, gestures: videoAnalysis.gestures }
+        : null,
+      sourceDurationMs
+    );
+    const adaptiveDensityTargets = computeAdaptiveDensityTargets(speechCharacteristics, footageCharacteristics, densityPreset);
+    const densityGuidance = describeDensityGuidanceForPrompt(adaptiveDensityTargets);
+    logger.info(
+      { jobId, densityPreset, speakingRateWpm: Math.round(speechCharacteristics.speakingRateWpm), paceBucket: speechCharacteristics.paceBucket, adjustmentNotes: adaptiveDensityTargets.adjustmentNotes },
+      "[ai edit job] computed adaptive editing-density guidance for this video"
+    );
+
     if (TIMELINE_PLANNING_MODULES.some(wantsModule)) {
       // AI Video Director (2026-08-07) — feature flag, default OFF. While
       // off, everything below this branch is the ORIGINAL single-call
@@ -465,6 +490,7 @@ export async function processAiEditJob(jobId: string): Promise<void> {
               brollStockOnly: job.brollStockOnly,
               referenceScript: job.script ?? undefined,
               repairMaxAttempts: repairMaxAttemptsForDirector,
+              densityGuidance,
             },
             wantsModule,
           });
@@ -505,6 +531,7 @@ export async function processAiEditJob(jobId: string): Promise<void> {
         sourceDurationMs,
         survivingSegmentCount,
         repairMaxAttempts,
+        densityGuidance,
       };
 
       // Re-bound to plain consts — TypeScript's control-flow narrowing
@@ -548,6 +575,12 @@ export async function processAiEditJob(jobId: string): Promise<void> {
             pacingInScope: wantsModule("sceneRemoval") || wantsModule("captions"),
           }
         );
+        // Editing-density alignment (2026-08-08) — measures this ATTEMPT's
+        // real generated densities against the adaptive targets computed
+        // above, purely deterministic (zero extra LLM cost), and feeds the
+        // SAME existing bounded retry decision below rather than adding a
+        // second loop.
+        const densityAlignment = scoreDensityAlignment(computeActualDensities({ sceneRemoval, captions: attemptCaptions, zoom: attemptZoom, broll: attemptBroll, stickers: attemptStickers, sfx: attemptSfx }, sourceDurationMs), adaptiveDensityTargets);
         return {
           captions: attemptCaptions,
           zoom: attemptZoom,
@@ -559,6 +592,7 @@ export async function processAiEditJob(jobId: string): Promise<void> {
           reasoningCostUsd: planResult.costUsd ?? 0,
           warnings: planResult.warnings,
           scores,
+          densityAlignment,
         };
       }
 
@@ -579,11 +613,23 @@ export async function processAiEditJob(jobId: string): Promise<void> {
         // pipeline (AI_EDIT_DIRECTOR_PIPELINE_ENABLED) has its own,
         // separately-configured iterative loop (director/orchestrator.ts)
         // that reads AI_EDIT_QUALITY_TARGET_SCORE instead.
-        if (best.scores.editingScore < AI_EDIT_QUALITY_RETRY_THRESHOLD) {
-          logger.info({ jobId, scores: best.scores }, "[ai edit job] first planning attempt scored below the quality threshold — retrying once");
+        // Editing-density alignment (2026-08-08) is an ADDITIONAL trigger
+        // for this SAME existing bounded retry — not a second loop. A
+        // structurally fine plan (high editingScore) can still land far
+        // outside this video's own adaptive rhythm target (e.g. way too
+        // few b-roll slots for a slow speaker's calculated target); that's
+        // exactly the failure mode the founder's density-calibration
+        // request is about, so it earns the same one-shot regenerate.
+        if (best.densityAlignment.misalignments.length > 0) {
+          logger.info({ jobId, densityAlignment: best.densityAlignment }, "[ai edit job] first planning attempt's editing density is misaligned with this video's adaptive target");
+        }
+        if (best.scores.editingScore < AI_EDIT_QUALITY_RETRY_THRESHOLD || best.densityAlignment.score < AI_EDIT_QUALITY_RETRY_THRESHOLD) {
+          logger.info({ jobId, scores: best.scores, densityAlignmentScore: best.densityAlignment.score }, "[ai edit job] first planning attempt scored below the quality or density-alignment threshold — retrying once");
           try {
             const retry = await attemptPlanning();
-            if (retry.scores.editingScore > best.scores.editingScore) best = retry;
+            const bestCombined = best.scores.editingScore + best.densityAlignment.score;
+            const retryCombined = retry.scores.editingScore + retry.densityAlignment.score;
+            if (retryCombined > bestCombined) best = retry;
           } catch (retryErr) {
             // The retry failing is never fatal — the FIRST attempt already
             // succeeded and is still fully usable, just lower-scoring.
@@ -600,6 +646,10 @@ export async function processAiEditJob(jobId: string): Promise<void> {
         transitions = best.transitions;
         reasoningCostUsd = best.reasoningCostUsd;
         attemptScores = best.scores;
+        logger.info(
+          { jobId, densityAlignmentScore: best.densityAlignment.score, remainingMisalignments: best.densityAlignment.misalignments },
+          "[ai edit job] final selected plan's editing-density alignment"
+        );
 
         // Quality-calibration pass (2026-08-07, live human-editor review) —
         // this deterministic "no dead screen" gap-fixer (visual-coverage.ts)
