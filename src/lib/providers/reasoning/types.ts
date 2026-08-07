@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { GenerationProvider } from "@/lib/generation/types";
 import {
   AI_QUALITY_CATEGORIES,
+  AI_ZOOM_STYLES,
   aiBrollSchema,
   aiCaptionHighlightWordSchema,
   aiCaptionRevealSchema,
@@ -104,6 +105,9 @@ export const reasoningZoomItemSchema = z
     endMs: z.number().int().min(0),
     scaleFrom: z.number().min(1).max(1000),
     scaleTo: z.number().min(1).max(1000),
+    // Quality upgrade (2026-08-07, TASK 5 — "smart zooms") — see
+    // AI_ZOOM_STYLES' own doc comment (validations/ai-timeline.ts).
+    style: z.enum(AI_ZOOM_STYLES).optional(),
     // AI Video Director (2026-08-07) — see aiCaptionSchema's own doc
     // comment (validations/ai-timeline.ts) for the shared reason-field
     // convention. Optional so plan()'s own legacy zoom output (which
@@ -442,12 +446,15 @@ export interface ReasoningAudioResult {
   warnings?: string[];
 }
 
-// Agent 7 — Quality Reviewer. Scores ONLY the 4 categories that genuinely
-// require judgment (Hook/Emotion/Retention/Story Flow) — everything
-// structurally measurable (Captions/B-roll/Visual Variety/Pacing/Music/
-// SFX) is scored deterministically by quality-review.ts without any LLM
-// call. `deterministicScores` is fed IN so this call can reason about the
-// full picture without re-deriving what's already known.
+// Agent 7 — Quality Reviewer. Scores ONLY the 3 categories that genuinely
+// require judgment (Hook/Retention/Story) — everything structurally
+// measurable (Captions/B-roll/Music/SFX/Zoom/Visual Variety/Editing
+// Rhythm) is scored deterministically by quality-review.ts without any
+// LLM call. `deterministicScores` is fed IN so this call can reason about
+// the full picture without re-deriving what's already known. Narrowed
+// from 4 judged categories to 3 (2026-08-07, TASK 10 quality-upgrade
+// pass) — "emotion" dropped, "zoom" moved to deterministic — a genuine
+// simplification, not just a rename.
 export interface ReasoningQualityReviewRequest {
   storySummary: { hookText: string; beats: AIStoryBeat[]; retentionScore: number };
   captions: AICaption[];
@@ -465,14 +472,12 @@ export interface ReasoningQualityReviewRequest {
 export const reasoningQualityReviewOutputSchema = z.object({
   hookScore: z.number().min(0).max(100),
   hookNote: z.string().min(1).max(280).optional(),
-  emotionScore: z.number().min(0).max(100),
-  emotionNote: z.string().min(1).max(280).optional(),
   retentionScore: z.number().min(0).max(100),
   retentionNote: z.string().min(1).max(280).optional(),
-  storyFlowScore: z.number().min(0).max(100),
-  storyFlowNote: z.string().min(1).max(280).optional(),
+  storyScore: z.number().min(0).max(100),
+  storyNote: z.string().min(1).max(280).optional(),
   // Which categories (from the full AI_QUALITY_CATEGORIES set, not just
-  // this call's own 4 judged ones) the model itself flags as weak —
+  // this call's own 3 judged ones) the model itself flags as weak —
   // advisory input to quality-review.ts's own routing; the deterministic
   // categories' weakness is still decided by their own scorers, not by
   // asking the model to self-report on numbers it never computed.
@@ -483,12 +488,10 @@ export type ReasoningQualityReviewOutput = z.infer<typeof reasoningQualityReview
 export interface ReasoningQualityReviewResult {
   hookScore: number;
   hookNote?: string;
-  emotionScore: number;
-  emotionNote?: string;
   retentionScore: number;
   retentionNote?: string;
-  storyFlowScore: number;
-  storyFlowNote?: string;
+  storyScore: number;
+  storyNote?: string;
   weakCategories: AiQualityCategory[];
   providerRef?: string;
   usage?: { tokens?: number };

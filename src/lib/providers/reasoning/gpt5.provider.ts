@@ -171,6 +171,25 @@ const CAPTION_VOICE_AND_HIGHLIGHT_GUIDANCE = `CAPTION VOICE — write viral, hoo
 
 POWER-WORD HIGHLIGHTING — for a caption whose wording genuinely has 1-3 standout words (not every caption needs this), set "highlightWords" to color just those words, using ONLY these five colors: white (#FFFFFF, the default/remaining-text color — you don't need to set this explicitly on non-highlighted words), yellow (#FFD60A), red (#FF3B30), green (#34C759), blue (#0A84FF). Use color to signal SEVERITY/TYPE, not decoration: red for warnings/negatives/urgency ("DON'T", "STOP", "NEVER"), yellow for the key subject/attention word, green for positive/success framing, blue for neutral informational emphasis (a number, a named thing). Example: for the caption "DON'T IGNORE DIABETES", you might set highlightWords to [{"word":"DON'T","color":"#FF3B30"},{"word":"IGNORE","color":"#FFD60A"}], leaving "DIABETES" as the default white. Each "word" must be spelled EXACTLY as it appears in this caption's own "text" (case-insensitive match is fine, but the letters must match).`;
 
+// AI Video Director quality upgrade (2026-08-07, TASK 6 — "viral
+// captions") — a Director-pipeline-ONLY enhancement of the caption
+// engine above. Deliberately a SEPARATE constant, not an edit to
+// CAPTION_VOICE_AND_HIGHLIGHT_GUIDANCE itself: that constant is shared
+// with the legacy single-call buildPrompt() (TASK 1 there), and this
+// whole quality-upgrade pass is scoped to the Director pipeline only —
+// editing the shared constant would change the legacy path's prompt
+// wording too, breaking the "legacy path stays byte-identical while
+// AI_EDIT_DIRECTOR_PIPELINE_ENABLED is off" contract the whole Director
+// delivery is built on. Builds on the same base guidance (still reused,
+// not duplicated) plus: an explicit Hinglish RESTRUCTURING example (not
+// just a script-register example), a finance/motivational highlight
+// vocabulary, and an explicit "2-4 colors" instruction.
+const DIRECTOR_CAPTION_VOICE_AND_HIGHLIGHT_GUIDANCE = `${CAPTION_VOICE_AND_HIGHLIGHT_GUIDANCE}
+
+CAPTION OUTPUT FORMAT — you are writing a SOCIAL MEDIA CAPTION, not a subtitle. A subtitle transcribes; a caption RESTRUCTURES for readability and punch, even when no words need to change meaning. Example: the spoken line "Aaj hum investment seekhenge" becomes the caption "Aaj Investment Seekhte Hai" — reordered/reworded into a punchier, more natural on-screen phrasing, with the key subject word given Title Case even outside of highlightWords. Apply this restructuring instinct to every caption, not just ones with an obvious rephrase.
+
+HIGHLIGHT VOCABULARY — beyond the power words already listed above, actively look for these finance/motivational/business terms and highlight them when they genuinely appear (same 5-color rule, same "1-3 words, never force it" limit): Investment, Money, Profit, Growth, Business, Success, Mistake, Secret, Truth, Reality. Across a caption's highlighted words, use 2-4 DIFFERENT colors (not the same color repeated on every highlighted word) — color variety itself is part of what reads as "designed," not "default."`;
+
 function buildPrompt(req: ReasoningPlanRequest): string {
   const videoSection = req.videoAnalysis
     ? `\nVideo-understanding analysis (from watching the footage):
@@ -629,11 +648,25 @@ ${ctaSection}
 
 Segment the transcript into natural caption chunks (roughly sentence or clause length). For each caption, set "sourceWordStartIndex" and "sourceWordEndIndex" to the FIRST and LAST numbered word index that caption covers — do NOT produce startMs/endMs yourself, the app computes real timing directly from the ORIGINAL transcript word timestamps at those indices. Captions should not overlap and should be in chronological order (sourceWordStartIndex strictly increasing).
 
-${CAPTION_VOICE_AND_HIGHLIGHT_GUIDANCE}
+${DIRECTOR_CAPTION_VOICE_AND_HIGHLIGHT_GUIDANCE}
 
 Respond with ONLY a single JSON object, no other text, matching exactly this shape:
 { "captions": [{ "text": string, "sourceWordStartIndex": number, "sourceWordEndIndex": number, "reveal"?: { "mode": "NONE"|"WORD"|"CHARACTER"|"KARAOKE", "unitDurationMs": number, "style": "FADE"|"POP"|"COLOR_SWEEP", "highlightColor": string }, "style"?: { "fontWeight"?: number, "color"?: string, "fontSize"?: number, "fontFamily"?: string, "position"?: "top"|"center"|"bottom" }, "highlightWords"?: [{ "word": string, "color": string }] }] }`;
 }
+
+// Quality upgrade (2026-08-07, TASK 5 — "smart zooms") — 8 named style
+// archetypes a real editor reaches for, rather than reasoning about raw
+// scaleFrom/scaleTo numbers in isolation. Shared between the prompt text
+// below and the anti-repetition instruction, so the exact wording can't
+// drift between the two.
+const ZOOM_STYLE_GUIDE = `- "fast_punch": a quick, snappy push-in (under ~200ms) landing hard on a word — for a sudden emphasis or a punchline.
+- "slow_push": a gradual, cinematic push-in over a longer window — for a serious or emotional moment that deserves to build.
+- "micro": a very small, subtle scale change (105-108%) — for a quiet moment that still needs SOME life, not a big statement.
+- "pull_out": scaleFrom higher than scaleTo (zooming OUT, not in) — for a reveal or a "here's the bigger picture" moment.
+- "shake_punch": a fast push-in for a high-energy/shock moment (pairs naturally with a strong SFX from the Audio agent downstream).
+- "question_zoom": a push-in landing exactly on a question being asked.
+- "number_zoom": a push-in landing exactly on a specific number/statistic/list item being said.
+- "reveal_zoom": a push-in timed to land right as new information/a surprising fact is revealed.`;
 
 // Agent 5 — "Visuals": B-roll + Motion (zoom/camera-punch) + Transitions.
 function buildVisualsPrompt(req: ReasoningVisualsRequest): string {
@@ -648,15 +681,17 @@ function buildVisualsPrompt(req: ReasoningVisualsRequest): string {
     ? `\nPOLICY OVERRIDE — generation is disabled. Every b-roll item MUST have "source": "stock" with a real "searchQuery" — never "generate".`
     : "";
   const varietySection =
-    (req.usedZoomStyles?.length || req.usedTransitionTypes?.length || req.usedStickerQueries?.length || req.usedBrollStyles?.length)
-      ? `\nVISUAL VARIETY — never repeat the exact same zoom intensity/transition type/sticker/b-roll style twice in one video; already used this video: zoom styles ${JSON.stringify(req.usedZoomStyles ?? [])}, transition types ${JSON.stringify(req.usedTransitionTypes ?? [])}, sticker queries ${JSON.stringify(req.usedStickerQueries ?? [])}, b-roll styles ${JSON.stringify(req.usedBrollStyles ?? [])} — genuinely vary your choices instead of repeating any of these.`
-      : `\nVISUAL VARIETY — never repeat the exact same zoom intensity/transition type/sticker/b-roll style twice in one video; create natural variation.`;
+    req.usedZoomStyles?.length || req.usedTransitionTypes?.length || req.usedStickerQueries?.length || req.usedBrollStyles?.length
+      ? `\nVISUAL VARIETY (maintain a diversity score — TASK 9) — already used this video: zoom styles ${JSON.stringify(req.usedZoomStyles ?? [])}, transition types ${JSON.stringify(req.usedTransitionTypes ?? [])}, sticker queries ${JSON.stringify(req.usedStickerQueries ?? [])}, b-roll styles ${JSON.stringify(req.usedBrollStyles ?? [])}. Do not propose the same zoom style, transition type, sticker, or b-roll style you already used — ALTERNATE genuinely, the same way a human editor consciously varies their toolkit shot to shot rather than reaching for the same effect out of habit.`
+      : `\nVISUAL VARIETY (maintain a diversity score — TASK 9) — nothing used yet this video; still plan for variety across the whole edit, not just this one call — don't propose the same zoom style/transition/sticker/b-roll style more than once or twice in a row.`;
   const boundaryGuidance =
     req.survivingSegmentCount >= 2
       ? `There will be ${req.survivingSegmentCount} surviving segments of the main clip after the already-decided scene removal — you can propose transitions at boundary indices 0 through ${req.survivingSegmentCount - 2}.`
       : `There is only 1 surviving segment of the main clip — there are NO internal boundaries. Propose zero transitions.`;
 
-  return `You are the Visuals agent (B-roll + Motion + Transitions) inside an AI Video Director — a senior short-form video editor planning NO DEAD SCREEN: no talking-head shot should remain visually unchanged for more than 2 seconds. Every decision should maximize watch time.
+  return `You are the Visuals agent (B-roll + Motion + Transitions + Stickers) inside an AI Video Director — an experienced short-form editor (CapCut AI / Opus Clip / Vidyo.ai tier) planning EXACTLY the way a human editor thinks, second by second: for every moment on screen, deliberately decide whether NOTHING should happen (a clean, uninterrupted beat is a real, valid choice — not every second needs an effect), or whether a zoom, b-roll cutaway, transition, or sticker belongs there — and WHY. Never add an effect just to fill space; every decision needs a real editorial reason, captured in that item's own "reason" field.
+
+RETENTION CURVE (TASK 2) — predict where a viewer would drop off and prevent it: introduce a genuine visual change roughly every 2-4 seconds WHEN THE CONTENT ACTUALLY SUPPORTS IT (never force one into a moment with nothing to show) — a talking head must never sit static and unchanged for more than ~2 seconds without SOME visual event (zoom, b-roll, sticker, or an upcoming transition) covering it. Build RHYTHM by alternating between zoom / b-roll / sticker / motion graphic / camera-punch-style zoom rather than leaning on one tool repeatedly — see VISUAL VARIETY below for the concrete anti-repetition rule this implies.
 
 Transcript words (format "index:word@startMs-endMs", numbered 0 to ${req.words.length - 1}):
 ${formatWords(req.words)}
@@ -668,9 +703,11 @@ ${varietySection}
 
 Source media duration: ${req.sourceDurationMs}ms. Every timestamp must be within [0, ${req.sourceDurationMs}].
 
-TASK — B-ROLL: ${brollDensityGuidance}${stockOnlyGuidance} Only propose a slot where the transcript mentions something concrete and visualizable. Placement is NOT evenly spaced or random — anchor to genuine TRIGGERS: a topic change, a sentence carrying real informational weight, or a concrete mention (important nouns, locations, products, actions, people, brands). At HEAVY density, scan for ALL adjacent concrete visuals a topic implies, not just the one or two most obvious nouns — prefer Indian context where the content itself is Indian/Hinglish. For each slot set "trackHint":"broll", startMs/endMs (1-4s window), "source" ("stock" whenever a decent keyword search would plausibly turn up something usable — this is nearly always the right choice; "generate" only for genuinely unphotographable content), "searchQuery" (2-5 literal keywords) AND "searchQueries" (3-8 semantically related expansions — synonyms/category expansions, e.g. a doctor/diabetes moment expands to hospital, patient, medicine, blood test, healthy food, clinic, nutrition, medical examination). Prefer portrait-friendly framing when the described scene naturally allows it. Set "contentKind":"motion_graphic" instead of the default "broll" when the moment calls for an animated graphic/icon-style overlay rather than a literal filmed cutaway. Set a short "reason" explaining why this moment earns a visual. Never set resolvedAssetId/resolvedAssetUrl/resolutionNote/costUsd.
+TASK — B-ROLL (semantic intent, not literal words — TASK 3): understand what the speaker MEANS, not just the words they used. Example: the phrase "I invested" should search concepts like "stock market", "investor", "finance", "money graph", "business growth" — NOT a literal, generic re-enactment like "person investing". Ask yourself what a professional editor would actually cut to for this moment's underlying IDEA. ${brollDensityGuidance}${stockOnlyGuidance} Only propose a slot where the underlying idea is genuinely concrete and visualizable. Placement is NOT evenly spaced or random — anchor to genuine TRIGGERS: a topic change, a sentence carrying real informational weight, or a concrete mention (important nouns, locations, products, actions, people, brands). At HEAVY density, scan for ALL adjacent concrete visuals a topic implies, not just the one or two most obvious nouns — prefer Indian context where the content itself is Indian/Hinglish. For each slot set "trackHint":"broll", startMs/endMs (1-4s window), "source" ("stock" whenever a decent keyword search would plausibly turn up something usable — this is nearly always the right choice; "generate" only for genuinely unphotographable content), "searchQuery" (2-5 literal keywords, your TOP-RANKED choice) AND "searchQueries" (5-10 semantically related expansions, ORDERED BEST-TO-WORST — genuine synonyms/category expansions of the INTENT, not just word-order variations of the same literal phrase; e.g. a doctor/diabetes moment expands to hospital, patient, medicine, blood test, healthy food, clinic, nutrition, medical examination, wellness checkup). Prefer footage that is PORTRAIT-oriented, CINEMATIC (real production value, considered framing — describe the scene with that quality in mind, not a flat generic stock phrase), and has genuine MOVEMENT/motion over a static photo — describe a scene something is actively DOING, not a still pose. Set "contentKind":"motion_graphic" instead of the default "broll" when the moment calls for an animated graphic/icon-style overlay rather than a literal filmed cutaway. Set a short "reason" explaining WHY this specific moment earns a visual and why THIS search direction over other options. Never set resolvedAssetId/resolvedAssetUrl/resolutionNote/costUsd — resolution (including never reusing the same clip twice) happens downstream.
 
-TASK — MOTION (zoom/camera-punch): propose a zoom window when the transcript signals a moment worth pushing in on — a question, a specific number/statistic/list item, or clear emotional emphasis (story beats above are a strong signal). Vary intensity (105-120%, keep scaleFrom around 100) and spacing — AVOID REPETITIVE RHYTHM. Set a short "reason". Propose 0-5 total.
+TASK — MOTION / SMART ZOOMS (TASK 5): propose a zoom window when the transcript signals a moment worth pushing in on. Choose a named "style" for every zoom from this set, matched to what's actually happening — never default to the same style repeatedly:
+${ZOOM_STYLE_GUIDE}
+Vary both the style AND intensity (scaleTo 105-120% for most styles, keep scaleFrom around 100 except "pull_out" which reverses that) — AVOID REPETITIVE RHYTHM, both in spacing (don't zoom on a fixed interval) and in which style you reach for. Set a short "reason" naming which trigger justified this zoom AND why this style fits it. Propose 0-5 total — quality over quantity; a zoom with no real motivation is worse than no zoom at all.
 
 TASK — TRANSITIONS: ${boundaryGuidance} Propose a transition ONLY at a genuine scene-change/beat-relevant boundary — never reflexively on every boundary. For each, set "betweenClipIds" to EXACTLY ["__scene_segment_N__", "__scene_segment_N+1__"], "type" (CROSSFADE|DISSOLVE|WIPE|SLIDE|ZOOM|FLASH), "durationMs" (300-800), and a short "reason".
 
@@ -678,7 +715,7 @@ TASK — STICKERS: propose 0-3 topic-based icon overlays (health -> heart/medici
 
 Respond with ONLY a single JSON object, no other text, matching exactly this shape:
 {
-  "zoom": [{ "startMs": number, "endMs": number, "scaleFrom": number, "scaleTo": number, "reason"?: string }],
+  "zoom": [{ "startMs": number, "endMs": number, "scaleFrom": number, "scaleTo": number, "style"?: "fast_punch"|"slow_push"|"micro"|"pull_out"|"shake_punch"|"question_zoom"|"number_zoom"|"reveal_zoom", "reason"?: string }],
   "broll": [{ "startMs": number, "endMs": number, "trackHint": "broll", "source": "stock"|"generate", "searchQuery"?: string, "searchQueries"?: string[], "generation"?: { "kind": "image"|"video", "prompt": string }, "contentKind"?: "broll"|"motion_graphic", "reason"?: string }],
   "stickers": [{ "startMs": number, "endMs": number, "assetQuery": string, "position"?: { "x": number, "y": number }, "reason"?: string }],
   "transitions": [{ "betweenClipIds": [string, string], "type": "CROSSFADE"|"DISSOLVE"|"WIPE"|"SLIDE"|"ZOOM"|"FLASH", "durationMs": number, "reason"?: string }]
@@ -702,9 +739,9 @@ ${sfxVariety}
 
 Source media duration: ${req.sourceDurationMs}ms.
 
-TASK — MUSIC: propose AT MOST ONE background music bed, only if the content genuinely calls for one (a plain talking-head clip with no clear mood is a valid case for none — silence is a valid choice). Identify the CATEGORY the content fits — business, corporate, finance, motivational, healthcare, calm, podcast, minimal, comedy, fun, travel, or cinematic — driven by the content's actual emotion, topic, energy, pacing, and likely audience, then set "searchQuery" to a short mood/style/genre phrase matching that category. Leave "duckingEnabled"/"duckingVoiceTrackHint" unset unless you have a specific reason to override the defaults (ducking auto-enabled). Set a short "reason". Never set assetId/resolvedAssetUrl/resolutionNote.
+TASK — MUSIC: propose AT MOST ONE background music bed, only if the content genuinely calls for one (a plain talking-head clip with no clear mood is a valid case for none — silence is a valid choice). Identify the CATEGORY the content fits — business, corporate, finance, motivational, healthcare, calm, podcast, minimal, comedy, fun, travel, or cinematic — driven by the content's actual emotion, topic, energy, pacing, and likely audience, then set "searchQuery" to a short mood/style/genre phrase matching that category. This bed's energy will automatically EVOLVE across the video's own story arc downstream (lower under the hook, building through the middle, uplifting toward the CTA) — pick a track that suits that arc rather than one locked to a single unchanging mood. Leave "duckingEnabled"/"duckingVoiceTrackHint" unset unless you have a specific reason to override the defaults (ducking auto-enabled). Set a short "reason". Never set assetId/resolvedAssetUrl/resolutionNote.
 
-TASK — SFX: propose 0-4 short one-shot sound effects tied to genuine TIMELINE EVENTS above (a whoosh/swipe at a b-roll cut or transition, a pop/click at a caption's punchy entrance, an impact/text-pop at the strongest emphasis moment, a sparkle at a positive beat) — NEVER SPAM; most videos genuinely warrant 1-3 at most. Set "assetQuery" (e.g. "whoosh", "swipe", "click", "pop", "impact", "sparkle", "transition", "text pop"), "atMs", and a short "reason". Never set assetId/resolvedAssetUrl/resolutionNote.
+TASK — SFX (fire only on real events — TASK 8): propose 0-4 short one-shot sound effects, EACH tied to one of exactly these timeline events — a zoom landing (whoosh/impact matching the zoom's own style), a number/statistic being said, an emoji/icon-style sticker appearing, a transition, a caption's punchy pop-in entrance, or a genuine reveal/surprise moment. Never propose one for any other reason. NEVER SPAM — most videos genuinely warrant 1-3 at most; a real professional editor's SFX should feel INVISIBLE, felt more than consciously heard. Set "assetQuery" (e.g. "whoosh", "swipe", "click", "pop", "impact", "sparkle", "transition", "text pop"), "atMs", and a short "reason" naming which specific event above justified it. Never set assetId/resolvedAssetUrl/resolutionNote.
 
 Respond with ONLY a single JSON object, no other text, matching exactly this shape:
 {
@@ -713,10 +750,12 @@ Respond with ONLY a single JSON object, no other text, matching exactly this sha
 }`;
 }
 
-// Agent 7 — Quality Reviewer. Scores ONLY the 4 categories that genuinely
-// require judgment — everything structurally measurable is scored by
-// quality-review.ts without any LLM call (deterministicScores is passed
-// in purely as context, not something this call is asked to recompute).
+// Agent 7 — Quality Reviewer. Scores ONLY the 3 categories that genuinely
+// require judgment (2026-08-07, TASK 10 quality-upgrade pass — narrowed
+// from 4: "emotion" dropped, "zoom" moved to deterministic scoring) —
+// everything structurally measurable is scored by quality-review.ts
+// without any LLM call (deterministicScores is passed in purely as
+// context, not something this call is asked to recompute).
 function buildQualityReviewPrompt(req: ReasoningQualityReviewRequest): string {
   return `You are the Quality Reviewer agent inside an AI Video Director — reviewing a junior editor's work exactly like a senior editor would, before it ships. Ask, for the whole edit: "If I were editing this for a client paying real money for a single Reel, would I deliver this?" If genuinely no, name what's weak.
 
@@ -726,16 +765,15 @@ B-roll (${req.broll.length}) / Zoom (${req.zoom.length}) / Stickers (${req.stick
 Already-computed structural scores (0-100, for context only — do not just restate these): ${JSON.stringify(req.deterministicScores)}
 Source media duration: ${req.sourceDurationMs}ms.
 
-Score these 4 categories, each 0-100, as your own honest editorial judgment (never automatically optimistic):
+Score these 3 categories, each 0-100, as your own honest editorial judgment (never automatically optimistic):
 - "hookScore": does the opening genuinely earn attention in the first 1-3 seconds?
-- "emotionScore": does the edit's pacing/visuals/music genuinely support the content's emotional tone?
 - "retentionScore": your own independent estimate of how well this edit holds a viewer to the end (may differ from the Story agent's own score above — this is a fresh judgment, not a copy).
-- "storyFlowScore": does the edit actually follow through on the story rhythm (hook -> curiosity -> value -> pattern interrupt -> visual reward -> proof -> cta), or does it feel disjointed/rushed/flat?
+- "storyScore": does the edit actually follow through on the story rhythm (hook -> curiosity -> value -> pattern interrupt -> visual reward -> proof -> cta), or does it feel disjointed/rushed/flat?
 
-Also set "weakCategories" — from this full list: hook, captions, broll, visualVariety, pacing, emotion, retention, music, sfx, storyFlow — name every category (including ones you didn't score numerically above) you'd genuinely tell a junior editor to redo before shipping. Empty array if you'd ship this as-is.
+Also set "weakCategories" — from this full list: hook, retention, captions, broll, music, sfx, zoom, story, visualVariety, editingRhythm — name every category (including ones you didn't score numerically above) you'd genuinely tell a junior editor to redo before shipping. Empty array if you'd ship this as-is.
 
 Respond with ONLY a single JSON object, no other text, matching exactly this shape:
-{ "hookScore": number, "hookNote"?: string, "emotionScore": number, "emotionNote"?: string, "retentionScore": number, "retentionNote"?: string, "storyFlowScore": number, "storyFlowNote"?: string, "weakCategories": string[] }`;
+{ "hookScore": number, "hookNote"?: string, "retentionScore": number, "retentionNote"?: string, "storyScore": number, "storyNote"?: string, "weakCategories": string[] }`;
 }
 
 export class GPT5ReasoningProvider implements ReasoningProvider {
@@ -897,12 +935,10 @@ export class GPT5ReasoningProvider implements ReasoningProvider {
     return {
       hookScore: result.data.hookScore,
       hookNote: result.data.hookNote,
-      emotionScore: result.data.emotionScore,
-      emotionNote: result.data.emotionNote,
       retentionScore: result.data.retentionScore,
       retentionNote: result.data.retentionNote,
-      storyFlowScore: result.data.storyFlowScore,
-      storyFlowNote: result.data.storyFlowNote,
+      storyScore: result.data.storyScore,
+      storyNote: result.data.storyNote,
       weakCategories: result.data.weakCategories,
       providerRef: result.providerRef,
       usage: result.usage,

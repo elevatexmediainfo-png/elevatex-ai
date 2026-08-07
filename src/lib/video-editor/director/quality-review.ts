@@ -1,23 +1,50 @@
 import { computeBrollTargetRange } from "@/lib/providers/reasoning/gpt5.provider";
+import type { ReasoningZoomItem } from "@/lib/providers/reasoning";
 import { AI_QUALITY_CATEGORIES, type AIBroll, type AICaption, type AIMusic, type AISceneRemoval, type AISfx, type AiQualityCategory, type AiQualityScoresV2 } from "@/lib/validations/ai-timeline";
 import { clamp0to100, scoreCaptions, scorePacing } from "../ai-edit-quality-scoring";
 import { scoreVisualVariety } from "./variety-ledger";
 import type { DirectorAgentId, DirectorIterationEntry, VarietyLedger } from "./types";
 
 // AI Video Director (2026-08-07) — the 10-category quality rubric (TASK
-// 12 in the approved plan). 6 categories are scored HERE, deterministically,
-// with zero LLM call (captions/broll/visualVariety/pacing/music/sfx); 4
-// require genuine judgment (hook/emotion/retention/storyFlow) and come
-// from the Quality Reviewer agent's own reviewQuality() call
-// (director/orchestrator.ts wires that call and passes its result in).
+// 12 in the approved plan; category set realigned 2026-08-07, TASK 10 of
+// the quality-upgrade pass — see aiQualityScoresV2Schema's own doc
+// comment in validations/ai-timeline.ts for the full rename/rationale).
+// 7 categories are scored HERE, deterministically, with zero LLM call
+// (captions/broll/music/sfx/zoom/visualVariety/editingRhythm); 3 require
+// genuine judgment (hook/retention/story) and come from the Quality
+// Reviewer agent's own reviewQuality() call (director/orchestrator.ts
+// wires that call and passes its result in).
 
 export interface DeterministicScores {
   captionScore: number;
   brollScore: number;
-  visualVarietyScore: number;
-  pacingScore: number;
   musicScore: number;
   sfxScore: number;
+  zoomScore: number;
+  visualVarietyScore: number;
+  editingRhythmScore: number;
+}
+
+// TASK 10 — zoom is now scored deterministically rather than folded into
+// the LLM's judged categories. Two honest, structural signals: (1) count
+// reasonableness (loose, not a hard target like b-roll density — every
+// Visuals-agent call already hard-caps proposals at "0-5 total" regardless
+// of video length, so this only penalizes genuine outliers well beyond
+// what that cap alone would allow); (2) named-style diversity — every
+// zoom using the identical style reads as monotonous regardless of count,
+// a real signal distinct from the whole-ledger visualVarietyScore (which
+// mixes zoom/transition/sticker/broll together) — this isolates JUST the
+// zoom dimension of that.
+export function scoreZoomDeterministic(zoom: ReasoningZoomItem[], sourceDurationMs: number): number {
+  if (zoom.length === 0) return 100; // zero zoom is a valid choice for calm content
+  const minutes = Math.max(sourceDurationMs, 1) / 60_000;
+  const reasonableMax = Math.max(5, Math.ceil(minutes * 3));
+  const countScore = zoom.length <= reasonableMax ? 100 : clamp0to100(100 - (zoom.length - reasonableMax) * 15);
+
+  const namedStyles = zoom.map((z) => z.style).filter((s): s is NonNullable<typeof s> => !!s);
+  const diversityScore = namedStyles.length <= 1 ? 100 : clamp0to100((new Set(namedStyles).size / namedStyles.length) * 100);
+
+  return clamp0to100(countScore * 0.5 + diversityScore * 0.5);
 }
 
 // Deliberately counts PROPOSED items (broll.length), never resolvedAssetId
@@ -58,6 +85,7 @@ export function scoreSfxDeterministic(sfx: AISfx[], maxPer10s: number): number {
 export function computeDeterministicScores(input: {
   captions: AICaption[];
   broll: AIBroll[];
+  zoom: ReasoningZoomItem[];
   sceneRemoval: AISceneRemoval[];
   music?: AIMusic;
   sfx: AISfx[];
@@ -69,10 +97,11 @@ export function computeDeterministicScores(input: {
   return {
     captionScore: input.captions.length > 0 ? scoreCaptions(input.captions, input.sourceDurationMs) : 100,
     brollScore: scoreBrollDeterministic(input.broll, input.sourceDurationMs, input.brollDensity),
-    visualVarietyScore: scoreVisualVariety(input.varietyLedger),
-    pacingScore: input.captions.length > 0 ? scorePacing(input.sceneRemoval, input.captions, input.sourceDurationMs) : 100,
     musicScore: scoreMusicDeterministic(input.music),
     sfxScore: scoreSfxDeterministic(input.sfx, input.sfxMaxPer10s),
+    zoomScore: scoreZoomDeterministic(input.zoom, input.sourceDurationMs),
+    visualVarietyScore: scoreVisualVariety(input.varietyLedger),
+    editingRhythmScore: input.captions.length > 0 ? scorePacing(input.sceneRemoval, input.captions, input.sourceDurationMs) : 100,
   };
 }
 
@@ -95,9 +124,8 @@ const DETERMINISTIC_WEAK_THRESHOLD = 60;
 
 export interface QualityReviewerJudgedScores {
   hookScore: number;
-  emotionScore: number;
   retentionScore: number;
-  storyFlowScore: number;
+  storyScore: number;
   weakCategories: AiQualityCategory[];
 }
 
@@ -110,15 +138,15 @@ export function buildQualityScoresV2(
 ): AiQualityScoresV2 {
   const perCategory: Record<AiQualityCategory, number> = {
     hook: judged.hookScore,
+    retention: judged.retentionScore,
     captions: deterministic.captionScore,
     broll: deterministic.brollScore,
-    visualVariety: deterministic.visualVarietyScore,
-    pacing: deterministic.pacingScore,
-    emotion: judged.emotionScore,
-    retention: judged.retentionScore,
     music: deterministic.musicScore,
     sfx: deterministic.sfxScore,
-    storyFlow: judged.storyFlowScore,
+    zoom: deterministic.zoomScore,
+    story: judged.storyScore,
+    visualVariety: deterministic.visualVarietyScore,
+    editingRhythm: deterministic.editingRhythmScore,
   };
   const overallScore = computeOverallScore(perCategory, weights);
   const weakFromDeterministic = AI_QUALITY_CATEGORIES.filter((c) => perCategory[c] < DETERMINISTIC_WEAK_THRESHOLD);
@@ -127,14 +155,14 @@ export function buildQualityScoresV2(
   return {
     captionScore: deterministic.captionScore,
     brollScore: deterministic.brollScore,
-    visualVarietyScore: deterministic.visualVarietyScore,
-    pacingScore: deterministic.pacingScore,
     musicScore: deterministic.musicScore,
     sfxScore: deterministic.sfxScore,
+    zoomScore: deterministic.zoomScore,
+    visualVarietyScore: deterministic.visualVarietyScore,
+    editingRhythmScore: deterministic.editingRhythmScore,
     hookScore: judged.hookScore,
-    emotionScore: judged.emotionScore,
     retentionScore: judged.retentionScore,
-    storyFlowScore: judged.storyFlowScore,
+    storyScore: judged.storyScore,
     overallScore,
     thresholdMet: overallScore >= targetScore,
     iterations,
@@ -153,15 +181,15 @@ export function buildQualityScoresV2(
 
 export const CATEGORY_AGENT_MAP: Record<AiQualityCategory, DirectorAgentId[]> = {
   hook: ["story"],
+  retention: ["story"],
   captions: ["captions"],
   broll: ["visuals"],
-  visualVariety: ["visuals"],
-  pacing: ["visuals"],
-  emotion: ["story", "visuals"],
-  retention: ["story"],
   music: ["audio"],
   sfx: ["audio"],
-  storyFlow: ["story", "captions"],
+  zoom: ["visuals"],
+  story: ["story", "captions"],
+  visualVariety: ["visuals"],
+  editingRhythm: ["visuals"],
 };
 
 // If an earlier agent reruns, everything that consumed ITS output is now

@@ -9,6 +9,7 @@ import {
   scoreBrollDeterministic,
   scoreMusicDeterministic,
   scoreSfxDeterministic,
+  scoreZoomDeterministic,
 } from "./quality-review";
 import type { DirectorIterationEntry } from "./types";
 import type { AiQualityScoresV2 } from "@/lib/validations/ai-timeline";
@@ -60,11 +61,36 @@ describe("scoreSfxDeterministic", () => {
   });
 });
 
+describe("scoreZoomDeterministic", () => {
+  it("scores 100 with zero zoom (a valid choice for calm content)", () => {
+    expect(scoreZoomDeterministic([], 60_000)).toBe(100);
+  });
+
+  it("scores 100 for a reasonable count with fully diverse named styles", () => {
+    const zoom = [
+      { startMs: 0, endMs: 500, scaleFrom: 100, scaleTo: 110, style: "fast_punch" as const },
+      { startMs: 1000, endMs: 1500, scaleFrom: 100, scaleTo: 115, style: "slow_push" as const },
+    ];
+    expect(scoreZoomDeterministic(zoom, 60_000)).toBe(100);
+  });
+
+  it("penalizes every zoom using the identical named style (monotonous, regardless of count)", () => {
+    const zoom = Array.from({ length: 3 }, (_, i) => ({ startMs: i * 1000, endMs: i * 1000 + 400, scaleFrom: 100, scaleTo: 110, style: "fast_punch" as const }));
+    expect(scoreZoomDeterministic(zoom, 60_000)).toBeLessThan(100);
+  });
+
+  it("penalizes a genuinely excessive count well beyond what the video length could plausibly support", () => {
+    const zoom = Array.from({ length: 30 }, (_, i) => ({ startMs: i * 500, endMs: i * 500 + 200, scaleFrom: 100, scaleTo: 110 }));
+    expect(scoreZoomDeterministic(zoom, 30_000)).toBeLessThan(100); // 30 zooms in a 30s video
+  });
+});
+
 describe("computeDeterministicScores", () => {
   it("treats an empty caption section as neutral (100), not a defect, when captions weren't proposed at all", () => {
     const scores = computeDeterministicScores({
       captions: [],
       broll: [],
+      zoom: [],
       sceneRemoval: [],
       sfx: [],
       varietyLedger: createEmptyVarietyLedger(),
@@ -72,14 +98,14 @@ describe("computeDeterministicScores", () => {
       sfxMaxPer10s: 1,
     });
     expect(scores.captionScore).toBe(100);
-    expect(scores.pacingScore).toBe(100);
+    expect(scores.editingRhythmScore).toBe(100);
   });
 });
 
 describe("computeOverallScore", () => {
   it("weights categories per the given weight map", () => {
     const perCategory = {
-      hook: 100, captions: 0, broll: 100, visualVariety: 100, pacing: 100, emotion: 100, retention: 100, music: 100, sfx: 100, storyFlow: 100,
+      hook: 100, retention: 100, captions: 0, broll: 100, music: 100, sfx: 100, zoom: 100, story: 100, visualVariety: 100, editingRhythm: 100,
     };
     // Weighting captions at 0 excludes its 0-score from dragging the average down.
     const withoutCaptionsWeight = computeOverallScore(perCategory, { captions: 0 });
@@ -91,8 +117,8 @@ describe("computeOverallScore", () => {
 
 describe("buildQualityScoresV2", () => {
   it("unions deterministic-weak categories with the reviewer's own self-reported weakCategories", () => {
-    const deterministic = { captionScore: 30, brollScore: 100, visualVarietyScore: 100, pacingScore: 100, musicScore: 100, sfxScore: 100 }; // captions below the deterministic weak threshold
-    const judged = { hookScore: 90, emotionScore: 90, retentionScore: 90, storyFlowScore: 90, weakCategories: ["music" as const] };
+    const deterministic = { captionScore: 30, brollScore: 100, musicScore: 100, sfxScore: 100, zoomScore: 100, visualVarietyScore: 100, editingRhythmScore: 100 }; // captions below the deterministic weak threshold
+    const judged = { hookScore: 90, retentionScore: 90, storyScore: 90, weakCategories: ["music" as const] };
     const result = buildQualityScoresV2(deterministic, judged, {}, 90, 1);
     expect(result.weakCategoriesFinal).toEqual(expect.arrayContaining(["captions", "music"]));
     expect(result.thresholdMet).toBe(result.overallScore >= 90);

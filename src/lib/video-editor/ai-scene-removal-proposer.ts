@@ -16,7 +16,7 @@
 // silence/filler_word. The merge function combines both sources into one
 // sensible, non-redundant candidate list.
 
-import { detectFillerWords, detectSilenceGapsAdaptive, type TimedWord } from "@/lib/transcription/segmentation";
+import { detectDuplicatePhrases, detectFillerWords, detectSilenceGapsAdaptive, type TimedWord } from "@/lib/transcription/segmentation";
 import type { AISceneRemoval, AISceneRemovalReason } from "@/lib/validations/ai-timeline";
 
 export interface SceneRemovalProposerOptions {
@@ -73,7 +73,17 @@ export function proposeSceneRemovals(words: TimedWord[], options: SceneRemovalPr
     reason: "filler_word" as const,
   }));
 
-  return [...silenceRemovals, ...fillerRemovals].sort((a, b) => a.startMs - b.startMs);
+  // Quality upgrade (2026-08-07) — multi-word sentence restarts
+  // ("so we— so we actually need to..."), the complement to
+  // repeated_word's single-word case. See detectDuplicatePhrases' own doc
+  // comment (segmentation.ts).
+  const duplicatePhraseRemovals: AISceneRemoval[] = detectDuplicatePhrases(words).map((match) => ({
+    startMs: match.startMs,
+    endMs: match.endMs,
+    reason: "duplicate_phrase" as const,
+  }));
+
+  return [...silenceRemovals, ...fillerRemovals, ...duplicatePhraseRemovals].sort((a, b) => a.startMs - b.startMs);
 }
 
 // Higher priority = kept when two candidates overlap and get merged into
@@ -83,10 +93,19 @@ export function proposeSceneRemovals(words: TimedWord[], options: SceneRemovalPr
 // human reviewer than "there was a pause here," even when the windows
 // genuinely coincide (e.g. a bad take often IS also a silence gap while
 // the speaker collects themselves).
+// Quality upgrade (2026-08-07) — camera_adjustment/dead_reaction (video-
+// derived, like bad_take/duplicate_take/quality_issue) slot in alongside
+// their existing video-derived siblings; duplicate_phrase (transcript-
+// derived, like filler_word) slots in just above filler_word — a
+// multi-word restart is a MORE specific, informative signal than a bare
+// filler sound when the two windows happen to overlap.
 const REASON_PRIORITY: Record<AISceneRemovalReason, number> = {
-  bad_take: 5,
-  duplicate_take: 4,
+  bad_take: 7,
+  duplicate_take: 6,
+  camera_adjustment: 5,
+  dead_reaction: 4,
   quality_issue: 3,
+  duplicate_phrase: 2.5,
   filler_word: 2,
   silence: 1,
 };

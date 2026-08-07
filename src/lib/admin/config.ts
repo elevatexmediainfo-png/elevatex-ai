@@ -1066,11 +1066,19 @@ export const CONFIG_REGISTRY = {
     description: "A talking-head stretch with no caption/b-roll/zoom/sticker/motion-graphic visual treatment longer than this is flagged as a dead-screen violation by the Director pipeline's deterministic gap detector (visual-coverage.ts) and auto-fixed with the cheapest fitting insert. Phase 1 fixes are limited to the 5 visual types that already render (b-roll, zoom/camera-punch, sticker, animated caption, motion-graphic-as-asset) — picture-in-picture/split-screen/blur-background/progress-bar/callout/face-punch/screen-recording are a deferred future phase needing new renderer support.",
     category: "video_editor_policy",
   },
+  // Category set realigned 2026-08-07 (quality-upgrade pass, TASK 10) to
+  // hook/retention/captions/broll/music/sfx/zoom/story/visualVariety/
+  // editingRhythm — see aiQualityScoresV2Schema's own doc comment
+  // (validations/ai-timeline.ts) for why ("emotion" dropped, "zoom" added,
+  // "pacing"->"editingRhythm", "storyFlow"->"story"). Safe to evolve this
+  // default in place — the feature (AI_EDIT_DIRECTOR_PIPELINE_ENABLED) has
+  // never been enabled for real users, so no live config value depends on
+  // the old key names.
   AI_EDIT_QUALITY_CATEGORY_WEIGHTS: {
     schema: z.record(z.string(), z.number().min(0).max(5)),
-    default: { hook: 1.5, captions: 1, broll: 1, visualVariety: 0.75, pacing: 1, emotion: 1, retention: 1.5, music: 0.5, sfx: 0.5, storyFlow: 1 } as const,
+    default: { hook: 1.5, retention: 1.5, captions: 1, broll: 1, music: 0.5, sfx: 0.5, zoom: 0.75, story: 1, visualVariety: 0.75, editingRhythm: 1 } as const,
     label: "AI Director quality-category weights",
-    description: "Relative weight of each of the 9 sub-category scores (hook/captions/broll/visualVariety/pacing/emotion/retention/music/sfx/storyFlow) when computing the single overallScore the Final Director gate compares against AI_EDIT_QUALITY_TARGET_SCORE. Hook and Retention weighted higher by default, matching the 'retention-first' principle — every decision should maximize watch time.",
+    description: "Relative weight of each of the 10 sub-category scores (hook/retention/captions/broll/music/sfx/zoom/story/visualVariety/editingRhythm) when computing the single overallScore the Final Director gate compares against AI_EDIT_QUALITY_TARGET_SCORE. Hook and Retention weighted higher by default, matching the 'retention-first' principle — every decision should maximize watch time.",
     category: "video_editor_policy",
   },
   AI_EDIT_SFX_MAX_PER_10S: {

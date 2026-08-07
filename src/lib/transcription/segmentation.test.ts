@@ -3,11 +3,16 @@ import { describe, expect, it } from "vitest";
 import {
   adaptiveSilenceThresholdMs,
   assignParagraphIndices,
+  detectDuplicatePhrases,
   detectFillerWords,
   detectSilenceGaps,
   detectSilenceGapsAdaptive,
   wordsWithinSegment,
 } from "./segmentation";
+
+function words(...tokens: string[]) {
+  return tokens.map((word, i) => ({ word, startMs: i * 300, endMs: i * 300 + 250 }));
+}
 
 describe("detectSilenceGaps", () => {
   it("returns no gaps when words are closely spaced", () => {
@@ -269,5 +274,45 @@ describe("detectFillerWords", () => {
   it("returns an empty array for no words or a single word", () => {
     expect(detectFillerWords([])).toEqual([]);
     expect(detectFillerWords([{ word: "hi", startMs: 0, endMs: 100 }])).toEqual([]);
+  });
+});
+
+// Quality upgrade (2026-08-07, "cinematic editing — sentence restarts").
+describe("detectDuplicatePhrases", () => {
+  it("flags a multi-word sentence restart, keeping the SECOND (better) delivery", () => {
+    const w = words("so", "we", "need", "to", "so", "we", "need", "to", "actually", "focus");
+    const result = detectDuplicatePhrases(w);
+    expect(result).toHaveLength(1);
+    expect(result[0].phrase).toBe("so we need to");
+    expect(result[0].startMs).toBe(w[0].startMs); // the EARLIER (abandoned) occurrence
+    expect(result[0].endMs).toBe(w[3].endMs);
+  });
+
+  it("prefers the LONGEST matching phrase at a position, not just the shortest 2-word one", () => {
+    const w = words("i", "think", "that", "we", "should", "i", "think", "that", "we", "should", "go");
+    const result = detectDuplicatePhrases(w);
+    expect(result).toHaveLength(1);
+    expect(result[0].phrase).toBe("i think that we should"); // 5 words, not just "i think"
+  });
+
+  it("does not flag ordinary speech with no repeated phrase", () => {
+    const w = words("today", "we", "will", "learn", "about", "investing", "wisely");
+    expect(detectDuplicatePhrases(w)).toEqual([]);
+  });
+
+  it("does not flag a repeat that falls outside the lookahead window", () => {
+    const filler = Array.from({ length: 20 }, (_, i) => `filler${i}`);
+    const w = words("so", "we", "need", "to", ...filler, "so", "we", "need", "to");
+    expect(detectDuplicatePhrases(w)).toEqual([]);
+  });
+
+  it("a single repeated word alone does not trigger a phrase match (that's detectFillerWords' job)", () => {
+    const w = words("no", "no", "thanks");
+    expect(detectDuplicatePhrases(w)).toEqual([]);
+  });
+
+  it("handles empty and short input without throwing", () => {
+    expect(detectDuplicatePhrases([])).toEqual([]);
+    expect(detectDuplicatePhrases(words("hi"))).toEqual([]);
   });
 });

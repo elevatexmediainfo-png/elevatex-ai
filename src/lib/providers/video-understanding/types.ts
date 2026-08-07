@@ -23,9 +23,14 @@ export interface EmotionBeat extends TimedMoment {
 }
 
 // Matches AISceneRemovalReason's video-derived subset exactly
-// (lib/validations/ai-timeline.ts) — "silence"/"filler_word" are
-// transcript-derived (Module 2) and never produced by this provider.
-export const VIDEO_FLAG_REASONS = ["bad_take", "duplicate_take", "quality_issue"] as const;
+// (lib/validations/ai-timeline.ts) — "silence"/"filler_word"/
+// "duplicate_phrase" are transcript-derived (Module 2 / the 2026-08-07
+// quality upgrade) and never produced by this provider. "camera_adjustment"
+// (2026-08-07, "cinematic editing") — the camera visibly being repositioned/
+// refocused mid-shot, not part of the final cut. "dead_reaction" — a
+// visible pause with no meaningful expression/reaction, distinct from a
+// "quality_issue" (which is about framing/lighting/blur, not content).
+export const VIDEO_FLAG_REASONS = ["bad_take", "duplicate_take", "quality_issue", "camera_adjustment", "dead_reaction"] as const;
 export type VideoFlagReason = (typeof VIDEO_FLAG_REASONS)[number];
 
 export interface VideoFlaggedSegment {

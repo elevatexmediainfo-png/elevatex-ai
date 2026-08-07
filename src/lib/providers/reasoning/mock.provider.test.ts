@@ -152,9 +152,8 @@ describe("MockReasoningProvider — Director agents", () => {
       sourceDurationMs: 1000,
     });
     expect(result.hookScore).toBe(60);
-    expect(result.emotionScore).toBe(60);
     expect(result.retentionScore).toBe(60);
-    expect(result.storyFlowScore).toBe(60);
+    expect(result.storyScore).toBe(60);
     expect(result.weakCategories).toEqual([]);
   });
 });

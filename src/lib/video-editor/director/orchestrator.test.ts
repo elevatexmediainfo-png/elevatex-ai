@@ -59,12 +59,11 @@ const CAPTIONS_RESULT = { captions: [{ text: "hi there", startMs: 0, endMs: 20_0
 const VISUALS_RESULT = { zoom: [], broll: [{ startMs: 0, endMs: 4000, trackHint: "broll", source: "stock", searchQuery: "x" }], stickers: [], transitions: [], costUsd: 0.01 };
 const AUDIO_RESULT = { sfx: [], costUsd: 0.01 };
 
-function reviewResult(overallLikeScores: Partial<{ hookScore: number; emotionScore: number; retentionScore: number; storyFlowScore: number; weakCategories: string[] }>) {
+function reviewResult(overallLikeScores: Partial<{ hookScore: number; retentionScore: number; storyScore: number; weakCategories: string[] }>) {
   return {
     hookScore: 90,
-    emotionScore: 90,
     retentionScore: 90,
-    storyFlowScore: 90,
+    storyScore: 90,
     weakCategories: [],
     costUsd: 0.01,
     ...overallLikeScores,

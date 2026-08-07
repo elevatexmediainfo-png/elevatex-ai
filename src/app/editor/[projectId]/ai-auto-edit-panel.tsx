@@ -4,6 +4,7 @@ import * as React from "react";
 import {
   AlertTriangle,
   ArrowRightLeft,
+  Camera,
   CaptionsIcon,
   CheckCircle2,
   ChevronDown,
@@ -15,8 +16,10 @@ import {
   Loader2,
   MessageSquareWarning,
   Music2,
+  PauseCircle,
   RectangleHorizontal,
   RectangleVertical,
+  Repeat2,
   RotateCcw,
   Smile,
   Sparkles,
@@ -136,6 +139,11 @@ const REASON_LABEL: Record<AISceneRemovalReason, string> = {
   bad_take: "Bad take",
   duplicate_take: "Duplicate take",
   quality_issue: "Quality issue",
+  // Quality upgrade (2026-08-07, "cinematic editing") — see
+  // AI_SCENE_REMOVAL_REASONS' own doc comment (validations/ai-timeline.ts).
+  duplicate_phrase: "Sentence restart",
+  camera_adjustment: "Camera adjustment",
+  dead_reaction: "Dead moment",
 };
 
 // Phase 12 Module 3 — silence/filler_word come from Module 2's transcript
@@ -150,6 +158,9 @@ const REASON_ICON: Record<AISceneRemovalReason, React.ComponentType<{ className?
   bad_take: RotateCcw,
   duplicate_take: Copy,
   quality_issue: ImageOff,
+  duplicate_phrase: Repeat2,
+  camera_adjustment: Camera,
+  dead_reaction: PauseCircle,
 };
 
 const REASON_BADGE_CLASS: Record<AISceneRemovalReason, string> = {
@@ -158,6 +169,9 @@ const REASON_BADGE_CLASS: Record<AISceneRemovalReason, string> = {
   bad_take: "bg-rose-500/15 text-rose-300",
   duplicate_take: "bg-purple-500/15 text-purple-300",
   quality_issue: "bg-orange-500/15 text-orange-300",
+  duplicate_phrase: "bg-amber-500/15 text-amber-300",
+  camera_adjustment: "bg-slate-500/15 text-slate-300",
+  dead_reaction: "bg-slate-500/15 text-slate-300",
 };
 
 function formatMs(ms: number): string {

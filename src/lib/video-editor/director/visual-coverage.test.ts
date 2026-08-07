@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createEmptyVarietyLedger, recordUsage } from "./variety-ledger";
+import { createEmptyVarietyLedger } from "./variety-ledger";
 import {
   applyNoDeadScreenFixes,
   computeSourceSurvivingWindows,
@@ -79,16 +79,27 @@ describe("computeVisualCoverage + findDeadScreenGaps", () => {
 });
 
 describe("decideFixForGap", () => {
-  it("prefers broll for a large gap, zoom for a small one, when the ledger is empty", () => {
-    expect(decideFixForGap(createEmptyVarietyLedger(), 5000)).toBe("broll");
-    expect(decideFixForGap(createEmptyVarietyLedger(), 2200)).toBe("zoom");
+  it("prefers broll for a large gap, zoom for a small one, with no recent history", () => {
+    expect(decideFixForGap([], 5000)).toBe("broll");
+    expect(decideFixForGap([], 2200)).toBe("zoom");
   });
 
-  it("falls through to the next-cheapest option when the preferred kind was already used", () => {
-    const ledger = recordUsage(createEmptyVarietyLedger(), "brollStyles", "broll");
-    // A large gap would normally pick "broll" first, but it's already used -> falls through.
-    const kind = decideFixForGap(ledger, 5000);
+  it("falls through to the next-cheapest option when the preferred kind was picked in the recent window", () => {
+    // A large gap would normally pick "broll" first, but it was just used -> falls through.
+    const kind = decideFixForGap(["broll"], 5000);
     expect(kind).not.toBe("broll");
+  });
+
+  // TASK 9 real bug fix (2026-08-07) — "broll" is a legitimate REPEATED
+  // choice across a video (that's the whole point of b-roll density); the
+  // OLD version of this function used the whole-job variety ledger's
+  // isRepeat(), which made "broll" permanently unavailable after its
+  // first-ever use. It must remain choosable again once it's no longer
+  // within the recent alternation window.
+  it("allows a kind to be picked again once it has scrolled out of the recent alternation window", () => {
+    // FIX_ALTERNATION_WINDOW is 2 — 3 rounds back is outside the window.
+    const kind = decideFixForGap(["broll", "zoom", "sticker"], 5000);
+    expect(kind).toBe("broll"); // "broll" is no longer in the last-2 window (["zoom","sticker"])
   });
 });
 
@@ -120,5 +131,35 @@ describe("applyNoDeadScreenFixes", () => {
   it("produces zero items when there are zero gaps", () => {
     const result = applyNoDeadScreenFixes([], [], createEmptyVarietyLedger());
     expect(result).toEqual({ broll: [], zoom: [], stickers: [], ledger: createEmptyVarietyLedger(), gapsFixed: 0 });
+  });
+
+  // TASK 9 (2026-08-07) — several same-size (large) gaps in a row must
+  // genuinely ALTERNATE fix kinds, not repeat "broll" every single time —
+  // this is the real, end-to-end proof of the alternation-window fix.
+  it("alternates fix kinds across several consecutive large gaps instead of repeating the same one", () => {
+    const gaps = [
+      { startMs: 0, endMs: 5000, durationMs: 5000 },
+      { startMs: 6000, endMs: 11_000, durationMs: 5000 },
+      { startMs: 12_000, endMs: 17_000, durationMs: 5000 },
+      { startMs: 18_000, endMs: 23_000, durationMs: 5000 },
+    ];
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger());
+    // No two ADJACENT gaps may produce the exact same kind.
+    const kindOf = (startMs: number): string => {
+      if (result.zoom.some((z) => z.startMs === startMs)) return "zoom";
+      if (result.stickers.some((s) => s.startMs === startMs)) return "sticker";
+      const b = result.broll.find((item) => item.startMs === startMs);
+      return b?.contentKind === "motion_graphic" ? "motion_graphic" : "broll";
+    };
+    const sequence = gaps.map((g) => kindOf(g.startMs));
+    for (let i = 1; i < sequence.length; i++) {
+      expect(sequence[i]).not.toBe(sequence[i - 1]);
+    }
+  });
+
+  it("the auto-fixer's own zoom insert always uses the subtle 'micro' style, never a loud one", () => {
+    const result = applyNoDeadScreenFixes([{ startMs: 0, endMs: 2200, durationMs: 2200 }], [], createEmptyVarietyLedger());
+    expect(result.zoom).toHaveLength(1);
+    expect(result.zoom[0].style).toBe("micro");
   });
 });

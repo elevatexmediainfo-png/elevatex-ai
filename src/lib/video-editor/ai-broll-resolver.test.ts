@@ -243,6 +243,38 @@ describe("resolveBrollItem — stock", () => {
     expect(result.resolutionNote).toContain("Failed to download");
   });
 
+  // Quality upgrade (2026-08-07, TASK 3 — "rank them, choose the highest
+  // quality result") — among several ranked expanded queries searched in
+  // parallel, the highest-RELEVANCE result wins, not just whichever query
+  // happened to be listed first/searched first.
+  it("picks the highest-scoring result across several ranked expanded queries, not just the first one found", async () => {
+    searchStockMediaMock.mockImplementation(async (_category: string, q: string) => {
+      if (q === "stock market") return { outcomes: [{ providerId: "pexels", results: [stockResult({ externalId: "sm-1", kind: "VIDEO", title: "market chart background" })] }] }; // no overlap with "invest"
+      if (q === "business growth") return { outcomes: [{ providerId: "pexels", results: [stockResult({ externalId: "bg-1", kind: "VIDEO", title: "business growth invest chart" })] }] }; // overlaps "invest"
+      return { outcomes: [{ providerId: "pexels", results: [] }] };
+    });
+    materializeStockAssetMock.mockResolvedValue({ id: "asset-best", url: "https://cdn/best.mp4", thumbnailUrl: null });
+
+    const result = await resolveBrollItem(brollStock({ searchQuery: "invest", searchQueries: ["stock market", "money graph", "business growth"] }), CTX);
+
+    expect(materializeStockAssetMock).toHaveBeenCalledWith("user-1", "pexels", "STOCK_MEDIA", expect.objectContaining({ externalId: "bg-1" }));
+    expect(result.resolvedAssetId).toBe("asset-best");
+  });
+
+  it("falls back to sequential search of the remaining (unranked-slice) queries when the top parallel slice finds nothing", async () => {
+    // 6 expansions — more than EXPANSION_PARALLEL_SEARCH_COUNT (4). Only
+    // the 6th (well beyond the parallel slice) returns anything.
+    searchStockMediaMock.mockImplementation(async (_category: string, q: string) => {
+      if (q === "q6") return { outcomes: [{ providerId: "pexels", results: [stockResult({ externalId: "late-find", kind: "VIDEO" })] }] };
+      return { outcomes: [{ providerId: "pexels", results: [] }] };
+    });
+    materializeStockAssetMock.mockResolvedValue({ id: "asset-late", url: "https://cdn/late.mp4", thumbnailUrl: null });
+
+    const result = await resolveBrollItem(brollStock({ searchQuery: "invest", searchQueries: ["q1", "q2", "q3", "q4", "q5", "q6"] }), CTX);
+
+    expect(result.resolvedAssetId).toBe("asset-late");
+  });
+
   it("flags a stock item with no searchQuery as unresolved (defensive, schema should prevent this)", async () => {
     const result = await resolveBrollItem({ startMs: 0, endMs: 1000, trackHint: "broll", source: "stock" }, CTX);
     expect(result.resolutionNote).toContain("no searchQuery");

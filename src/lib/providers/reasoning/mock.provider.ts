@@ -129,9 +129,8 @@ export class MockReasoningProvider implements ReasoningProvider {
     // an honest "I have no real opinion," not a manufactured pass/fail.
     return {
       hookScore: 60,
-      emotionScore: 60,
       retentionScore: 60,
-      storyFlowScore: 60,
+      storyScore: 60,
       weakCategories: [],
     };
   }

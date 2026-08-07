@@ -873,6 +873,51 @@ describe("translateAITimelinePlan", () => {
     );
   });
 
+  // TASK 7 (2026-08-07, "music should evolve") — volumeEnvelope's
+  // fractional points become real content.volume keyframes on the clip.
+  it("music with a volumeEnvelope gets real content.volume keyframes, mapped from fraction to real ms", async () => {
+    const project = baseProject({ tracks: [], durationMs: 20_000 });
+    const plan = emptyPlan({
+      music: {
+        assetId: "music-asset-1",
+        duckingEnabled: true,
+        volumeEnvelope: [
+          { atFraction: 0, volumeLevel: 40 },
+          { atFraction: 0.5, volumeLevel: 65 },
+          { atFraction: 0.9, volumeLevel: 85 },
+        ],
+      },
+    });
+    const deps = makeFakeDeps();
+    const result = translateAITimelinePlan(plan, project, deps);
+    await result.command!.execute();
+
+    expect(deps.addMusicTrack.addClip).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: {
+          volume: {
+            value: 40,
+            keyframes: [
+              expect.objectContaining({ timeMs: 0, value: 40 }),
+              expect.objectContaining({ timeMs: 10_000, value: 65 }),
+              expect.objectContaining({ timeMs: 18_000, value: 85 }),
+            ],
+          },
+        },
+      })
+    );
+  });
+
+  it("music with NO volumeEnvelope has no 'content' key at all — falls back to the clip's own default volume unchanged", async () => {
+    const project = baseProject({ tracks: [], durationMs: 15_000 });
+    const plan = emptyPlan({ music: { assetId: "music-asset-1", duckingEnabled: true } });
+    const deps = makeFakeDeps();
+    const result = translateAITimelinePlan(plan, project, deps);
+    await result.command!.execute();
+
+    expect(deps.addMusicTrack.addClip).toHaveBeenCalledWith(expect.not.objectContaining({ content: expect.anything() }));
+  });
+
   it("music with an EXISTING MUSIC track adds the clip and updates ducking as two independent commands", async () => {
     const musicTrack = makeTrack({ id: "music-1", kind: "AUDIO", audioSubtype: "MUSIC", duckingEnabled: false });
     const project = baseProject({ tracks: [musicTrack], durationMs: 12_000 });

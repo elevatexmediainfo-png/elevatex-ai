@@ -60,7 +60,27 @@ const RANGE_ERROR = { message: "endMs must be after startMs" };
 // sceneRemoval — unwanted content to cut (silence/filler/bad takes/etc.)
 // ---------------------------------------------------------------------
 
-export const AI_SCENE_REMOVAL_REASONS = ["silence", "filler_word", "bad_take", "duplicate_take", "quality_issue"] as const;
+// Quality upgrade (2026-08-07, "cinematic editing — remove more than just
+// silence") — "duplicate_phrase" is transcript-only (detectDuplicatePhrases,
+// lib/transcription/segmentation.ts): a MULTI-WORD phrase repeated within
+// a short window (a sentence restart that abandons and re-says several
+// words, not just one — see detectFillerWords' own "repeated_word" for
+// the single-word case this complements). "camera_adjustment" and
+// "dead_reaction" are video-only (Gemini flaggedSegments,
+// video-understanding/gemini.provider.ts) — VIDEO_FLAG_REASONS
+// (video-understanding/types.ts) must stay a SUBSET of this list, since
+// ai-edit-jobs.ts assigns a flagged segment's reason directly onto an
+// AISceneRemoval.
+export const AI_SCENE_REMOVAL_REASONS = [
+  "silence",
+  "filler_word",
+  "bad_take",
+  "duplicate_take",
+  "quality_issue",
+  "duplicate_phrase",
+  "camera_adjustment",
+  "dead_reaction",
+] as const;
 export type AISceneRemovalReason = (typeof AI_SCENE_REMOVAL_REASONS)[number];
 
 export const aiSceneRemovalSchema = z
@@ -161,6 +181,17 @@ export type AICaption = z.infer<typeof aiCaptionSchema>;
 // remapped, right before translateAITimelinePlan() runs.
 export const AI_ZOOM_SOURCE_CLIP_PLACEHOLDER = "__source_clip__";
 
+// Quality upgrade (2026-08-07, "smart zooms") — named style archetypes a
+// real editor reaches for, rather than the model reasoning about raw
+// scaleFrom/scaleTo numbers alone. Optional (not `.default()` — see
+// aiBrollSchema's contentKind doc comment for why a Zod `.default()` on a
+// field like this would break every existing hand-built AIZoom literal):
+// absent means the item predates this field or the model didn't name one,
+// in which case zoomStyleBucket's own scale-delta heuristic
+// (variety-ledger.ts) is still the fallback for variety tracking.
+export const AI_ZOOM_STYLES = ["fast_punch", "slow_push", "micro", "pull_out", "shake_punch", "question_zoom", "number_zoom", "reveal_zoom"] as const;
+export type AIZoomStyle = (typeof AI_ZOOM_STYLES)[number];
+
 export const aiZoomSchema = z
   .object({
     clipId: z.string().min(1),
@@ -170,6 +201,7 @@ export const aiZoomSchema = z
     // native size) — NOT a 0..1 or 1..N multiplier.
     scaleFrom: z.number().min(1).max(1000),
     scaleTo: z.number().min(1).max(1000),
+    style: z.enum(AI_ZOOM_STYLES).optional(),
     // AI Video Director (2026-08-07) — see aiCaptionSchema's own doc
     // comment for the shared reason-field convention.
     reason: z.string().min(1).max(280).optional(),
@@ -207,8 +239,12 @@ export const aiBrollSchema = z
     // buildBroadenedQueries' own doc comment for why scoring stays
     // anchored to one fixed query even as the search text varies);
     // `searchQueries` is additive, optional, and empty/absent means
-    // "behave exactly as before this field existed."
-    searchQueries: z.array(z.string().min(1)).max(8).optional(),
+    // "behave exactly as before this field existed." Cap raised 8 -> 10
+    // (2026-08-07, TASK 3 quality upgrade — "generate 5-10 alternative
+    // search queries, ranked") to fit the Director Visuals agent's own
+    // widened ask; the legacy single-call prompt still only asks for 3-8
+    // and is unaffected by a higher CEILING it never approaches.
+    searchQueries: z.array(z.string().min(1)).max(10).optional(),
     generation: z
       .object({
         kind: z.enum(AI_GENERATION_KINDS),
@@ -302,6 +338,36 @@ export type AISticker = z.infer<typeof aiStickerSchema>;
 // reused, not reimplemented.
 // ---------------------------------------------------------------------
 
+// Quality upgrade (2026-08-07, "music should evolve") — a plain
+// (position, level) point list describing how loud the music bed should
+// be at each moment, 0-100 (100 = full pre-ducking volume; real-time
+// speech ducking still applies ON TOP of this via the existing
+// duckingEnabled/duckingAmountDb mechanism — this is the bed's OWN energy
+// curve, not a duck override). `atFraction` (0-1) is a FRACTION of the
+// music clip's own total duration, deliberately NOT an absolute
+// millisecond — the story beats this is computed from (director/
+// music-envelope.ts's buildMusicVolumeEnvelope) are timed in ORIGINAL
+// SOURCE-relative ms, but the music clip itself plays across the FINAL,
+// POST-SCENE-REMOVAL edited timeline (a different, generally shorter
+// duration with a non-trivial time mapping — see
+// ai-timeline-translator.ts's own computeSurvivingSegments for how
+// involved that remap already is for OTHER sections). Expressing the
+// envelope as a proportion of total progress through the edit sidesteps
+// needing that same remap machinery here: the curve's SHAPE (low->build->
+// uplifting) is preserved proportionally regardless of exactly where cuts
+// landed, which is what "the music should evolve across the video's own
+// arc" actually calls for — an honest, simpler, equally-correct
+// interpretation, not a shortcut that loses meaning. Computed
+// DETERMINISTICALLY from the Story agent's own beats — never asked of the
+// model, so this costs zero extra reasoning tokens. Optional/absent means
+// a flat, unchanging volume (today's pre-existing behavior) — old plans
+// and the legacy single-call path never populate this.
+export const aiMusicVolumePointSchema = z.object({
+  atFraction: z.number().min(0).max(1),
+  volumeLevel: z.number().min(0).max(100),
+});
+export type AIMusicVolumePoint = z.infer<typeof aiMusicVolumePointSchema>;
+
 export const aiMusicSchema = z
   .object({
     searchQuery: z.string().min(1).optional(),
@@ -319,6 +385,7 @@ export const aiMusicSchema = z
     // AI Video Director (2026-08-07) — see aiCaptionSchema's own doc
     // comment for the shared reason-field convention.
     reason: z.string().min(1).max(280).optional(),
+    volumeEnvelope: z.array(aiMusicVolumePointSchema).optional(),
   })
   .refine((v) => !!v.searchQuery || !!v.assetId, { message: "either searchQuery or assetId is required" });
 export type AIMusic = z.infer<typeof aiMusicSchema>;
@@ -456,10 +523,24 @@ export type AIStoryPlan = z.infer<typeof aiStoryPlanSchema>;
 // on the plan is a union of both shapes so old rows keep parsing exactly
 // as before; every NEW plan the Director pipeline produces always writes
 // this v2 shape.
+//
+// Category set realigned (2026-08-07, quality-upgrade pass — TASK 10)
+// to the founder's own exact 10-category rubric: Hook, Retention,
+// Caption, B-roll, Music, SFX, Zoom (new), Story (was storyFlow), Visual
+// Variety, Editing Rhythm (was pacing). "Emotion" was dropped — it isn't
+// part of the new rubric, and this shape was never enabled for real users
+// (AI_EDIT_DIRECTOR_PIPELINE_ENABLED defaults false, still does), so
+// evolving it in place is safe — no v3 needed, nothing depends on the old
+// field names externally. Zoom is now scored DETERMINISTICALLY (count-vs-
+// video-length reasonableness + named-style diversity from the variety
+// ledger, ai-edit-jobs quality-review.ts's scoreZoomDeterministic) rather
+// than asking the LLM — narrowing the Quality Reviewer's own judged set
+// from 4 categories to 3 (hook/retention/story), a genuine cost/
+// simplicity improvement, not just a rename.
 // ---------------------------------------------------------------------
 
 export const AI_QUALITY_CATEGORIES = [
-  "hook", "captions", "broll", "visualVariety", "pacing", "emotion", "retention", "music", "sfx", "storyFlow",
+  "hook", "retention", "captions", "broll", "music", "sfx", "zoom", "story", "visualVariety", "editingRhythm",
 ] as const;
 export type AiQualityCategory = (typeof AI_QUALITY_CATEGORIES)[number];
 
@@ -467,15 +548,15 @@ export const aiQualityScoresV2Schema = z.object({
   // Deterministic, structural — no LLM call.
   captionScore: z.number().min(0).max(100),
   brollScore: z.number().min(0).max(100),
-  visualVarietyScore: z.number().min(0).max(100),
-  pacingScore: z.number().min(0).max(100),
   musicScore: z.number().min(0).max(100),
   sfxScore: z.number().min(0).max(100),
+  zoomScore: z.number().min(0).max(100),
+  visualVarietyScore: z.number().min(0).max(100),
+  editingRhythmScore: z.number().min(0).max(100),
   // LLM-judged — from the Quality Reviewer agent's own call.
   hookScore: z.number().min(0).max(100),
-  emotionScore: z.number().min(0).max(100),
   retentionScore: z.number().min(0).max(100),
-  storyFlowScore: z.number().min(0).max(100),
+  storyScore: z.number().min(0).max(100),
   // Weighted aggregate of the 10 above (see AI_EDIT_QUALITY_CATEGORY_WEIGHTS
   // admin config) and the Final Director gate's own comparison value.
   overallScore: z.number().min(0).max(100),

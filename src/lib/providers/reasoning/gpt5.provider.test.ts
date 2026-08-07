@@ -864,6 +864,23 @@ describe("GPT5ReasoningProvider — Director agents", () => {
     expect(userMessage).toContain("Save This Reel");
   });
 
+  // Quality upgrade (2026-08-07, TASK 6) — the Director-only caption
+  // enhancement (Hinglish restructuring example, finance vocabulary, 2-4
+  // color instruction) must reach the Caption agent's own prompt, WITHOUT
+  // altering the legacy buildPrompt()'s shared CAPTION_VOICE_AND_HIGHLIGHT_
+  // GUIDANCE constant (see gpt5.provider.test.ts's own "legacy path"
+  // describe block for byte-identical verification of that).
+  it("planCaptions prompt: TASK 6 restructuring example, finance vocabulary, and 2-4 color instruction", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(JSON.stringify({ captions: [] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.planCaptions({ words, storyBeats: [] });
+    const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
+    expect(userMessage).toContain("Aaj Investment Seekhte Hai");
+    expect(userMessage).toContain("Investment, Money, Profit, Growth, Business, Success, Mistake, Secret, Truth, Reality");
+    expect(userMessage).toContain("2-4 DIFFERENT colors");
+  });
+
   it("planVisuals: returns zoom/broll/stickers/transitions and prompts no-dead-screen + visual variety", async () => {
     const json = JSON.stringify({
       zoom: [{ startMs: 0, endMs: 500, scaleFrom: 100, scaleTo: 112, reason: "question" }],
@@ -879,11 +896,34 @@ describe("GPT5ReasoningProvider — Director agents", () => {
     expect(result.zoom).toHaveLength(1);
     expect(result.zoom[0].reason).toBe("question");
     const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
-    expect(userMessage).toContain("NO DEAD SCREEN");
+    expect(userMessage).toContain("RETENTION CURVE");
     expect(userMessage).toContain("VISUAL VARIETY");
     expect(userMessage).toContain(`["subtle"]`);
     expect(userMessage).toContain("searchQueries");
     expect(userMessage).toContain("contentKind");
+  });
+
+  // Quality upgrade (2026-08-07) — TASK 1/2 human-editor + retention-curve
+  // framing, TASK 3 semantic b-roll intent (the exact "I invested" example
+  // from the brief), TASK 5 named zoom styles, TASK 9 alternation wording.
+  it("planVisuals prompt: semantic-intent b-roll example, 5-10 ranked queries, all 8 named zoom styles", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(JSON.stringify({ zoom: [], broll: [], stickers: [], transitions: [] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.planVisuals({ words, videoAnalysis: null, captions: [], storyBeats: [], sourceDurationMs: 5000, survivingSegmentCount: 1 });
+    const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
+
+    expect(userMessage).toContain("understand what the speaker MEANS, not just the words");
+    expect(userMessage).toContain("stock market");
+    expect(userMessage).toContain("money graph");
+    expect(userMessage).toContain("5-10 semantically related expansions");
+    expect(userMessage).toContain("ORDERED BEST-TO-WORST");
+    expect(userMessage).toContain("CINEMATIC");
+    expect(userMessage).toContain("MOVEMENT/motion over a static photo");
+    expect(userMessage).toContain("second by second");
+    for (const style of ["fast_punch", "slow_push", "micro", "pull_out", "shake_punch", "question_zoom", "number_zoom", "reveal_zoom"]) {
+      expect(userMessage).toContain(style);
+    }
   });
 
   it("planAudio: returns music/sfx and prompts SFX invisibility + anti-spam", async () => {
@@ -901,8 +941,25 @@ describe("GPT5ReasoningProvider — Director agents", () => {
     expect(userMessage).toContain("business, corporate, finance, motivational, healthcare, calm, podcast, minimal, comedy, fun, travel, or cinematic");
   });
 
-  it("reviewQuality: returns the 4 LLM-judged scores + weakCategories, asks the client-would-I-ship-this question", async () => {
-    const json = JSON.stringify({ hookScore: 80, emotionScore: 70, retentionScore: 75, storyFlowScore: 65, weakCategories: ["pacing"] });
+  // Quality upgrade (2026-08-07, TASK 8) — SFX must fire ONLY on the exact
+  // named events, and TASK 7's music-evolves framing.
+  it("planAudio prompt: exact SFX trigger list (zoom/number/emoji/transition/caption pop/reveal) and music-evolves framing", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(JSON.stringify({ sfx: [] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.planAudio({ words, storyBeats: [], captions: [], broll: [], transitions: [], sourceDurationMs: 5000 });
+    const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
+
+    expect(userMessage).toContain("a zoom landing");
+    expect(userMessage).toContain("a number/statistic being said");
+    expect(userMessage).toContain("an emoji/icon-style sticker appearing");
+    expect(userMessage).toContain("a caption's punchy pop-in entrance");
+    expect(userMessage).toContain("a genuine reveal/surprise moment");
+    expect(userMessage).toContain("automatically EVOLVE across the video's own story arc");
+  });
+
+  it("reviewQuality: returns the 3 LLM-judged scores + weakCategories, asks the client-would-I-ship-this question", async () => {
+    const json = JSON.stringify({ hookScore: 80, retentionScore: 75, storyScore: 65, weakCategories: ["editingRhythm"] });
     const fetchMock = vi.fn().mockResolvedValue(chatResponse(json));
     vi.stubGlobal("fetch", fetchMock);
     const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
@@ -919,7 +976,8 @@ describe("GPT5ReasoningProvider — Director agents", () => {
     });
 
     expect(result.hookScore).toBe(80);
-    expect(result.weakCategories).toEqual(["pacing"]);
+    expect(result.storyScore).toBe(65);
+    expect(result.weakCategories).toEqual(["editingRhythm"]);
     const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
     expect(userMessage).toContain("would I deliver this");
     expect(userMessage).toContain("senior editor");

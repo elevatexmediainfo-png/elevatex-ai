@@ -1,7 +1,7 @@
 import type { ReasoningZoomItem } from "@/lib/providers/reasoning";
 import type { AIBroll, AICaption, AISticker } from "@/lib/validations/ai-timeline";
 import type { VarietyLedger } from "./types";
-import { isRepeat, recordUsage } from "./variety-ledger";
+import { recordUsage } from "./variety-ledger";
 
 // AI Video Director (2026-08-07) — "No dead screen" rule: no talking-head
 // shot should remain visually unchanged for more than
@@ -126,21 +126,43 @@ export function findDeadScreenGaps(
 
 export type VisualCoverageFixKind = "broll" | "sticker" | "motion_graphic" | "zoom";
 
+// TASK 9 (2026-08-07, "maintain a diversity score... never repeat within
+// a short window") — how many of the MOST RECENT fix kinds count as "too
+// recent to repeat." Deliberately a small rolling window, NOT a whole-job
+// "has this kind ever been used" check — a real, pre-existing bug in this
+// function's first version used the whole-job variety ledger's own
+// isRepeat() for this, which meant "broll" (a category meant to legitimately
+// repeat many times across one video — that's the entire point of b-roll
+// density) became permanently unavailable to the auto-fixer after its very
+// first use, silently biasing every later gap toward zoom/sticker. Fixed
+// by tracking only the last FIX_ALTERNATION_WINDOW choices made BY THIS
+// AUTO-FIXER specifically (recentKinds, threaded through
+// applyNoDeadScreenFixes below) — the actual per-item VALUES (a specific
+// zoom style, a specific sticker query) still use the real, whole-job
+// variety ledger for their own dedup, which is the right scope for those.
+export const FIX_ALTERNATION_WINDOW = 2;
+
 // Deterministic heuristic (no LLM call — free on every quality-loop
-// iteration): bigger gaps get the more substantial fix; a fix kind
-// already used adjacent-in-recency (per the variety ledger) is skipped in
-// favor of the next-cheapest option, so the auto-fixer doesn't itself
-// create a visual-variety violation right next to an existing one.
-export function decideFixForGap(ledger: VarietyLedger, durationMs: number): VisualCoverageFixKind {
+// iteration): bigger gaps get the more substantial fix; a fix KIND used
+// in the last FIX_ALTERNATION_WINDOW choices is skipped in favor of the
+// next-cheapest option, so consecutive auto-fixes genuinely alternate
+// instead of repeating the same category back-to-back.
+export function decideFixForGap(recentKinds: VisualCoverageFixKind[], durationMs: number): VisualCoverageFixKind {
   const candidates: VisualCoverageFixKind[] =
     durationMs >= 4000 ? ["broll", "motion_graphic", "sticker", "zoom"] : durationMs >= 2500 ? ["motion_graphic", "sticker", "broll", "zoom"] : ["zoom", "sticker", "motion_graphic", "broll"];
 
+  const tooRecent = new Set(recentKinds.slice(-FIX_ALTERNATION_WINDOW));
   for (const kind of candidates) {
-    const category = kind === "zoom" ? "zoomStyles" : kind === "sticker" ? "stickerQueries" : "brollStyles";
-    if (!isRepeat(ledger, category, kind)) return kind;
+    if (!tooRecent.has(kind)) return kind;
   }
-  return candidates[0];
+  return candidates[0]; // every candidate was recently used — fall back to the size-appropriate default anyway
 }
+
+// TASK 5 — the auto-fixer's own zoom fix always uses the smallest, most
+// unobtrusive named style ("micro") — an automatic safety-net insert
+// should never be as visually loud as a deliberate, story-motivated zoom
+// the Visuals agent itself chose.
+const AUTO_FIX_ZOOM_STYLE = "micro" as const;
 
 // Picks the caption whose time range is nearest the gap's midpoint to
 // derive a plausible search phrase for an auto-inserted broll/motion-
@@ -190,14 +212,19 @@ export function applyNoDeadScreenFixes(
   const zoom: ReasoningZoomItem[] = [];
   const stickers: AISticker[] = [];
   let nextLedger = ledger;
+  // Which fix KIND was picked, most recent last — this is the small
+  // rolling alternation window (see decideFixForGap's own doc comment),
+  // deliberately separate from nextLedger's whole-job per-VALUE dedup.
+  const recentKinds: VisualCoverageFixKind[] = [];
 
   for (const gap of gaps) {
-    const kind = decideFixForGap(nextLedger, gap.durationMs);
+    const kind = decideFixForGap(recentKinds, gap.durationMs);
+    recentKinds.push(kind);
     const reason = `Auto-inserted: ${(gap.durationMs / 1000).toFixed(1)}s of talking-head footage had no visual treatment (no-dead-screen rule).`;
 
     if (kind === "zoom") {
-      zoom.push({ startMs: gap.startMs, endMs: gap.endMs, scaleFrom: 100, scaleTo: 112, reason });
-      nextLedger = recordUsage(nextLedger, "zoomStyles", "auto_fix_punch");
+      zoom.push({ startMs: gap.startMs, endMs: gap.endMs, scaleFrom: 100, scaleTo: 112, style: AUTO_FIX_ZOOM_STYLE, reason });
+      nextLedger = recordUsage(nextLedger, "zoomStyles", AUTO_FIX_ZOOM_STYLE);
     } else if (kind === "sticker") {
       const query = deriveFixSearchQuery(gap, captions);
       stickers.push({ assetQuery: query, startMs: gap.startMs, endMs: Math.min(gap.endMs, gap.startMs + 2000), reason });
@@ -215,7 +242,12 @@ export function applyNoDeadScreenFixes(
         autoInserted: true,
         reason,
       });
-      nextLedger = recordUsage(nextLedger, "brollStyles", kind);
+      // Tracked by the actual search query (a real, per-item value), not
+      // the generic kind label — matches how the Visuals agent's own
+      // proposed b-roll items are tracked (see orchestrator.ts's
+      // runVisualsAgent), so this genuinely contributes to b-roll-style
+      // variety scoring rather than one repeated placeholder string.
+      nextLedger = recordUsage(nextLedger, "brollStyles", query);
     }
   }
 

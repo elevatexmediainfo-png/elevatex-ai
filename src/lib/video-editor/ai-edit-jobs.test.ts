@@ -300,8 +300,8 @@ describe("processAiEditJob — AI Video Director pipeline (flag on)", () => {
     sfx: [],
     story: { beats: [{ kind: "hook", startMs: 0, endMs: 500, description: "opening" }], hookText: "director hook", retentionRisks: [] },
     scores: {
-      captionScore: 90, brollScore: 90, visualVarietyScore: 90, pacingScore: 90, musicScore: 100, sfxScore: 100,
-      hookScore: 90, emotionScore: 90, retentionScore: 90, storyFlowScore: 90,
+      captionScore: 90, brollScore: 90, musicScore: 100, sfxScore: 100, zoomScore: 90, visualVarietyScore: 90, editingRhythmScore: 90,
+      hookScore: 90, retentionScore: 90, storyScore: 90,
       overallScore: 92, thresholdMet: true, iterations: 1, weakCategoriesFinal: [],
     },
     reasoningCostUsd: 0.2,

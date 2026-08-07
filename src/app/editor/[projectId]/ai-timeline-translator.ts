@@ -705,10 +705,28 @@ function translateMusic(
     duckingFadeMs: musicTrack?.duckingFadeMs ?? 300,
     duckingVoiceTrackIds: voiceTrackIds,
   };
+  // TASK 7 (2026-08-07, "music should evolve") — music.volumeEnvelope's
+  // fractional (atFraction, volumeLevel) points (director/music-envelope.ts)
+  // become real volume keyframes on the clip itself, same Keyframeable<number>
+  // mechanism translateZoom already uses for ClipTransform.scale — just on
+  // ClipContent.volume instead. atFraction * project.durationMs converts
+  // proportional position into this clip's own clip-relative ms (the clip
+  // always starts at 0 and spans the whole project, so clip-relative and
+  // timeline-absolute are the same value here). Absent/empty envelope
+  // (legacy plans, or a Director run with no story beats) means no
+  // "volume" key at all — the clip falls back to its own default (100%,
+  // unchanging), today's pre-existing behavior, unchanged.
+  const volumeKeyframes = (music.volumeEnvelope ?? []).map((point, i) => ({
+    id: `ai-music-volume-${i}`,
+    timeMs: Math.round(point.atFraction * project.durationMs),
+    value: point.volumeLevel,
+    easing: DEFAULT_KEYFRAME_EASING,
+  }));
   const clipInput: Omit<AddClipPatch, "trackId"> = {
     assetId: music.assetId,
     startMs: 0,
     durationMs: project.durationMs,
+    ...(volumeKeyframes.length > 0 ? { content: { volume: { value: volumeKeyframes[0].value, keyframes: volumeKeyframes } } } : {}),
   };
 
   if (musicTrack) {

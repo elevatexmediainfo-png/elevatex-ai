@@ -3,6 +3,7 @@ import { normalizeSceneRemovalWindows } from "@/app/editor/[projectId]/ai-timeli
 import { planAudio as planAudioAgent, planDirectorCaptions, planStory as planStoryAgent, planVisuals as planVisualsAgent, reviewQuality as reviewQualityAgent } from "@/lib/generation/reasoning";
 import type { ReasoningAudioRequest, ReasoningCaptionRequest, ReasoningQualityReviewRequest, ReasoningStoryRequest, ReasoningVisualsRequest } from "@/lib/providers/reasoning";
 import type { AiQualityCategory, AiQualityScoresV2 } from "@/lib/validations/ai-timeline";
+import { buildMusicVolumeEnvelope } from "./music-envelope";
 import { buildQualityScoresV2, computeDeterministicScores, countTrailingNonImproving, resolveAgentsToRerun, STAGNATION_ROUNDS } from "./quality-review";
 import type { DirectorAgentId, DirectorContext, DirectorIterationEntry, DirectorJobMeta, DirectorPipelineResult, SpeechAnalysisOutput, VideoAnalysisOutput } from "./types";
 import { applyNoDeadScreenFixes, computeSourceSurvivingWindows, computeVisualCoverage, findDeadScreenGaps } from "./visual-coverage";
@@ -94,10 +95,15 @@ async function runVisualsAgent(ctx: DirectorContext): Promise<DirectorContext> {
   const transitions = ctx.wantsModule("transitions") ? result.transitions : [];
 
   let ledger = ctx.varietyLedger;
+  // Quality upgrade (2026-08-07, TASK 5) — the Visuals agent now names a
+  // real style directly (fast_punch/slow_push/etc.); zoomStyleBucket's own
+  // scale-delta heuristic is only a fallback for the rare case the model
+  // omitted "style" (or for legacy-shaped zoom items with no style field
+  // at all).
   ledger = recordManyUsages(
     ledger,
     "zoomStyles",
-    zoom.map((z) => zoomStyleBucket(z.scaleFrom, z.scaleTo))
+    zoom.map((z) => z.style ?? zoomStyleBucket(z.scaleFrom, z.scaleTo))
   );
   ledger = recordManyUsages(
     ledger,
@@ -140,7 +146,13 @@ async function runAudioAgent(ctx: DirectorContext): Promise<DirectorContext> {
     repairMaxAttempts: ctx.jobMeta.repairMaxAttempts,
   };
   const result = await planAudioAgent(req, { userId: ctx.jobMeta.userId });
-  const music = ctx.wantsModule("music") ? result.music : undefined;
+  // TASK 7 (2026-08-07, "music should evolve") — deterministic, computed
+  // from the already-planned story beats, zero extra reasoning cost. See
+  // music-envelope.ts's own doc comment for the beat->energy mapping.
+  const music =
+    ctx.wantsModule("music") && result.music
+      ? { ...result.music, volumeEnvelope: buildMusicVolumeEnvelope(ctx.story?.beats ?? [], ctx.speech.sourceDurationMs) }
+      : undefined;
   const sfx = ctx.wantsModule("sfx") ? result.sfx : [];
   const ledger = recordManyUsages(
     ctx.varietyLedger,
@@ -199,7 +211,7 @@ interface ScoreOutcome {
   warnings: string[];
 }
 
-// Deterministic categories are computed locally (zero cost); the 4
+// Deterministic categories are computed locally (zero cost); the 3
 // LLM-judged categories come from one reviewQuality() call. Never throws
 // silently swallowed — a failure here propagates to the caller, which
 // decides (first pass: fatal to the Director attempt; loop iterations:
@@ -211,6 +223,7 @@ async function scoreDirectorPlan(
   const deterministic = computeDeterministicScores({
     captions: ctx.captions,
     broll: ctx.broll,
+    zoom: ctx.zoom,
     sceneRemoval: ctx.speech.sceneRemoval,
     music: ctx.music,
     sfx: ctx.sfx,
@@ -233,10 +246,11 @@ async function scoreDirectorPlan(
     deterministicScores: {
       captions: deterministic.captionScore,
       broll: deterministic.brollScore,
-      visualVariety: deterministic.visualVarietyScore,
-      pacing: deterministic.pacingScore,
       music: deterministic.musicScore,
       sfx: deterministic.sfxScore,
+      zoom: deterministic.zoomScore,
+      visualVariety: deterministic.visualVarietyScore,
+      editingRhythm: deterministic.editingRhythmScore,
     },
     sourceDurationMs: ctx.speech.sourceDurationMs,
     repairMaxAttempts: ctx.jobMeta.repairMaxAttempts,
@@ -247,9 +261,8 @@ async function scoreDirectorPlan(
     deterministic,
     {
       hookScore: reviewResult.hookScore,
-      emotionScore: reviewResult.emotionScore,
       retentionScore: reviewResult.retentionScore,
-      storyFlowScore: reviewResult.storyFlowScore,
+      storyScore: reviewResult.storyScore,
       weakCategories: reviewResult.weakCategories,
     },
     opts.weights,

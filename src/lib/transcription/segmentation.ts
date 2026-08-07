@@ -260,7 +260,9 @@ export interface DisfluencyMatch {
 // never be treated as a disfluency.
 const FILLER_WORD_RE = /^(u+m+|u+h+|e+r+m*|h+m+|a{2,}|a+h+)$/i;
 
-function normalizeWord(raw: string): string {
+// Exported (2026-08-07, "cinematic editing" quality upgrade) — reused by
+// detectDuplicatePhrases below rather than a second normalization rule.
+export function normalizeWord(raw: string): string {
   return raw.trim().replace(/^[.,!?…"'()[\]]+|[.,!?…"'()[\]]+$/g, "").toLowerCase();
 }
 
@@ -283,4 +285,79 @@ export function detectFillerWords(words: TimedWord[]): DisfluencyMatch[] {
   }
 
   return matches.sort((a, b) => a.startMs - b.startMs);
+}
+
+// Quality upgrade (2026-08-07, "cinematic editing — sentence restarts /
+// duplicate phrases") — detectFillerWords' own "repeated_word" only
+// catches a SINGLE word repeated back-to-back ("the the meeting"). A real
+// sentence restart very often re-says SEVERAL words before diverging
+// ("so we need to— so we need to actually focus on...") — this is the
+// multi-word complement: a sliding window of PHRASE_MIN_WORDS..
+// PHRASE_MAX_WORDS words, checked for an exact repeat starting anywhere
+// within PHRASE_LOOKAHEAD_WORDS words after the phrase ends. Flags the
+// EARLIER (abandoned) occurrence, same "the first delivery is the one to
+// cut" convention detectFillerWords' repeated_word already established.
+// Longer phrase matches are preferred over shorter ones at the same
+// starting position (a genuine 4-word restart is a stronger signal than
+// the 2-word sub-phrase inside it), and a match consumes its own span so
+// nested/overlapping shorter matches inside an already-flagged phrase
+// aren't ALSO reported separately (mergeSceneRemovalCandidates would
+// merge them anyway, but this keeps the raw output itself non-redundant).
+export interface DuplicatePhraseMatch {
+  startMs: number;
+  endMs: number;
+  phrase: string;
+}
+
+const PHRASE_MIN_WORDS = 2;
+const PHRASE_MAX_WORDS = 6;
+const PHRASE_LOOKAHEAD_WORDS = 10;
+
+export function detectDuplicatePhrases(words: TimedWord[]): DuplicatePhraseMatch[] {
+  const normalized = words.map((w) => normalizeWord(w.word));
+  const matches: DuplicatePhraseMatch[] = [];
+  let i = 0;
+
+  while (i < words.length) {
+    let matchedLen = 0;
+
+    for (let len = Math.min(PHRASE_MAX_WORDS, words.length - i); len >= PHRASE_MIN_WORDS; len--) {
+      const phrase = normalized.slice(i, i + len);
+      if (phrase.some((token) => token.length === 0)) continue; // skip phrases touching punctuation-only "words"
+
+      const searchStart = i + len;
+      const searchEnd = Math.min(words.length - len, i + len + PHRASE_LOOKAHEAD_WORDS);
+      let found = false;
+      for (let j = searchStart; j <= searchEnd; j++) {
+        let isMatch = true;
+        for (let k = 0; k < len; k++) {
+          if (normalized[j + k] !== phrase[k]) {
+            isMatch = false;
+            break;
+          }
+        }
+        if (isMatch) {
+          found = true;
+          break;
+        }
+      }
+      if (found) {
+        matchedLen = len;
+        break; // longest match at this position wins
+      }
+    }
+
+    if (matchedLen > 0) {
+      matches.push({
+        startMs: words[i].startMs,
+        endMs: words[i + matchedLen - 1].endMs,
+        phrase: words.slice(i, i + matchedLen).map((w) => w.word).join(" "),
+      });
+      i += matchedLen; // don't re-scan inside the span just flagged
+    } else {
+      i += 1;
+    }
+  }
+
+  return matches;
 }
