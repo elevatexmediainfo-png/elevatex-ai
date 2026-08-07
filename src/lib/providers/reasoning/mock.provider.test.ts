@@ -89,3 +89,72 @@ describe("MockReasoningProvider.plan", () => {
     ]);
   });
 });
+
+// AI Video Director (2026-08-07) — the 5 new stub methods required for
+// structural typing. Same "honest, cheap, never fabricate insight"
+// philosophy as plan() above — these exist so the Director pipeline's
+// WIRING is fully exercisable without API credentials, not to produce
+// genuinely useful output.
+describe("MockReasoningProvider — Director agents", () => {
+  const words = [
+    { word: "hi", startMs: 0, endMs: 100 },
+    { word: "there", startMs: 100, endMs: 200 },
+  ];
+
+  it("planStory: one neutral 'value' beat spanning the whole duration, retentionScore explicitly neutral (50)", async () => {
+    const provider = new MockReasoningProvider();
+    const result = await provider.planStory({ words, videoAnalysis: null, sourceDurationMs: 1000 });
+
+    expect(result.beats).toEqual([{ kind: "value", startMs: 0, endMs: 1000, description: expect.any(String) }]);
+    expect(result.hookText).toBe("hi there");
+    expect(result.retentionScore).toBe(50);
+    expect(result.retentionRisks).toEqual([]);
+    expect(result.ctaPresent).toBe(false);
+  });
+
+  it("planCaptions: delegates to the same fallback chunker plan() uses, never empty for real words", async () => {
+    const provider = new MockReasoningProvider();
+    const result = await provider.planCaptions({ words, storyBeats: [] });
+    expect(result.captions.length).toBeGreaterThan(0);
+  });
+
+  it("planVisuals: all empty arrays — no fabricated broll/zoom/stickers/transitions", async () => {
+    const provider = new MockReasoningProvider();
+    const result = await provider.planVisuals({
+      words,
+      videoAnalysis: null,
+      captions: [],
+      storyBeats: [],
+      sourceDurationMs: 1000,
+      survivingSegmentCount: 1,
+    });
+    expect(result).toEqual({ zoom: [], broll: [], stickers: [], transitions: [] });
+  });
+
+  it("planAudio: no music, empty sfx — no fabricated selection", async () => {
+    const provider = new MockReasoningProvider();
+    const result = await provider.planAudio({ words, storyBeats: [], captions: [], broll: [], transitions: [], sourceDurationMs: 1000 });
+    expect(result.music).toBeUndefined();
+    expect(result.sfx).toEqual([]);
+  });
+
+  it("reviewQuality: flat mid-range scores, empty weakCategories — never triggers a retry loop in tests", async () => {
+    const provider = new MockReasoningProvider();
+    const result = await provider.reviewQuality({
+      storySummary: { hookText: "x", beats: [], retentionScore: 50 },
+      captions: [],
+      broll: [],
+      zoom: [],
+      stickers: [],
+      transitions: [],
+      sfx: [],
+      deterministicScores: {},
+      sourceDurationMs: 1000,
+    });
+    expect(result.hookScore).toBe(60);
+    expect(result.emotionScore).toBe(60);
+    expect(result.retentionScore).toBe(60);
+    expect(result.storyFlowScore).toBe(60);
+    expect(result.weakCategories).toEqual([]);
+  });
+});

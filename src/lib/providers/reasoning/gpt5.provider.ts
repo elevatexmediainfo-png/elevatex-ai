@@ -1,4 +1,4 @@
-import type { z } from "zod";
+import { z } from "zod";
 import type { ProviderRuntimeConfig } from "../credentials";
 import { logger } from "@/lib/observability/logger";
 import { aiReeditResponseSchema, type AIReeditResponse } from "@/lib/validations/ai-reedit";
@@ -7,12 +7,27 @@ import { buildFallbackCaptionsFromWords, splitTextIntoCaptionChunks, MAX_WORDS_P
 import { chatTemperatureParam } from "../openai-chat-params";
 import {
   parsePlanOutputLeniently,
+  reasoningAudioOutputSchema,
+  reasoningCaptionRawSchema,
+  reasoningQualityReviewOutputSchema,
+  reasoningStoryOutputSchema,
+  reasoningVisualsOutputSchema,
+  type ReasoningAudioRequest,
+  type ReasoningAudioResult,
   type ReasoningCaptionRaw,
+  type ReasoningCaptionRequest,
+  type ReasoningCaptionResult,
   type ReasoningPlanRequest,
   type ReasoningPlanResult,
   type ReasoningProvider,
+  type ReasoningQualityReviewRequest,
+  type ReasoningQualityReviewResult,
   type ReasoningReeditRequest,
   type ReasoningReeditResult,
+  type ReasoningStoryRequest,
+  type ReasoningStoryResult,
+  type ReasoningVisualsRequest,
+  type ReasoningVisualsResult,
 } from "./types";
 
 // Real adapter — GPT-5.x, the REASONING category's own model (distinct
@@ -137,6 +152,25 @@ export function computeBrollTargetRange(sourceDurationMs: number, density: "MINI
 // formatting.ts's whole surface directly.
 export { MAX_WORDS_PER_CAPTION };
 
+// AI Video Director (2026-08-07) — extracted verbatim (no wording change,
+// zero interpolation in this block to begin with) out of buildPrompt's
+// own inline TASK 1 text so the NEW standalone Caption agent
+// (buildCaptionAgentPrompt below) can reuse the exact same already-built
+// viral/Hinglish/power-word/highlighting guidance rather than a second,
+// drifting copy — the plan's own explicit "reuse verbatim, no rebuild"
+// requirement. buildPrompt's own call site is updated to use this same
+// constant, so the legacy single-call path's prompt text is byte-for-byte
+// unchanged (verified by the existing prompt-content test suite, which
+// asserts via toContain(), not exact-string-equality).
+const CAPTION_VOICE_AND_HIGHLIGHT_GUIDANCE = `CAPTION VOICE — write viral, hook-style captions, not a plain transcription. A caption's job is to make someone stop scrolling and keep watching, not to be a court-reporter transcript of every word spoken:
+- Punch up the wording. Rather than transcribing verbatim, distill each caption down to its punchiest phrasing — short, declarative, high-impact. "Diabetes ko lightly mat lo" becomes something like "DON'T IGNORE DIABETES" or "BIGGEST MISTAKE" or "3 FOODS TO AVOID" — pick whichever punchy framing actually fits what that moment of the transcript is saying, don't force the same template everywhere.
+- Reach for power words where they genuinely fit the moment (never force one into every caption): WARNING, STOP, SAVE, SECRET, PRO TIP, DON'T, BIGGEST, WHY, HOW, TOP 3, IMPORTANT, NEVER.
+- Not every caption needs to be a hook — mid-video informational beats can read more plainly; save the punchiest treatment for the moments that most deserve it (the actual hook near the start, a genuine warning/insight, a key number or list item).
+- LANGUAGE REGISTER: if the transcript is spoken in Hindi or Hinglish, caption TEXT defaults to Roman-script Hinglish (Hindi-English code-mixed, colloquial, LATIN SCRIPT) — the way a real Indian creator captions their own reels, not formal/textbook Hindi and NEVER Devanagari script, unless the style preset above explicitly asks for something else. Example: "आज से ये मत करो" is WRONG; "Aaj se ye mat karo" is correct. Mix in English naturally where a real bilingual creator would ("Sugar Control", "Morning Routine", "Health Tip", "Business Mistake") rather than translating everything into one language mechanically. If the transcript is entirely in English, this doesn't apply — keep captions in English.
+- CTA: if the transcript's own final ~15% doesn't already contain a clear call-to-action, propose ONE additional caption citing the LAST few numbered words (for timing only) whose TEXT is a short CTA appropriate to the content — e.g. "Follow For More", "Save This Reel", "Comment GUIDE", "Like & Share". This is the same "text is rephrased, timing still anchors to real words" mechanic as everything else in this task — never invent a word index range that doesn't exist.
+
+POWER-WORD HIGHLIGHTING — for a caption whose wording genuinely has 1-3 standout words (not every caption needs this), set "highlightWords" to color just those words, using ONLY these five colors: white (#FFFFFF, the default/remaining-text color — you don't need to set this explicitly on non-highlighted words), yellow (#FFD60A), red (#FF3B30), green (#34C759), blue (#0A84FF). Use color to signal SEVERITY/TYPE, not decoration: red for warnings/negatives/urgency ("DON'T", "STOP", "NEVER"), yellow for the key subject/attention word, green for positive/success framing, blue for neutral informational emphasis (a number, a named thing). Example: for the caption "DON'T IGNORE DIABETES", you might set highlightWords to [{"word":"DON'T","color":"#FF3B30"},{"word":"IGNORE","color":"#FFD60A"}], leaving "DIABETES" as the default white. Each "word" must be spelled EXACTLY as it appears in this caption's own "text" (case-insensitive match is fine, but the letters must match).`;
+
 function buildPrompt(req: ReasoningPlanRequest): string {
   const videoSection = req.videoAnalysis
     ? `\nVideo-understanding analysis (from watching the footage):
@@ -215,14 +249,7 @@ TASK 1 — captions: Segment the transcript into natural caption chunks (roughly
       : ""
   }
 
-CAPTION VOICE — write viral, hook-style captions, not a plain transcription. A caption's job is to make someone stop scrolling and keep watching, not to be a court-reporter transcript of every word spoken:
-- Punch up the wording. Rather than transcribing verbatim, distill each caption down to its punchiest phrasing — short, declarative, high-impact. "Diabetes ko lightly mat lo" becomes something like "DON'T IGNORE DIABETES" or "BIGGEST MISTAKE" or "3 FOODS TO AVOID" — pick whichever punchy framing actually fits what that moment of the transcript is saying, don't force the same template everywhere.
-- Reach for power words where they genuinely fit the moment (never force one into every caption): WARNING, STOP, SAVE, SECRET, PRO TIP, DON'T, BIGGEST, WHY, HOW, TOP 3, IMPORTANT, NEVER.
-- Not every caption needs to be a hook — mid-video informational beats can read more plainly; save the punchiest treatment for the moments that most deserve it (the actual hook near the start, a genuine warning/insight, a key number or list item).
-- LANGUAGE REGISTER: if the transcript is spoken in Hindi or Hinglish, caption TEXT defaults to Roman-script Hinglish (Hindi-English code-mixed, colloquial, LATIN SCRIPT) — the way a real Indian creator captions their own reels, not formal/textbook Hindi and NEVER Devanagari script, unless the style preset above explicitly asks for something else. Example: "आज से ये मत करो" is WRONG; "Aaj se ye mat karo" is correct. Mix in English naturally where a real bilingual creator would ("Sugar Control", "Morning Routine", "Health Tip", "Business Mistake") rather than translating everything into one language mechanically. If the transcript is entirely in English, this doesn't apply — keep captions in English.
-- CTA: if the transcript's own final ~15% doesn't already contain a clear call-to-action, propose ONE additional caption citing the LAST few numbered words (for timing only) whose TEXT is a short CTA appropriate to the content — e.g. "Follow For More", "Save This Reel", "Comment GUIDE", "Like & Share". This is the same "text is rephrased, timing still anchors to real words" mechanic as everything else in this task — never invent a word index range that doesn't exist.
-
-POWER-WORD HIGHLIGHTING — for a caption whose wording genuinely has 1-3 standout words (not every caption needs this), set "highlightWords" to color just those words, using ONLY these five colors: white (#FFFFFF, the default/remaining-text color — you don't need to set this explicitly on non-highlighted words), yellow (#FFD60A), red (#FF3B30), green (#34C759), blue (#0A84FF). Use color to signal SEVERITY/TYPE, not decoration: red for warnings/negatives/urgency ("DON'T", "STOP", "NEVER"), yellow for the key subject/attention word, green for positive/success framing, blue for neutral informational emphasis (a number, a named thing). Example: for the caption "DON'T IGNORE DIABETES", you might set highlightWords to [{"word":"DON'T","color":"#FF3B30"},{"word":"IGNORE","color":"#FFD60A"}], leaving "DIABETES" as the default white. Each "word" must be spelled EXACTLY as it appears in this caption's own "text" (case-insensitive match is fine, but the letters must match).
+${CAPTION_VOICE_AND_HIGHLIGHT_GUIDANCE}
 
 TASK 2 — zoom: Zoom should feel motivated by the SPEECH, not decorative or random. Propose a zoom window (in addition to any video-understanding emphasis moments given above) when the transcript itself signals a moment worth pushing in on:
 - A question being asked (the sentence ends with "?" or is phrased as one).
@@ -514,6 +541,203 @@ Respond with ONLY a single JSON object, no other text, matching exactly this sha
 | { "action": "cannot_do", "message": string }`;
 }
 
+// ---------------------------------------------------------------------
+// AI Video Director (2026-08-07) — 5 new, focused prompt builders, one
+// per new agent, replacing slices of buildPrompt's single combined
+// prompt. Each is deliberately independent of buildPrompt (no shared
+// mutable state, no reuse of buildPrompt itself) so the legacy single-
+// call path stays byte-for-byte unchanged regardless of what happens
+// here. Small, genuinely-shared fragments (video-understanding section,
+// caption-voice guidance) are their own tiny helpers so the SAME wording
+// isn't hand-copied and left to drift.
+// ---------------------------------------------------------------------
+
+function buildVideoAnalysisFragment(videoAnalysis: ReasoningPlanRequest["videoAnalysis"], noneFallback: string): string {
+  return videoAnalysis
+    ? `\nVideo-understanding analysis (from watching the footage):
+Emphasis moments: ${JSON.stringify(videoAnalysis.emphasisMoments)}
+Emotion beats: ${JSON.stringify(videoAnalysis.emotionBeats)}
+Visual context: ${JSON.stringify(videoAnalysis.visualContext)}`
+    : `\n${noneFallback}`;
+}
+
+// Agent 3 — Story + Hook + Retention.
+function buildStoryPrompt(req: ReasoningStoryRequest): string {
+  const styleSection = req.stylePreset ? `\nStyle preset: "${req.stylePreset}" — let this influence TONE (energetic/calm/bold) but not the story STRUCTURE below.` : "";
+  const scriptSection = req.referenceScript ? `\nReference script (provided by the user — may not match the actual recording word-for-word):\n${req.referenceScript}` : "";
+
+  return `You are the Story + Hook + Retention agent inside an AI Video Director — a senior short-form video editor (15+ years, Opus Clip/Vizard/CapCut Auto Edit tier) planning the NARRATIVE STRUCTURE of a talking-head video before any captions, b-roll, zoom, or audio decisions are made downstream. The goal is an edit a professional editor would confidently publish without manual changes.
+
+Transcript words (format "index:word@startMs-endMs", numbered 0 to ${req.words.length - 1}):
+${formatWords(req.words)}
+${buildVideoAnalysisFragment(req.videoAnalysis, "No video-understanding analysis is available for this source — build the story purely from the transcript.")}
+${styleSection}
+${scriptSection}
+
+Source media duration: ${req.sourceDurationMs}ms. Every beat's startMs/endMs must be within [0, ${req.sourceDurationMs}].
+
+TASK — STORY RHYTHM: break the video into beats using this rhythm, in order, using ONLY the kinds that genuinely occur (most videos won't have all 7 — never invent a beat that isn't really there): "hook" (the opening moment that must earn attention — always required, always first), "curiosity" (a question or gap that makes the viewer want to keep watching), "value" (the actual substance/information/story — always required), "pattern_interrupt" (a genuine shift in energy, topic, or delivery that resets attention mid-video — optional), "visual_reward" (a moment that pays off with something satisfying to see/hear — optional), "proof" (evidence, a result, a demonstration, a specific number backing up a claim — optional), "cta" (a closing call-to-action). Beats must be chronological and non-overlapping, and together should roughly span the full video (small unaccounted-for stretches are fine — this is a narrative skeleton, not frame-perfect coverage). For each beat set a short "description" (what happens here) and, when there's a genuine editorial reason, "reason" (why this counts as this KIND of beat).
+
+TASK — HOOK: identify (or, if the literal opening words are weak, propose an IMPROVED) the hook. Set "hookText" to the strongest possible opening line for this content — if the transcript's actual first few seconds are already strong, use them close to verbatim; if they're a slow warm-up ("Hi guys, so today I wanted to talk about..."), propose a punchier alternative a real editor would open on instead. Set "hookStrengthReason" — a short, honest editorial note on WHY this hook works (or the biggest risk if it's weak).
+
+TASK — RETENTION: set "retentionScore" (0-100) — YOUR OWN editorial judgment (an opinion, not a measured statistic) of how likely a typical viewer is to keep watching past the first 3 seconds and through to the end, given the hook, pacing, and content. Be honest and calibrated, not automatically optimistic — a genuinely weak or slow opening should score well below 100. Set "retentionRisks" (0-6 short strings) naming SPECIFIC concrete risks (e.g. "slow first 2 seconds before any hook", "no clear payoff until very late", "monotone pacing in the middle third") — empty array if you see none.
+
+TASK — CTA: set "ctaPresent" true if the transcript's own final ~15% already contains a clear call-to-action; if not, set it false and propose one in "ctaText" (e.g. "Follow For More", "Save This Reel", "Comment GUIDE", "Like & Share") for the downstream Caption agent to place.
+
+Respond with ONLY a single JSON object, no other text, matching exactly this shape:
+{
+  "beats": [{ "kind": "hook"|"curiosity"|"value"|"pattern_interrupt"|"visual_reward"|"proof"|"cta", "startMs": number, "endMs": number, "description": string, "reason"?: string }],
+  "hookText": string,
+  "hookStrengthReason"?: string,
+  "retentionScore": number,
+  "retentionRisks": string[],
+  "ctaPresent"?: boolean,
+  "ctaText"?: string
+}`;
+}
+
+// Agent 4 — Captions. Same CAPTION_VOICE_AND_HIGHLIGHT_GUIDANCE the
+// legacy plan() uses, informed by the Story agent's own beats/hook/CTA.
+function buildCaptionAgentPrompt(req: ReasoningCaptionRequest): string {
+  const styleSection = req.stylePreset
+    ? `\nStyle preset: "${req.stylePreset}". Let this genuinely influence the captions' reveal style:
+- Punchy / energetic / shorts-style presets: reveal.mode "WORD" (or "KARAOKE" for a sing-along feel), short unitDurationMs (120-220), style "POP" or "COLOR_SWEEP".
+- Calm / professional / documentary-style presets: reveal.mode "NONE" (a static, non-animated caption per line) — set this EXPLICITLY; omitting "reveal" entirely defaults to word-by-word reveal, the WRONG choice for a calm preset.
+- Bold / hinglish presets: set "style.fontWeight" to 800 or 900 and "style.color" to a high-contrast color on every caption.`
+    : `\nNo style preset was chosen — use the neutral default: omit "reveal" entirely, or set reveal.mode "WORD" explicitly.`;
+  const scriptSection = req.referenceScript
+    ? `\nReference script (provided by the user — may not match the actual recording word-for-word): ${req.referenceScript}\nUse it to CORRECT obvious mis-transcribed words in caption TEXT ONLY — never change a caption's sourceWordStartIndex/sourceWordEndIndex based on the script, and never insert script text the transcript's own words don't cover at all. When the script and transcript genuinely disagree, trust the transcript.`
+    : "";
+  const beatsSection =
+    req.storyBeats.length > 0
+      ? `\nStory beats already planned by the Story agent — use these to know where the hook/CTA/value beats land, but still cite the transcript's own real word indices for every caption's timing: ${JSON.stringify(req.storyBeats)}`
+      : "";
+  const hookSection = req.hookText ? `\nThe Story agent's chosen hook line: "${req.hookText}" — the caption spanning the opening hook beat should reflect this framing (rephrase toward it, don't ignore it).` : "";
+  const ctaSection = req.ctaText
+    ? `\nThe Story agent's proposed CTA: "${req.ctaText}" — propose one additional caption citing the transcript's final few word indices (for timing only) whose TEXT is this CTA.`
+    : "";
+
+  return `You are the Caption agent inside an AI Video Director — the target quality bar is a modern short-form AI editor (Opus Clip / Vizard / CapCut Auto Edit style: punchy, fast-paced, immediately publishable to Reels/Shorts/TikTok), not a plain transcript with a subtitle track laid under it.
+
+Transcript words (format "index:word@startMs-endMs", numbered 0 to ${req.words.length - 1}):
+${formatWords(req.words)}
+${styleSection}
+${scriptSection}
+${beatsSection}
+${hookSection}
+${ctaSection}
+
+Segment the transcript into natural caption chunks (roughly sentence or clause length). For each caption, set "sourceWordStartIndex" and "sourceWordEndIndex" to the FIRST and LAST numbered word index that caption covers — do NOT produce startMs/endMs yourself, the app computes real timing directly from the ORIGINAL transcript word timestamps at those indices. Captions should not overlap and should be in chronological order (sourceWordStartIndex strictly increasing).
+
+${CAPTION_VOICE_AND_HIGHLIGHT_GUIDANCE}
+
+Respond with ONLY a single JSON object, no other text, matching exactly this shape:
+{ "captions": [{ "text": string, "sourceWordStartIndex": number, "sourceWordEndIndex": number, "reveal"?: { "mode": "NONE"|"WORD"|"CHARACTER"|"KARAOKE", "unitDurationMs": number, "style": "FADE"|"POP"|"COLOR_SWEEP", "highlightColor": string }, "style"?: { "fontWeight"?: number, "color"?: string, "fontSize"?: number, "fontFamily"?: string, "position"?: "top"|"center"|"bottom" }, "highlightWords"?: [{ "word": string, "color": string }] }] }`;
+}
+
+// Agent 5 — "Visuals": B-roll + Motion (zoom/camera-punch) + Transitions.
+function buildVisualsPrompt(req: ReasoningVisualsRequest): string {
+  const brollRange = computeBrollTargetRange(req.sourceDurationMs, req.brollDensity);
+  const brollDensityGuidance =
+    req.brollDensity === "MINIMAL"
+      ? `B-roll density: LIGHT. Aim for roughly ${brollRange.min}-${brollRange.max} b-roll slots for this video's length (~1-3 per minute) — only for moments that clearly stand out.`
+      : req.brollDensity === "HEAVY"
+        ? `B-roll density: HEAVY. Aim for roughly ${brollRange.min}-${brollRange.max} b-roll slots for this video's length (~6-12 per minute — the video's visual should genuinely change every few seconds). It is a real failure mode to land far below this range — if short of the target, look again at every sentence for a noun/location/product/action/person/brand you skipped.`
+        : `B-roll density: MEDIUM (default). Aim for roughly ${brollRange.min}-${brollRange.max} b-roll slots for this video's length (~3-6 per minute).`;
+  const stockOnlyGuidance = req.brollStockOnly
+    ? `\nPOLICY OVERRIDE — generation is disabled. Every b-roll item MUST have "source": "stock" with a real "searchQuery" — never "generate".`
+    : "";
+  const varietySection =
+    (req.usedZoomStyles?.length || req.usedTransitionTypes?.length || req.usedStickerQueries?.length || req.usedBrollStyles?.length)
+      ? `\nVISUAL VARIETY — never repeat the exact same zoom intensity/transition type/sticker/b-roll style twice in one video; already used this video: zoom styles ${JSON.stringify(req.usedZoomStyles ?? [])}, transition types ${JSON.stringify(req.usedTransitionTypes ?? [])}, sticker queries ${JSON.stringify(req.usedStickerQueries ?? [])}, b-roll styles ${JSON.stringify(req.usedBrollStyles ?? [])} — genuinely vary your choices instead of repeating any of these.`
+      : `\nVISUAL VARIETY — never repeat the exact same zoom intensity/transition type/sticker/b-roll style twice in one video; create natural variation.`;
+  const boundaryGuidance =
+    req.survivingSegmentCount >= 2
+      ? `There will be ${req.survivingSegmentCount} surviving segments of the main clip after the already-decided scene removal — you can propose transitions at boundary indices 0 through ${req.survivingSegmentCount - 2}.`
+      : `There is only 1 surviving segment of the main clip — there are NO internal boundaries. Propose zero transitions.`;
+
+  return `You are the Visuals agent (B-roll + Motion + Transitions) inside an AI Video Director — a senior short-form video editor planning NO DEAD SCREEN: no talking-head shot should remain visually unchanged for more than 2 seconds. Every decision should maximize watch time.
+
+Transcript words (format "index:word@startMs-endMs", numbered 0 to ${req.words.length - 1}):
+${formatWords(req.words)}
+${buildVideoAnalysisFragment(req.videoAnalysis, "No video-understanding analysis is available for this source.")}
+
+Finalized captions (for real timing/pacing context): ${JSON.stringify(req.captions.map((c) => ({ text: c.text, startMs: c.startMs, endMs: c.endMs })))}
+Story beats (know where pattern-interrupt/visual-reward/proof moments land — anchor extra visual energy there): ${JSON.stringify(req.storyBeats)}
+${varietySection}
+
+Source media duration: ${req.sourceDurationMs}ms. Every timestamp must be within [0, ${req.sourceDurationMs}].
+
+TASK — B-ROLL: ${brollDensityGuidance}${stockOnlyGuidance} Only propose a slot where the transcript mentions something concrete and visualizable. Placement is NOT evenly spaced or random — anchor to genuine TRIGGERS: a topic change, a sentence carrying real informational weight, or a concrete mention (important nouns, locations, products, actions, people, brands). At HEAVY density, scan for ALL adjacent concrete visuals a topic implies, not just the one or two most obvious nouns — prefer Indian context where the content itself is Indian/Hinglish. For each slot set "trackHint":"broll", startMs/endMs (1-4s window), "source" ("stock" whenever a decent keyword search would plausibly turn up something usable — this is nearly always the right choice; "generate" only for genuinely unphotographable content), "searchQuery" (2-5 literal keywords) AND "searchQueries" (3-8 semantically related expansions — synonyms/category expansions, e.g. a doctor/diabetes moment expands to hospital, patient, medicine, blood test, healthy food, clinic, nutrition, medical examination). Prefer portrait-friendly framing when the described scene naturally allows it. Set "contentKind":"motion_graphic" instead of the default "broll" when the moment calls for an animated graphic/icon-style overlay rather than a literal filmed cutaway. Set a short "reason" explaining why this moment earns a visual. Never set resolvedAssetId/resolvedAssetUrl/resolutionNote/costUsd.
+
+TASK — MOTION (zoom/camera-punch): propose a zoom window when the transcript signals a moment worth pushing in on — a question, a specific number/statistic/list item, or clear emotional emphasis (story beats above are a strong signal). Vary intensity (105-120%, keep scaleFrom around 100) and spacing — AVOID REPETITIVE RHYTHM. Set a short "reason". Propose 0-5 total.
+
+TASK — TRANSITIONS: ${boundaryGuidance} Propose a transition ONLY at a genuine scene-change/beat-relevant boundary — never reflexively on every boundary. For each, set "betweenClipIds" to EXACTLY ["__scene_segment_N__", "__scene_segment_N+1__"], "type" (CROSSFADE|DISSOLVE|WIPE|SLIDE|ZOOM|FLASH), "durationMs" (300-800), and a short "reason".
+
+TASK — STICKERS: propose 0-3 topic-based icon overlays (health -> heart/medicine-cross, business -> money/growth-chart, tech -> chip/AI, food -> plate, travel -> plane/map-pin, education -> book) — never random decorative emoji. Set "assetQuery", startMs/endMs (0.5-2s), optional "position", and a short "reason".
+
+Respond with ONLY a single JSON object, no other text, matching exactly this shape:
+{
+  "zoom": [{ "startMs": number, "endMs": number, "scaleFrom": number, "scaleTo": number, "reason"?: string }],
+  "broll": [{ "startMs": number, "endMs": number, "trackHint": "broll", "source": "stock"|"generate", "searchQuery"?: string, "searchQueries"?: string[], "generation"?: { "kind": "image"|"video", "prompt": string }, "contentKind"?: "broll"|"motion_graphic", "reason"?: string }],
+  "stickers": [{ "startMs": number, "endMs": number, "assetQuery": string, "position"?: { "x": number, "y": number }, "reason"?: string }],
+  "transitions": [{ "betweenClipIds": [string, string], "type": "CROSSFADE"|"DISSOLVE"|"WIPE"|"SLIDE"|"ZOOM"|"FLASH", "durationMs": number, "reason"?: string }]
+}`;
+}
+
+// Agent 6 — "Audio": Music + SFX.
+function buildAudioPrompt(req: ReasoningAudioRequest): string {
+  const sfxVariety = req.usedSfxQueries?.length
+    ? `\nAlready used this video: ${JSON.stringify(req.usedSfxQueries)} — vary your choices instead of repeating any of these.`
+    : "";
+
+  return `You are the Audio agent (Music + Sound Effects) inside an AI Video Director. SFX must feel INVISIBLE to a professional editor — an amateur should just feel the edit is energetic, never notice individual effects landing.
+
+Finalized visual/caption timeline (for duck/sync context):
+Captions: ${JSON.stringify(req.captions.map((c) => ({ text: c.text, startMs: c.startMs, endMs: c.endMs })))}
+B-roll cuts: ${JSON.stringify(req.broll.map((b) => ({ startMs: b.startMs, endMs: b.endMs })))}
+Transitions: ${JSON.stringify(req.transitions.map((t) => ({ durationMs: t.durationMs })))}
+Story beats: ${JSON.stringify(req.storyBeats)}
+${sfxVariety}
+
+Source media duration: ${req.sourceDurationMs}ms.
+
+TASK — MUSIC: propose AT MOST ONE background music bed, only if the content genuinely calls for one (a plain talking-head clip with no clear mood is a valid case for none — silence is a valid choice). Identify the CATEGORY the content fits — business, corporate, finance, motivational, healthcare, calm, podcast, minimal, comedy, fun, travel, or cinematic — driven by the content's actual emotion, topic, energy, pacing, and likely audience, then set "searchQuery" to a short mood/style/genre phrase matching that category. Leave "duckingEnabled"/"duckingVoiceTrackHint" unset unless you have a specific reason to override the defaults (ducking auto-enabled). Set a short "reason". Never set assetId/resolvedAssetUrl/resolutionNote.
+
+TASK — SFX: propose 0-4 short one-shot sound effects tied to genuine TIMELINE EVENTS above (a whoosh/swipe at a b-roll cut or transition, a pop/click at a caption's punchy entrance, an impact/text-pop at the strongest emphasis moment, a sparkle at a positive beat) — NEVER SPAM; most videos genuinely warrant 1-3 at most. Set "assetQuery" (e.g. "whoosh", "swipe", "click", "pop", "impact", "sparkle", "transition", "text pop"), "atMs", and a short "reason". Never set assetId/resolvedAssetUrl/resolutionNote.
+
+Respond with ONLY a single JSON object, no other text, matching exactly this shape:
+{
+  "music"?: { "searchQuery": string, "duckingEnabled"?: boolean, "duckingVoiceTrackHint"?: string, "reason"?: string },
+  "sfx": [{ "assetQuery": string, "atMs": number, "reason"?: string }]
+}`;
+}
+
+// Agent 7 — Quality Reviewer. Scores ONLY the 4 categories that genuinely
+// require judgment — everything structurally measurable is scored by
+// quality-review.ts without any LLM call (deterministicScores is passed
+// in purely as context, not something this call is asked to recompute).
+function buildQualityReviewPrompt(req: ReasoningQualityReviewRequest): string {
+  return `You are the Quality Reviewer agent inside an AI Video Director — reviewing a junior editor's work exactly like a senior editor would, before it ships. Ask, for the whole edit: "If I were editing this for a client paying real money for a single Reel, would I deliver this?" If genuinely no, name what's weak.
+
+Story: hook "${req.storySummary.hookText}", ${req.storySummary.beats.length} beats, Story agent's own retentionScore ${req.storySummary.retentionScore}.
+Captions (${req.captions.length}): ${JSON.stringify(req.captions.map((c) => c.text))}
+B-roll (${req.broll.length}) / Zoom (${req.zoom.length}) / Stickers (${req.stickers.length}) / Transitions (${req.transitions.length}) / SFX (${req.sfx.length}) / Music: ${req.music ? "present" : "none"}
+Already-computed structural scores (0-100, for context only — do not just restate these): ${JSON.stringify(req.deterministicScores)}
+Source media duration: ${req.sourceDurationMs}ms.
+
+Score these 4 categories, each 0-100, as your own honest editorial judgment (never automatically optimistic):
+- "hookScore": does the opening genuinely earn attention in the first 1-3 seconds?
+- "emotionScore": does the edit's pacing/visuals/music genuinely support the content's emotional tone?
+- "retentionScore": your own independent estimate of how well this edit holds a viewer to the end (may differ from the Story agent's own score above — this is a fresh judgment, not a copy).
+- "storyFlowScore": does the edit actually follow through on the story rhythm (hook -> curiosity -> value -> pattern interrupt -> visual reward -> proof -> cta), or does it feel disjointed/rushed/flat?
+
+Also set "weakCategories" — from this full list: hook, captions, broll, visualVariety, pacing, emotion, retention, music, sfx, storyFlow — name every category (including ones you didn't score numerically above) you'd genuinely tell a junior editor to redo before shipping. Empty array if you'd ship this as-is.
+
+Respond with ONLY a single JSON object, no other text, matching exactly this shape:
+{ "hookScore": number, "hookNote"?: string, "emotionScore": number, "emotionNote"?: string, "retentionScore": number, "retentionNote"?: string, "storyFlowScore": number, "storyFlowNote"?: string, "weakCategories": string[] }`;
+}
+
 export class GPT5ReasoningProvider implements ReasoningProvider {
   readonly id = "gpt5";
   readonly category = "REASONING" as const;
@@ -590,5 +814,98 @@ export class GPT5ReasoningProvider implements ReasoningProvider {
     });
 
     return { response: result.data, providerRef: result.providerRef, usage: result.usage };
+  }
+
+  // AI Video Director (2026-08-07) — 5 new focused agent calls. Each
+  // reuses the EXISTING runJsonRepairLoop (already fully generic — no new
+  // "shared repair loop" needed, it already is one) rather than
+  // reEdit()'s all-or-nothing gate being copied a 3rd/4th/5th time.
+  // Per-item lenient validation (parsePlanOutputLeniently's own approach)
+  // isn't reused here deliberately — that mechanism exists because ONE
+  // combined call's bad broll item used to wipe out five OTHER unrelated
+  // sections; these calls each own exactly one section, so an all-or-
+  // nothing repair-and-retry is the simpler, equally-safe fit.
+
+  async planStory(req: ReasoningStoryRequest, signal?: AbortSignal): Promise<ReasoningStoryResult> {
+    const apiKey = this.config.apiKey;
+    if (!apiKey) throw new Error("gpt5 is enabled but no API key is configured (Admin → AI Providers).");
+    const repairMaxAttempts = req.repairMaxAttempts ?? DEFAULT_REPAIR_MAX_ATTEMPTS;
+    const messages: ChatMessage[] = [
+      { role: "system", content: "You are a precise video-editing assistant that outputs ONLY valid JSON, exactly matching the schema you're given. Never include prose, markdown fences, or explanation outside the JSON object." },
+      { role: "user", content: buildStoryPrompt(req) },
+    ];
+    const result = await runJsonRepairLoop({ apiKey, model: this.model, messages, schema: reasoningStoryOutputSchema, repairMaxAttempts, errorPrefix: "GPT-5 story planning", schemaFailureKind: "story", signal });
+    return {
+      beats: result.data.beats,
+      hookText: result.data.hookText,
+      hookStrengthReason: result.data.hookStrengthReason,
+      retentionScore: result.data.retentionScore,
+      retentionRisks: result.data.retentionRisks,
+      ctaPresent: result.data.ctaPresent,
+      ctaText: result.data.ctaText,
+      providerRef: result.providerRef,
+      usage: result.usage,
+    };
+  }
+
+  async planCaptions(req: ReasoningCaptionRequest, signal?: AbortSignal): Promise<ReasoningCaptionResult> {
+    const apiKey = this.config.apiKey;
+    if (!apiKey) throw new Error("gpt5 is enabled but no API key is configured (Admin → AI Providers).");
+    const repairMaxAttempts = req.repairMaxAttempts ?? DEFAULT_REPAIR_MAX_ATTEMPTS;
+    const messages: ChatMessage[] = [
+      { role: "system", content: "You are a precise video-editing assistant that outputs ONLY valid JSON, exactly matching the schema you're given. Never include prose, markdown fences, or explanation outside the JSON object." },
+      { role: "user", content: buildCaptionAgentPrompt(req) },
+    ];
+    const wrapperSchema = z.object({ captions: z.array(reasoningCaptionRawSchema) });
+    const result = await runJsonRepairLoop({ apiKey, model: this.model, messages, schema: wrapperSchema, repairMaxAttempts, errorPrefix: "GPT-5 caption planning", schemaFailureKind: "captions", signal });
+    return { captions: resolveCaptionTiming(result.data.captions, req.words), providerRef: result.providerRef, usage: result.usage };
+  }
+
+  async planVisuals(req: ReasoningVisualsRequest, signal?: AbortSignal): Promise<ReasoningVisualsResult> {
+    const apiKey = this.config.apiKey;
+    if (!apiKey) throw new Error("gpt5 is enabled but no API key is configured (Admin → AI Providers).");
+    const repairMaxAttempts = req.repairMaxAttempts ?? DEFAULT_REPAIR_MAX_ATTEMPTS;
+    const messages: ChatMessage[] = [
+      { role: "system", content: "You are a precise video-editing assistant that outputs ONLY valid JSON, exactly matching the schema you're given. Never include prose, markdown fences, or explanation outside the JSON object." },
+      { role: "user", content: buildVisualsPrompt(req) },
+    ];
+    const result = await runJsonRepairLoop({ apiKey, model: this.model, messages, schema: reasoningVisualsOutputSchema, repairMaxAttempts, errorPrefix: "GPT-5 visuals planning", schemaFailureKind: "visuals", signal });
+    return { zoom: result.data.zoom, broll: result.data.broll, stickers: result.data.stickers, transitions: result.data.transitions, providerRef: result.providerRef, usage: result.usage };
+  }
+
+  async planAudio(req: ReasoningAudioRequest, signal?: AbortSignal): Promise<ReasoningAudioResult> {
+    const apiKey = this.config.apiKey;
+    if (!apiKey) throw new Error("gpt5 is enabled but no API key is configured (Admin → AI Providers).");
+    const repairMaxAttempts = req.repairMaxAttempts ?? DEFAULT_REPAIR_MAX_ATTEMPTS;
+    const messages: ChatMessage[] = [
+      { role: "system", content: "You are a precise video-editing assistant that outputs ONLY valid JSON, exactly matching the schema you're given. Never include prose, markdown fences, or explanation outside the JSON object." },
+      { role: "user", content: buildAudioPrompt(req) },
+    ];
+    const result = await runJsonRepairLoop({ apiKey, model: this.model, messages, schema: reasoningAudioOutputSchema, repairMaxAttempts, errorPrefix: "GPT-5 audio planning", schemaFailureKind: "audio", signal });
+    return { music: result.data.music, sfx: result.data.sfx, providerRef: result.providerRef, usage: result.usage };
+  }
+
+  async reviewQuality(req: ReasoningQualityReviewRequest, signal?: AbortSignal): Promise<ReasoningQualityReviewResult> {
+    const apiKey = this.config.apiKey;
+    if (!apiKey) throw new Error("gpt5 is enabled but no API key is configured (Admin → AI Providers).");
+    const repairMaxAttempts = req.repairMaxAttempts ?? DEFAULT_REPAIR_MAX_ATTEMPTS;
+    const messages: ChatMessage[] = [
+      { role: "system", content: "You are a precise video-editing assistant that outputs ONLY valid JSON, exactly matching the schema you're given. Never include prose, markdown fences, or explanation outside the JSON object." },
+      { role: "user", content: buildQualityReviewPrompt(req) },
+    ];
+    const result = await runJsonRepairLoop({ apiKey, model: this.model, messages, schema: reasoningQualityReviewOutputSchema, repairMaxAttempts, errorPrefix: "GPT-5 quality review", schemaFailureKind: "quality review", signal });
+    return {
+      hookScore: result.data.hookScore,
+      hookNote: result.data.hookNote,
+      emotionScore: result.data.emotionScore,
+      emotionNote: result.data.emotionNote,
+      retentionScore: result.data.retentionScore,
+      retentionNote: result.data.retentionNote,
+      storyFlowScore: result.data.storyFlowScore,
+      storyFlowNote: result.data.storyFlowNote,
+      weakCategories: result.data.weakCategories,
+      providerRef: result.providerRef,
+      usage: result.usage,
+    };
   }
 }

@@ -785,3 +785,143 @@ describe("resolveCaptionTiming (pure)", () => {
     expect(result[0].startMs).toBe(0);
   });
 });
+
+// AI Video Director (2026-08-07) — the 5 new focused agent calls. Each
+// follows the exact same fetch-mock/chatResponse pattern as plan()'s own
+// tests above; no need for a second mocking convention.
+describe("GPT5ReasoningProvider — Director agents", () => {
+  const words = [
+    { word: "Hello", startMs: 0, endMs: 300 },
+    { word: "world", startMs: 300, endMs: 600 },
+  ];
+
+  it("planStory: throws without an API key, returns validated beats/hook/retention on success", async () => {
+    const provider = new GPT5ReasoningProvider({});
+    await expect(provider.planStory({ words, videoAnalysis: null, sourceDurationMs: 5000 })).rejects.toThrow(/no API key/);
+
+    const json = JSON.stringify({
+      beats: [{ kind: "hook", startMs: 0, endMs: 600, description: "Opening line" }],
+      hookText: "Hello world",
+      retentionScore: 72,
+      retentionRisks: ["slow start"],
+      ctaPresent: false,
+      ctaText: "Follow For More",
+    });
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(json));
+    vi.stubGlobal("fetch", fetchMock);
+    const authed = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    const result = await authed.planStory({ words, videoAnalysis: null, sourceDurationMs: 5000 });
+
+    expect(result.beats).toHaveLength(1);
+    expect(result.beats[0].kind).toBe("hook");
+    expect(result.hookText).toBe("Hello world");
+    expect(result.retentionScore).toBe(72);
+    expect(result.retentionRisks).toEqual(["slow start"]);
+    expect(result.ctaText).toBe("Follow For More");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("planStory prompt: names all 7 story-rhythm beat kinds and asks for an honest, non-optimistic retentionScore", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(JSON.stringify({ beats: [{ kind: "value", startMs: 0, endMs: 600, description: "x" }], hookText: "x", retentionScore: 50, retentionRisks: [] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.planStory({ words, videoAnalysis: null, sourceDurationMs: 5000 });
+    const userMessage = fetchMock.mock.calls[0][1].body && JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
+
+    for (const kind of ["hook", "curiosity", "value", "pattern_interrupt", "visual_reward", "proof", "cta"]) {
+      expect(userMessage).toContain(`"${kind}"`);
+    }
+    expect(userMessage).toContain("YOUR OWN editorial judgment");
+    expect(userMessage).toContain("not automatically optimistic");
+  });
+
+  it("planCaptions: returns real transcript-anchored captions and reuses the same viral/highlight guidance as plan()", async () => {
+    const json = JSON.stringify({ captions: [{ text: "Hello world", sourceWordStartIndex: 0, sourceWordEndIndex: 1 }] });
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(json));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    const result = await provider.planCaptions({ words, storyBeats: [] });
+
+    expect(result.captions).toEqual([{ text: "Hello world.", startMs: 0, endMs: 600 }]);
+    const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
+    expect(userMessage).toContain("viral, hook-style captions");
+    expect(userMessage).toContain("Roman-script Hinglish");
+    expect(userMessage).toContain("highlightWords");
+  });
+
+  it("planCaptions prompt: surfaces the Story agent's hook/CTA/beats when given", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(JSON.stringify({ captions: [] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.planCaptions({
+      words,
+      storyBeats: [{ kind: "hook", startMs: 0, endMs: 300, description: "d" }],
+      hookText: "Don't Ignore This",
+      ctaText: "Save This Reel",
+    });
+    const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
+    expect(userMessage).toContain("Don't Ignore This");
+    expect(userMessage).toContain("Save This Reel");
+  });
+
+  it("planVisuals: returns zoom/broll/stickers/transitions and prompts no-dead-screen + visual variety", async () => {
+    const json = JSON.stringify({
+      zoom: [{ startMs: 0, endMs: 500, scaleFrom: 100, scaleTo: 112, reason: "question" }],
+      broll: [],
+      stickers: [],
+      transitions: [],
+    });
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(json));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    const result = await provider.planVisuals({ words, videoAnalysis: null, captions: [], storyBeats: [], sourceDurationMs: 5000, survivingSegmentCount: 1, usedZoomStyles: ["subtle"] });
+
+    expect(result.zoom).toHaveLength(1);
+    expect(result.zoom[0].reason).toBe("question");
+    const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
+    expect(userMessage).toContain("NO DEAD SCREEN");
+    expect(userMessage).toContain("VISUAL VARIETY");
+    expect(userMessage).toContain(`["subtle"]`);
+    expect(userMessage).toContain("searchQueries");
+    expect(userMessage).toContain("contentKind");
+  });
+
+  it("planAudio: returns music/sfx and prompts SFX invisibility + anti-spam", async () => {
+    const json = JSON.stringify({ music: { searchQuery: "calm ambient piano" }, sfx: [{ assetQuery: "whoosh", atMs: 1000 }] });
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(json));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    const result = await provider.planAudio({ words, storyBeats: [], captions: [], broll: [], transitions: [], sourceDurationMs: 5000 });
+
+    expect(result.music?.searchQuery).toBe("calm ambient piano");
+    expect(result.sfx).toHaveLength(1);
+    const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
+    expect(userMessage).toContain("INVISIBLE to a professional editor");
+    expect(userMessage).toContain("NEVER SPAM");
+    expect(userMessage).toContain("business, corporate, finance, motivational, healthcare, calm, podcast, minimal, comedy, fun, travel, or cinematic");
+  });
+
+  it("reviewQuality: returns the 4 LLM-judged scores + weakCategories, asks the client-would-I-ship-this question", async () => {
+    const json = JSON.stringify({ hookScore: 80, emotionScore: 70, retentionScore: 75, storyFlowScore: 65, weakCategories: ["pacing"] });
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(json));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    const result = await provider.reviewQuality({
+      storySummary: { hookText: "x", beats: [], retentionScore: 50 },
+      captions: [],
+      broll: [],
+      zoom: [],
+      stickers: [],
+      transitions: [],
+      sfx: [],
+      deterministicScores: { captions: 90 },
+      sourceDurationMs: 5000,
+    });
+
+    expect(result.hookScore).toBe(80);
+    expect(result.weakCategories).toEqual(["pacing"]);
+    const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
+    expect(userMessage).toContain("would I deliver this");
+    expect(userMessage).toContain("senior editor");
+  });
+});

@@ -1,6 +1,22 @@
 import { DEFAULT_REVEAL_CONFIG } from "@/lib/video-editor/text-style";
 import { buildFallbackCaptionsFromWords } from "@/lib/video-editor/caption-formatting";
-import type { ReasoningPlanRequest, ReasoningPlanResult, ReasoningProvider, ReasoningReeditRequest, ReasoningReeditResult } from "./types";
+import type {
+  ReasoningAudioRequest,
+  ReasoningAudioResult,
+  ReasoningCaptionRequest,
+  ReasoningCaptionResult,
+  ReasoningPlanRequest,
+  ReasoningPlanResult,
+  ReasoningProvider,
+  ReasoningQualityReviewRequest,
+  ReasoningQualityReviewResult,
+  ReasoningReeditRequest,
+  ReasoningReeditResult,
+  ReasoningStoryRequest,
+  ReasoningStoryResult,
+  ReasoningVisualsRequest,
+  ReasoningVisualsResult,
+} from "./types";
 
 // Default provider (selected when no REASONING ProviderConfig is enabled)
 // — deterministic captions chunked straight from the given words (one
@@ -56,6 +72,67 @@ export class MockReasoningProvider implements ReasoningProvider {
     return {
       response: { action: "cannot_do", message: "The mock reasoning provider can't interpret re-edit instructions — configure a real REASONING provider (Admin → AI Providers) to use this feature." },
       providerRef: `mock-reedit-${Date.now()}`,
+    };
+  }
+
+  // AI Video Director (2026-08-07) — required by ReasoningProvider's 5 new
+  // methods (TypeScript structural typing), used when
+  // AI_EDIT_DIRECTOR_PIPELINE_ENABLED is on. Same "never fabricate
+  // insight" philosophy as plan()/reEdit() above: honest, cheap,
+  // deterministic, and never a plausible-looking invention. A real
+  // REASONING provider (GPT5ReasoningProvider) is required for the
+  // Director pipeline to produce anything genuinely useful — these stubs
+  // exist so the pipeline's WIRING (orchestration, scoring, translation)
+  // is fully exercisable in tests without API credentials, the same role
+  // plan()'s own empty broll/sticker/music/sfx/transitions already serve.
+  async planStory(req: ReasoningStoryRequest): Promise<ReasoningStoryResult> {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const hookText = req.words.slice(0, 8).map((w) => w.word).join(" ") || "Watch this.";
+    return {
+      beats: [{ kind: "value", startMs: 0, endMs: req.sourceDurationMs, description: "Mock provider — no real story structure, one beat spanning the whole video." }],
+      hookText,
+      // Explicitly neutral, never a fabricated judgment — the mock has no
+      // real understanding of what makes a hook strong.
+      retentionScore: 50,
+      retentionRisks: [],
+      ctaPresent: false,
+    };
+  }
+
+  async planCaptions(req: ReasoningCaptionRequest): Promise<ReasoningCaptionResult> {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const captions = buildFallbackCaptionsFromWords(req.words).map((c) => ({
+      text: c.text,
+      startMs: c.startMs,
+      endMs: c.endMs,
+      reveal: { ...DEFAULT_REVEAL_CONFIG, mode: "WORD" as const },
+    }));
+    return { captions };
+  }
+
+  async planVisuals(_req: ReasoningVisualsRequest): Promise<ReasoningVisualsResult> {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // No real understanding of what's concrete/visualizable — same reason
+    // plan()'s own broll/stickers come back empty from the mock.
+    return { zoom: [], broll: [], stickers: [], transitions: [] };
+  }
+
+  async planAudio(_req: ReasoningAudioRequest): Promise<ReasoningAudioResult> {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    return { sfx: [] };
+  }
+
+  async reviewQuality(_req: ReasoningQualityReviewRequest): Promise<ReasoningQualityReviewResult> {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // Flat, mid-range, non-committal scores that never trigger a retry
+    // loop in tests exercising the mock provider (weakCategories: []) —
+    // an honest "I have no real opinion," not a manufactured pass/fail.
+    return {
+      hookScore: 60,
+      emotionScore: 60,
+      retentionScore: 60,
+      storyFlowScore: 60,
+      weakCategories: [],
     };
   }
 }

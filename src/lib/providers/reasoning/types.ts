@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import type { GenerationProvider } from "@/lib/generation/types";
 import {
+  AI_QUALITY_CATEGORIES,
   aiBrollSchema,
   aiCaptionHighlightWordSchema,
   aiCaptionRevealSchema,
@@ -9,12 +10,15 @@ import {
   aiMusicSchema,
   aiSfxSchema,
   aiStickerSchema,
+  aiStoryBeatSchema,
   aiTransitionSchema,
   type AIBroll,
   type AICaption,
+  type AiQualityCategory,
   type AIMusic,
   type AISfx,
   type AISticker,
+  type AIStoryBeat,
   type AITransitionPlan,
 } from "@/lib/validations/ai-timeline";
 import type { AIReeditResponse } from "@/lib/validations/ai-reedit";
@@ -100,6 +104,11 @@ export const reasoningZoomItemSchema = z
     endMs: z.number().int().min(0),
     scaleFrom: z.number().min(1).max(1000),
     scaleTo: z.number().min(1).max(1000),
+    // AI Video Director (2026-08-07) — see aiCaptionSchema's own doc
+    // comment (validations/ai-timeline.ts) for the shared reason-field
+    // convention. Optional so plan()'s own legacy zoom output (which
+    // never sets this) keeps parsing unchanged.
+    reason: z.string().min(1).max(280).optional(),
   })
   .refine((v) => v.endMs > v.startMs, { message: "endMs must be after startMs" });
 export type ReasoningZoomItem = z.infer<typeof reasoningZoomItemSchema>;
@@ -286,9 +295,215 @@ export interface ReasoningReeditResult {
   usage?: { tokens?: number };
 }
 
+// ---------------------------------------------------------------------
+// AI Video Director (2026-08-07) — 5 new, focused agent calls replacing
+// slices of `plan()`'s single combined prompt, per the approved plan
+// (purring-foraging-graham.md). `plan()`/`reEdit()` above are UNCHANGED —
+// these are purely additive methods on ReasoningProvider, used only when
+// AI_EDIT_DIRECTOR_PIPELINE_ENABLED is on (director/orchestrator.ts).
+// Each request only carries what that agent's own prompt genuinely needs
+// (never the whole job context), matching the data-dependency chain the
+// orchestrator threads through DirectorContext: Story -> Captions ->
+// Visuals (broll+motion+transitions) -> Audio (music+sfx) -> Quality
+// Reviewer.
+// ---------------------------------------------------------------------
+
+// Agent 3 — Story + Hook + Retention. Produces the shared narrative spine
+// (story rhythm: hook -> curiosity -> value -> pattern interrupt ->
+// visual reward -> proof -> cta) every downstream agent consumes.
+export interface ReasoningStoryRequest {
+  words: ReasoningPlanRequest["words"];
+  videoAnalysis: ReasoningPlanRequest["videoAnalysis"];
+  stylePreset?: string;
+  referenceScript?: string;
+  sourceDurationMs: number;
+  repairMaxAttempts?: number;
+}
+
+// Beats use genuine timeline-absolute ms (same convention broll/zoom
+// already use in plan() — only captions cite word INDICES, see
+// reasoningCaptionRawSchema's own doc comment for why). Reuses
+// aiStoryBeatSchema verbatim — same "the model's raw output and the
+// app's own contract are the same schema" principle broll already
+// established, not a parallel looser shape.
+export const reasoningStoryOutputSchema = z.object({
+  beats: z.array(aiStoryBeatSchema).min(1),
+  hookText: z.string().min(1).max(200),
+  hookStrengthReason: z.string().min(1).max(280).optional(),
+  // LLM-judgment only — an opinion from this one call, never a trained
+  // retention-prediction model. See aiStoryPlanSchema's own doc comment.
+  retentionScore: z.number().min(0).max(100),
+  retentionRisks: z.array(z.string().min(1)).max(6).default([]),
+  ctaPresent: z.boolean().optional(),
+  ctaText: z.string().min(1).max(200).optional(),
+});
+export type ReasoningStoryOutput = z.infer<typeof reasoningStoryOutputSchema>;
+
+export interface ReasoningStoryResult {
+  beats: AIStoryBeat[];
+  hookText: string;
+  hookStrengthReason?: string;
+  retentionScore: number;
+  retentionRisks: string[];
+  ctaPresent?: boolean;
+  ctaText?: string;
+  providerRef?: string;
+  usage?: { tokens?: number };
+  warnings?: string[];
+}
+
+// Agent 4 — Captions. Reuses reasoningCaptionRawSchema/resolveCaptionTiming
+// VERBATIM (the already-built viral/Hinglish/power-word/highlight engine —
+// no rebuild), just now informed by the Story agent's beats so the hook
+// and CTA lines land where the narrative actually puts them.
+export interface ReasoningCaptionRequest {
+  words: ReasoningPlanRequest["words"];
+  stylePreset?: string;
+  referenceScript?: string;
+  storyBeats: AIStoryBeat[];
+  hookText?: string;
+  ctaText?: string;
+  repairMaxAttempts?: number;
+}
+
+export interface ReasoningCaptionResult {
+  captions: AICaption[];
+  providerRef?: string;
+  usage?: { tokens?: number };
+  warnings?: string[];
+}
+
+// Agent 5 — "Visuals": B-roll + Motion (zoom/camera-punch) + Transitions.
+// Needs the finalized captions (for real cut/zoom/broll timing) and the
+// story beats (to know where pattern-interrupt/visual-reward moments
+// land). Carries the variety ledger's "already used" lists so the model
+// itself tries not to repeat a style/type — see variety-ledger.ts.
+export interface ReasoningVisualsRequest {
+  words: ReasoningPlanRequest["words"];
+  videoAnalysis: ReasoningPlanRequest["videoAnalysis"];
+  captions: AICaption[];
+  storyBeats: AIStoryBeat[];
+  brollDensity?: "MINIMAL" | "BALANCED" | "HEAVY";
+  brollStockOnly?: boolean;
+  sourceDurationMs: number;
+  survivingSegmentCount: number;
+  usedZoomStyles?: string[];
+  usedTransitionTypes?: string[];
+  usedStickerQueries?: string[];
+  usedBrollStyles?: string[];
+  repairMaxAttempts?: number;
+}
+
+export const reasoningVisualsOutputSchema = z.object({
+  zoom: z.array(reasoningZoomItemSchema),
+  broll: z.array(aiBrollSchema),
+  stickers: z.array(aiStickerSchema).default([]),
+  transitions: z.array(aiTransitionSchema).default([]),
+});
+export type ReasoningVisualsOutput = z.infer<typeof reasoningVisualsOutputSchema>;
+
+export interface ReasoningVisualsResult {
+  zoom: ReasoningZoomItem[];
+  broll: AIBroll[];
+  stickers: AISticker[];
+  transitions: AITransitionPlan[];
+  providerRef?: string;
+  usage?: { tokens?: number };
+  warnings?: string[];
+}
+
+// Agent 6 — "Audio": Music + SFX. Needs the finished visual/caption
+// timeline to duck/sync against, per the brief ("automatically duck
+// speech" / SFX tied to real timeline events). Reuses the existing
+// ducking mechanism (EditorTrack.duckingEnabled/duckingVoiceTrackIds)
+// unmodified — only the selection prompt gets richer.
+export interface ReasoningAudioRequest {
+  words: ReasoningPlanRequest["words"];
+  storyBeats: AIStoryBeat[];
+  captions: AICaption[];
+  broll: AIBroll[];
+  transitions: AITransitionPlan[];
+  sourceDurationMs: number;
+  usedSfxQueries?: string[];
+  repairMaxAttempts?: number;
+}
+
+export const reasoningAudioOutputSchema = z.object({
+  music: aiMusicSchema.optional(),
+  sfx: z.array(aiSfxSchema).default([]),
+});
+export type ReasoningAudioOutput = z.infer<typeof reasoningAudioOutputSchema>;
+
+export interface ReasoningAudioResult {
+  music?: AIMusic;
+  sfx: AISfx[];
+  providerRef?: string;
+  usage?: { tokens?: number };
+  warnings?: string[];
+}
+
+// Agent 7 — Quality Reviewer. Scores ONLY the 4 categories that genuinely
+// require judgment (Hook/Emotion/Retention/Story Flow) — everything
+// structurally measurable (Captions/B-roll/Visual Variety/Pacing/Music/
+// SFX) is scored deterministically by quality-review.ts without any LLM
+// call. `deterministicScores` is fed IN so this call can reason about the
+// full picture without re-deriving what's already known.
+export interface ReasoningQualityReviewRequest {
+  storySummary: { hookText: string; beats: AIStoryBeat[]; retentionScore: number };
+  captions: AICaption[];
+  broll: AIBroll[];
+  zoom: ReasoningZoomItem[];
+  stickers: AISticker[];
+  transitions: AITransitionPlan[];
+  music?: AIMusic;
+  sfx: AISfx[];
+  deterministicScores: Partial<Record<AiQualityCategory, number>>;
+  sourceDurationMs: number;
+  repairMaxAttempts?: number;
+}
+
+export const reasoningQualityReviewOutputSchema = z.object({
+  hookScore: z.number().min(0).max(100),
+  hookNote: z.string().min(1).max(280).optional(),
+  emotionScore: z.number().min(0).max(100),
+  emotionNote: z.string().min(1).max(280).optional(),
+  retentionScore: z.number().min(0).max(100),
+  retentionNote: z.string().min(1).max(280).optional(),
+  storyFlowScore: z.number().min(0).max(100),
+  storyFlowNote: z.string().min(1).max(280).optional(),
+  // Which categories (from the full AI_QUALITY_CATEGORIES set, not just
+  // this call's own 4 judged ones) the model itself flags as weak —
+  // advisory input to quality-review.ts's own routing; the deterministic
+  // categories' weakness is still decided by their own scorers, not by
+  // asking the model to self-report on numbers it never computed.
+  weakCategories: z.array(z.enum(AI_QUALITY_CATEGORIES)).default([]),
+});
+export type ReasoningQualityReviewOutput = z.infer<typeof reasoningQualityReviewOutputSchema>;
+
+export interface ReasoningQualityReviewResult {
+  hookScore: number;
+  hookNote?: string;
+  emotionScore: number;
+  emotionNote?: string;
+  retentionScore: number;
+  retentionNote?: string;
+  storyFlowScore: number;
+  storyFlowNote?: string;
+  weakCategories: AiQualityCategory[];
+  providerRef?: string;
+  usage?: { tokens?: number };
+  warnings?: string[];
+}
+
 export interface ReasoningProvider extends GenerationProvider {
   plan(req: ReasoningPlanRequest, signal?: AbortSignal): Promise<ReasoningPlanResult>;
   reEdit(req: ReasoningReeditRequest, signal?: AbortSignal): Promise<ReasoningReeditResult>;
+  // AI Video Director (2026-08-07) — additive, see the block comment above.
+  planStory(req: ReasoningStoryRequest, signal?: AbortSignal): Promise<ReasoningStoryResult>;
+  planCaptions(req: ReasoningCaptionRequest, signal?: AbortSignal): Promise<ReasoningCaptionResult>;
+  planVisuals(req: ReasoningVisualsRequest, signal?: AbortSignal): Promise<ReasoningVisualsResult>;
+  planAudio(req: ReasoningAudioRequest, signal?: AbortSignal): Promise<ReasoningAudioResult>;
+  reviewQuality(req: ReasoningQualityReviewRequest, signal?: AbortSignal): Promise<ReasoningQualityReviewResult>;
 }
 
 // Phase 12 Module 10 — costUsd is attached by the Generation Engine itself
@@ -296,3 +511,11 @@ export interface ReasoningProvider extends GenerationProvider {
 // adapter — real per-call vendor cost, for the AI Auto-Editor cost preview.
 export type ReasoningPlanResultWithProvider = ReasoningPlanResult & { providerId: string; costUsd?: number };
 export type ReasoningReeditResultWithProvider = ReasoningReeditResult & { providerId: string; costUsd?: number };
+
+// AI Video Director (2026-08-07) — same providerId/costUsd attachment
+// convention as the two above, one per new agent capability.
+export type ReasoningStoryResultWithProvider = ReasoningStoryResult & { providerId: string; costUsd?: number };
+export type ReasoningCaptionResultWithProvider = ReasoningCaptionResult & { providerId: string; costUsd?: number };
+export type ReasoningVisualsResultWithProvider = ReasoningVisualsResult & { providerId: string; costUsd?: number };
+export type ReasoningAudioResultWithProvider = ReasoningAudioResult & { providerId: string; costUsd?: number };
+export type ReasoningQualityReviewResultWithProvider = ReasoningQualityReviewResult & { providerId: string; costUsd?: number };
