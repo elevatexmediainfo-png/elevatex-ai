@@ -24,7 +24,10 @@ export interface AiEditQualityScores {
   pacingScore: number;
 }
 
-function clamp0to100(n: number): number {
+// Exported (2026-08-07) — the AI Video Director's own quality-review.ts
+// reuses this and scoreCaptions/scorePacing directly rather than a
+// second, drifting copy of the same coverage/brevity/pacing math.
+export function clamp0to100(n: number): number {
   return Math.max(0, Math.min(100, Math.round(n)));
 }
 
@@ -47,7 +50,7 @@ function captionCoverageFraction(captions: AICaption[], sourceDurationMs: number
   return Math.min(1, coveredMs / sourceDurationMs);
 }
 
-function scoreCaptions(captions: AICaption[], sourceDurationMs: number): number {
+export function scoreCaptions(captions: AICaption[], sourceDurationMs: number): number {
   if (captions.length === 0) return 0;
   const coverage = captionCoverageFraction(captions, sourceDurationMs); // 0..1
   const withHighlight = captions.filter((c) => c.highlightWords && c.highlightWords.length > 0).length;
@@ -65,6 +68,28 @@ function scoreCaptions(captions: AICaption[], sourceDurationMs: number): number 
   return clamp0to100(coverage * 60 + brevityScore * 25 + highlightRate * 15);
 }
 
+// FLAGGED, NOT FIXED (2026-08-07, found while building the AI Video
+// Director's own quality-review.ts, which deliberately does NOT repeat
+// this) — `resolvedCount` below filters on `resolvedAssetId`, but
+// scoreAiTimelinePlan is invoked from ai-edit-jobs.ts's attemptPlanning()
+// during PLANNING_TIMELINE, which runs BEFORE RESOLVING_ASSETS ever sets
+// resolvedAssetId on any broll item (see aiBrollSchema's own doc comment
+// in validations/ai-timeline.ts — "filled in by a LATER module, not this
+// one"). In production this means `resolvedCount` is effectively ALWAYS
+// 0 at the point this function actually runs, so `brollFit` is always 0
+// and `visualScore` is capped at ~20 (zoom/sticker bonuses only)
+// regardless of how well the b-roll plan actually matches the requested
+// density — which in turn means the bounded quality retry (AI_EDIT_
+// QUALITY_RETRY_THRESHOLD, 55) likely fires on nearly every run that
+// includes broll/zoom/stickers, silently doubling reasoning cost. NOT
+// fixed here deliberately — this function's exact behavior is the "zero
+// behavior change to the legacy path" contract this session's AI Video
+// Director work is built on (see PROJECT_STATUS.md / the final report);
+// changing it would alter legacy retry frequency, which is out of this
+// task's scope. Flagged for a dedicated follow-up fix (likely: count
+// proposed items directly, `broll.length`, since resolution hasn't
+// happened yet at this point in the pipeline — the AI Video Director's
+// own quality-review.ts does exactly this for its equivalent brollScore).
 function scoreVisuals(
   broll: AIBroll[],
   zoom: AIZoom[],
@@ -100,7 +125,7 @@ function scoreVisuals(
 // find SOMETHING in almost any unscripted recording); (2) captions don't
 // leave any single gap larger than a generous ceiling, which would read
 // as a long dead stretch with no on-screen text to hold attention.
-function scorePacing(sceneRemoval: AISceneRemoval[], captions: AICaption[], sourceDurationMs: number): number {
+export function scorePacing(sceneRemoval: AISceneRemoval[], captions: AICaption[], sourceDurationMs: number): number {
   const removalScore = sceneRemoval.length > 0 ? 1 : 0.4; // not zero — a genuinely clean recording with nothing to cut is possible, just less common
   let largestGapMs = 0;
   const sorted = [...captions].sort((a, b) => a.startMs - b.startMs);
