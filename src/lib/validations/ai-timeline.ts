@@ -135,6 +135,14 @@ export const aiCaptionSchema = z
     // Power-word highlighting — capped at a small number so a caption
     // never becomes a wall of competing colors; most captions have zero.
     highlightWords: z.array(aiCaptionHighlightWordSchema).max(4).optional(),
+    // AI Video Director (2026-08-07) — human-editor-simulation reasoning:
+    // a short, honest "why this wording/placement" note from whichever
+    // agent produced this item. Display-only (review UI), never read by
+    // the translator/apply path. Absent on any plan predating this field
+    // or produced by the legacy single-call planner, same "shows 'not
+    // available,' never fabricated" convention every other optional
+    // review-only field here already follows.
+    reason: z.string().min(1).max(280).optional(),
   })
   .refine(isValidRange, RANGE_ERROR);
 export type AICaption = z.infer<typeof aiCaptionSchema>;
@@ -162,6 +170,9 @@ export const aiZoomSchema = z
     // native size) — NOT a 0..1 or 1..N multiplier.
     scaleFrom: z.number().min(1).max(1000),
     scaleTo: z.number().min(1).max(1000),
+    // AI Video Director (2026-08-07) — see aiCaptionSchema's own doc
+    // comment for the shared reason-field convention.
+    reason: z.string().min(1).max(280).optional(),
   })
   .refine(isValidRange, RANGE_ERROR);
 export type AIZoom = z.infer<typeof aiZoomSchema>;
@@ -230,6 +241,26 @@ export const aiBrollSchema = z
     // absent means resolution wasn't attempted (mirrors resolutionNote's
     // own "absent vs. present" convention).
     costUsd: z.number().min(0).optional(),
+    // AI Video Director (2026-08-07) — see aiCaptionSchema's own doc
+    // comment for the shared reason-field convention.
+    reason: z.string().min(1).max(280).optional(),
+    // "motion_graphic" is the SAME renderable shape as a plain b-roll
+    // cutaway (OverlayLayer already plays any VIDEO/IMAGE asset full-frame
+    // regardless of semantic label — no new render branch needed), just a
+    // different semantic tag for scoring/review purposes and the seam a
+    // future Phase 2 ("pip"/"split_screen"/etc.) would extend rather than
+    // a brand-new schema. Deliberately `.optional()`, NOT `.default(...)`
+    // — a Zod `.default()` makes the field non-optional in the INFERRED
+    // TS type (z.infer's output type), which would break every existing
+    // hand-constructed AIBroll object literal across the codebase (tests,
+    // ai-broll-resolver.ts, translator) that predates this field. Callers
+    // that need the effective value read `item.contentKind ?? "broll"`.
+    contentKind: z.enum(["broll", "motion_graphic"]).optional(),
+    // No-dead-screen rule (2026-08-07) — true only for items the
+    // deterministic gap-fixer (visual-coverage.ts) synthesized itself,
+    // never proposed by an agent. Lets the review UI/scoring distinguish
+    // "the Director chose this" from "the safety net filled a gap."
+    autoInserted: z.boolean().optional(),
   })
   .refine(isValidRange, RANGE_ERROR)
   .refine((v) => v.source !== "stock" || !!v.searchQuery, { message: "source:\"stock\" requires searchQuery" })
@@ -256,6 +287,10 @@ export const aiStickerSchema = z
     // per the "don't fake it" principle applied everywhere else here.
     resolvedAssetUrl: z.string().min(1).optional(),
     resolutionNote: z.string().min(1).optional(),
+    // AI Video Director (2026-08-07) — see aiCaptionSchema's own doc
+    // comment for the shared reason-field convention.
+    reason: z.string().min(1).max(280).optional(),
+    autoInserted: z.boolean().optional(),
   })
   .refine(isValidRange, RANGE_ERROR)
   .refine((v) => !!v.assetQuery || !!v.assetId, { message: "either assetQuery or assetId is required" });
@@ -281,6 +316,9 @@ export const aiMusicSchema = z
     // shared resolution-result convention.
     resolvedAssetUrl: z.string().min(1).optional(),
     resolutionNote: z.string().min(1).optional(),
+    // AI Video Director (2026-08-07) — see aiCaptionSchema's own doc
+    // comment for the shared reason-field convention.
+    reason: z.string().min(1).max(280).optional(),
   })
   .refine((v) => !!v.searchQuery || !!v.assetId, { message: "either searchQuery or assetId is required" });
 export type AIMusic = z.infer<typeof aiMusicSchema>;
@@ -297,6 +335,9 @@ export const aiSfxSchema = z
     // Phase 12 Module 6 — see aiStickerSchema's own doc comment.
     resolvedAssetUrl: z.string().min(1).optional(),
     resolutionNote: z.string().min(1).optional(),
+    // AI Video Director (2026-08-07) — see aiCaptionSchema's own doc
+    // comment for the shared reason-field convention.
+    reason: z.string().min(1).max(280).optional(),
   })
   .refine((v) => !!v.assetQuery || !!v.assetId, { message: "either assetQuery or assetId is required" });
 export type AISfx = z.infer<typeof aiSfxSchema>;
@@ -326,6 +367,9 @@ export const aiTransitionSchema = z.object({
   betweenClipIds: z.tuple([z.string().min(1), z.string().min(1)]),
   type: z.enum(EDITOR_TRANSITION_TYPES),
   durationMs: z.number().int().min(100).max(10_000),
+  // AI Video Director (2026-08-07) — see aiCaptionSchema's own doc
+  // comment for the shared reason-field convention.
+  reason: z.string().min(1).max(280).optional(),
 });
 export type AITransitionPlan = z.infer<typeof aiTransitionSchema>;
 
@@ -364,6 +408,87 @@ export const aiQualityScoresSchema = z.object({
 export type AIQualityScores = z.infer<typeof aiQualityScoresSchema>;
 
 // ---------------------------------------------------------------------
+// story — AI Video Director (2026-08-07). The Story+Hook+Retention
+// agent's structured narrative spine, built once and consumed by every
+// downstream agent (Captions needs to know where the hook/CTA beats
+// land; Visuals needs to know where pattern-interrupt/visual-reward
+// beats land). Purely additive/optional on the plan — absent on the
+// legacy single-call planner's output and on any plan predating this
+// field, same "not available, never fabricated" convention as `cost`.
+// ---------------------------------------------------------------------
+
+export const AI_STORY_BEAT_KINDS = ["hook", "curiosity", "value", "pattern_interrupt", "visual_reward", "proof", "cta"] as const;
+export type AIStoryBeatKind = (typeof AI_STORY_BEAT_KINDS)[number];
+
+export const aiStoryBeatSchema = z
+  .object({
+    kind: z.enum(AI_STORY_BEAT_KINDS),
+    startMs: z.number().int().min(0),
+    endMs: z.number().int().min(0),
+    description: z.string().min(1).max(280),
+    reason: z.string().min(1).max(280).optional(),
+  })
+  .refine(isValidRange, RANGE_ERROR);
+export type AIStoryBeat = z.infer<typeof aiStoryBeatSchema>;
+
+export const aiStoryPlanSchema = z.object({
+  beats: z.array(aiStoryBeatSchema).min(1),
+  hookText: z.string().min(1).max(200),
+  hookStrengthReason: z.string().min(1).max(280).optional(),
+  // LLM-judgment only — an opinion from the Story agent's own call, never
+  // a trained retention-prediction model. Cross-checked against the
+  // Quality Reviewer's own independent retentionScore (see
+  // ai-edit-quality-scoring.ts) and averaged, not treated as ground truth
+  // on its own.
+  retentionScore: z.number().min(0).max(100).optional(),
+  retentionRisks: z.array(z.string().min(1)).max(6).default([]),
+  ctaPresent: z.boolean().optional(),
+  ctaText: z.string().min(1).max(200).optional(),
+});
+export type AIStoryPlan = z.infer<typeof aiStoryPlanSchema>;
+
+// ---------------------------------------------------------------------
+// qualityScores v2 — AI Video Director (2026-08-07). Extends the original
+// 4-dimension score (editingScore/captionScore/visualScore/pacingScore,
+// kept above as aiQualityScoresSchema for backward compatibility with
+// plans already persisted under that shape) to the full 10-category
+// rubric the iterative quality-review loop scores against. `qualityScores`
+// on the plan is a union of both shapes so old rows keep parsing exactly
+// as before; every NEW plan the Director pipeline produces always writes
+// this v2 shape.
+// ---------------------------------------------------------------------
+
+export const AI_QUALITY_CATEGORIES = [
+  "hook", "captions", "broll", "visualVariety", "pacing", "emotion", "retention", "music", "sfx", "storyFlow",
+] as const;
+export type AiQualityCategory = (typeof AI_QUALITY_CATEGORIES)[number];
+
+export const aiQualityScoresV2Schema = z.object({
+  // Deterministic, structural — no LLM call.
+  captionScore: z.number().min(0).max(100),
+  brollScore: z.number().min(0).max(100),
+  visualVarietyScore: z.number().min(0).max(100),
+  pacingScore: z.number().min(0).max(100),
+  musicScore: z.number().min(0).max(100),
+  sfxScore: z.number().min(0).max(100),
+  // LLM-judged — from the Quality Reviewer agent's own call.
+  hookScore: z.number().min(0).max(100),
+  emotionScore: z.number().min(0).max(100),
+  retentionScore: z.number().min(0).max(100),
+  storyFlowScore: z.number().min(0).max(100),
+  // Weighted aggregate of the 10 above (see AI_EDIT_QUALITY_CATEGORY_WEIGHTS
+  // admin config) and the Final Director gate's own comparison value.
+  overallScore: z.number().min(0).max(100),
+  // Honest "did we actually hit the target, or did we just run out of
+  // iterations and keep the best attempt seen" flag — never silently
+  // pretends to have cleared the bar it didn't clear.
+  thresholdMet: z.boolean(),
+  iterations: z.number().int().min(1),
+  weakCategoriesFinal: z.array(z.enum(AI_QUALITY_CATEGORIES)).default([]),
+});
+export type AiQualityScoresV2 = z.infer<typeof aiQualityScoresV2Schema>;
+
+// ---------------------------------------------------------------------
 // The full plan
 // ---------------------------------------------------------------------
 
@@ -379,6 +504,13 @@ export const aiTimelinePlanSchema = z.object({
   sfx: z.array(aiSfxSchema).default([]),
   transitions: z.array(aiTransitionSchema).default([]),
   cost: aiCostSummarySchema.optional(),
-  qualityScores: aiQualityScoresSchema.optional(),
+  // Union — old (v1) persisted plans keep parsing under aiQualityScoresSchema;
+  // every plan the Director pipeline produces going forward always writes
+  // the v2 shape. See aiQualityScoresV2Schema's own doc comment.
+  qualityScores: z.union([aiQualityScoresV2Schema, aiQualityScoresSchema]).optional(),
+  // AI Video Director (2026-08-07) — absent when produced by the legacy
+  // single-call planner (feature flag off) or on any plan predating this
+  // field.
+  story: aiStoryPlanSchema.optional(),
 });
 export type AITimelinePlan = z.infer<typeof aiTimelinePlanSchema>;

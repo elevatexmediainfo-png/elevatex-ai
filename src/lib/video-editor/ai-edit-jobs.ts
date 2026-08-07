@@ -499,7 +499,16 @@ export async function processAiEditJob(jobId: string): Promise<void> {
         // ONLY the reasoning call (never transcription/scene-removal/
         // broll resolution), and only ONCE, keeping whichever of the two
         // attempts scored higher — never a loop, never unbounded vendor
-        // spend.
+        // spend. Legacy single-call path only, deliberately left
+        // byte-identical to its pre-Director-pipeline behavior (still the
+        // plain AI_EDIT_QUALITY_RETRY_THRESHOLD=55 const, NOT the new
+        // AI_EDIT_QUALITY_TARGET_SCORE=90 config) — the two thresholds
+        // score fundamentally different rubrics (this one a coarse
+        // 4-dimension average, the Director's a 10-category weighted
+        // score) and are not interchangeable. The AI Video Director
+        // pipeline (AI_EDIT_DIRECTOR_PIPELINE_ENABLED) has its own,
+        // separately-configured iterative loop (director/orchestrator.ts)
+        // that reads AI_EDIT_QUALITY_TARGET_SCORE instead.
         if (best.scores.editingScore < AI_EDIT_QUALITY_RETRY_THRESHOLD) {
           logger.info({ jobId, scores: best.scores }, "[ai edit job] first planning attempt scored below the quality threshold — retrying once");
           try {

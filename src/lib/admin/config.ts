@@ -1026,6 +1026,60 @@ export const CONFIG_REGISTRY = {
     description: "Founder policy (2026-07-23) — while AI_EDIT_BROLL_STOCK_ONLY is on, the resolver still tries stock first, but if the best real match's relevance score (fraction of the search query's words actually present in the stock candidate's title/tags, 0-1) falls below this, it falls back to real generation for just that one item instead of placing a weak/irrelevant stock match. Calibrated against 39 real production search queries: 0.5 cleanly separated 2 genuinely bad matches from 37 acceptable-to-good ones (a ~5% real-world fallback rate). Same 'captured onto the job at creation time' pattern as AI_EDIT_BROLL_STOCK_ONLY (AiEditJob.brollRelevanceFallbackThreshold) — retune here without a prompt-engineering pass.",
     category: "video_editor_policy",
   },
+  // AI Video Director (2026-08-07) — a DISTINCT threshold from the older
+  // AI_EDIT_QUALITY_RETRY_THRESHOLD const (still 55, still hardcoded,
+  // still governs ONLY the legacy single-call planner's own one-shot
+  // bounded retry — deliberately left untouched so that path's behavior
+  // stays byte-identical while AI_EDIT_DIRECTOR_PIPELINE_ENABLED is off).
+  // This key is the single source of truth for the target the NEW
+  // Director pipeline's iterative self-review loop aims for before the
+  // Final Director gate finalizes — the two scores aren't interchangeable
+  // (this one is a 10-category weighted score, the legacy one a coarser
+  // 4-dimension average). Real cost implication — see
+  // AI_EDIT_DIRECTOR_PIPELINE_ENABLED's own doc comment; a target this
+  // high will realistically trigger 1-2 retry iterations on most real jobs.
+  AI_EDIT_QUALITY_TARGET_SCORE: {
+    schema: z.number().int().min(0).max(100),
+    default: 90,
+    label: "AI Director quality target score",
+    description: "Overall quality score (0-100, from the Quality Reviewer's 10-category rubric) the AI Video Director's iterative self-review loop targets before finalizing an edit. If AI_EDIT_DIRECTOR_MAX_QUALITY_ITERATIONS is reached first, the best-scoring attempt seen is kept and qualityScores.thresholdMet is stamped false — never silently pretends to have hit this bar. Distinct from the legacy AI_EDIT_QUALITY_RETRY_THRESHOLD const (55, unchanged) which governs only the original single-call planner.",
+    category: "video_editor_policy",
+  },
+  AI_EDIT_DIRECTOR_MAX_QUALITY_ITERATIONS: {
+    schema: z.number().int().min(1).max(6),
+    default: 3,
+    label: "AI Director max quality-review iterations",
+    description: "Upper bound on how many extra targeted-regeneration rounds the Quality Reviewer/Final Director loop may run per job, on top of the first full pass. Each iteration only re-invokes the specific agent(s) that map to the review's weak categories (plus whatever is downstream-dependent on them) — never the whole edit. Direct cost/latency multiplier: each extra iteration is up to 5 more GPT-5 reasoning calls (see AI_EDIT_DIRECTOR_PIPELINE_ENABLED).",
+    category: "video_editor_policy",
+  },
+  AI_EDIT_DIRECTOR_PIPELINE_ENABLED: {
+    schema: z.boolean(),
+    default: false,
+    label: "Enable AI Video Director multi-agent pipeline",
+    description: "Feature flag for the multi-agent AI Video Director pipeline (separate Story/Hook/Retention, Captions, Visuals, Audio, and Quality Reviewer reasoning calls, with an iterative self-review loop targeting AI_EDIT_QUALITY_TARGET_SCORE). While OFF, AI Auto-Edit uses the original single combined planTimeline() call unchanged — zero behavior change. Default OFF deliberately: the Director pipeline realistically costs 5x today's GPT-5 reasoning spend per job with zero retries, and up to ~11-15x in the worst case (bounded by AI_EDIT_DIRECTOR_MAX_QUALITY_ITERATIONS). Do not enable in production before a deliberate pricing review of the AI Auto-Edit credit cost — the existing per-call cost logging/credit-charging mechanism is correct and needs no code change, but the real dollar cost per job will be materially higher.",
+    category: "video_editor_policy",
+  },
+  AI_EDIT_NO_DEAD_SCREEN_GAP_THRESHOLD_MS: {
+    schema: z.number().int().min(500).max(10_000),
+    default: 2000,
+    label: "No-dead-screen gap threshold (ms)",
+    description: "A talking-head stretch with no caption/b-roll/zoom/sticker/motion-graphic visual treatment longer than this is flagged as a dead-screen violation by the Director pipeline's deterministic gap detector (visual-coverage.ts) and auto-fixed with the cheapest fitting insert. Phase 1 fixes are limited to the 5 visual types that already render (b-roll, zoom/camera-punch, sticker, animated caption, motion-graphic-as-asset) — picture-in-picture/split-screen/blur-background/progress-bar/callout/face-punch/screen-recording are a deferred future phase needing new renderer support.",
+    category: "video_editor_policy",
+  },
+  AI_EDIT_QUALITY_CATEGORY_WEIGHTS: {
+    schema: z.record(z.string(), z.number().min(0).max(5)),
+    default: { hook: 1.5, captions: 1, broll: 1, visualVariety: 0.75, pacing: 1, emotion: 1, retention: 1.5, music: 0.5, sfx: 0.5, storyFlow: 1 } as const,
+    label: "AI Director quality-category weights",
+    description: "Relative weight of each of the 9 sub-category scores (hook/captions/broll/visualVariety/pacing/emotion/retention/music/sfx/storyFlow) when computing the single overallScore the Final Director gate compares against AI_EDIT_QUALITY_TARGET_SCORE. Hook and Retention weighted higher by default, matching the 'retention-first' principle — every decision should maximize watch time.",
+    category: "video_editor_policy",
+  },
+  AI_EDIT_SFX_MAX_PER_10S: {
+    schema: z.number().min(0).max(5),
+    default: 1,
+    label: "Max SFX events per 10 seconds",
+    description: "Anti-spam ceiling used by the Director pipeline's deterministic SFX scoring — more events than this in any rolling 10s window scores sfxScore down, enforcing the brief's 'must feel invisible to professionals, energetic to amateurs, never spam' SFX principle.",
+    category: "video_editor_policy",
+  },
 } as const;
 
 export type ConfigKey = keyof typeof CONFIG_REGISTRY;
