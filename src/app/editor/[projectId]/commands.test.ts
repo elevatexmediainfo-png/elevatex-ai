@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   createAddTrackAndClipCommand,
+  createAddTrackWithClipsCommand,
+  createCaptionsTrackCommand,
   createCompositeCommand,
   createDeleteClipCommand,
   createMoveClipCommand,
+  createOverlayTrackCommand,
   createRippleDeleteCommand,
+  createSceneRemovalCommand,
   createTrimClipCommand,
   type AddTrackAndClipDeps,
   type ClipCommandDeps,
@@ -493,5 +497,178 @@ describe("createAddTrackAndClipCommand", () => {
     await expect(command.undo()).resolves.toBeUndefined();
     expect(deps.deleteClip).not.toHaveBeenCalled();
     expect(deps.removeTrack).not.toHaveBeenCalled();
+  });
+});
+
+// PRODUCTION INVESTIGATION (2026-08-07) — "the generated AI Auto-Edit is
+// almost identical to the original video." Real, reproduced bug found
+// while tracing Timeline Apply: createAddTrackWithClipsCommand and (the
+// now-removed) createCaptionsAboveOverlayCommand both accumulated created
+// clip ids in a LOCAL loop variable and only assigned it to the outer
+// (undo-tracking) variable AFTER the whole loop finished. If addClip threw
+// partway through a batch (item 5 of 20, say — any transient network/
+// validation failure), every item BEFORE the failure was already
+// persisted server-side, but the outer variable never learned about them
+// — so this command's own undo() had nothing to clean up, AND the
+// top-level createCompositeCommand's rollback loop only called undo() on
+// commands that RESOLVED (this one REJECTED), so it was skipped there
+// too. The partially-created rows were orphaned forever, silently — while
+// every OTHER sibling command in the same composite that DID fully
+// succeed (e.g. scene removal, zoom) got rolled back, since the composite
+// treated any single rejection as cause to undo everything else.
+//
+// FIXED (2026-08, Task E, requirements 1 and 3):
+//   1. createAddTrackWithClipsCommand and createSceneRemovalCommand now
+//      push directly to the outer undo-tracking variable INSIDE their own
+//      loops, the moment each item's addClip/segment-create resolves —
+//      undo() always has an accurate record of every item that actually
+//      landed, even after a mid-batch throw.
+//   2. createCaptionsAboveOverlayCommand no longer exists.
+//      createCaptionsTrackCommand and createOverlayTrackCommand are two
+//      fully INDEPENDENT commands — a captions failure can no longer
+//      prevent overlay(b-roll/stickers) from running, and vice versa.
+//   3. The top-level orchestrator (ai-auto-edit-panel.tsx's handleApply)
+//      no longer wraps every section into ONE createCompositeCommand — it
+//      runs each module independently and explicitly calls THAT module's
+//      own undo() on failure, so a fully-successful sibling module is
+//      never touched by an unrelated module's failure.
+describe("FIX VERIFICATION — incremental clip tracking + module independence (2026-08, Task E)", () => {
+  function makeFlakyBatchDeps(failAtCallIndex: number) {
+    let nextTrackId = 1;
+    let addClipCallCount = 0;
+    const createdClipIds: string[] = [];
+    return {
+      addTrack: vi.fn().mockImplementation(async (input) => ({ track: { id: `track-${nextTrackId++}`, order: nextTrackId, ...input } as unknown as TrackView })),
+      removeTrack: vi.fn().mockResolvedValue(undefined),
+      addClip: vi.fn().mockImplementation(async (patch) => {
+        const callIndex = addClipCallCount++;
+        if (callIndex === failAtCallIndex) {
+          throw new Error(`Simulated transient failure on item ${callIndex} (e.g. a real network blip or validation mismatch)`);
+        }
+        const id = `clip-${callIndex}`;
+        createdClipIds.push(id);
+        return { clip: { id, ...patch } as unknown as ClipView };
+      }),
+      deleteClip: vi.fn().mockResolvedValue(undefined),
+      updateClip: vi.fn(),
+      splitClip: vi.fn(),
+      rippleDeleteClip: vi.fn(),
+      duplicateClip: vi.fn(),
+      replaceClipSource: vi.fn(),
+      groupClips: vi.fn(),
+      ungroupClips: vi.fn(),
+      __createdClipIds: createdClipIds, // test-only escape hatch to see what's ACTUALLY in "the database"
+    } as unknown as AddTrackAndClipDeps & { __createdClipIds: string[] };
+  }
+
+  it("createAddTrackWithClipsCommand: undo() now cleans up EVERY clip that actually landed before the failure, not zero", async () => {
+    const deps = makeFlakyBatchDeps(4); // 0-indexed — the 5th addClip call fails
+    const clipInputs = Array.from({ length: 5 }, (_, i) => ({ startMs: i * 1000, durationMs: 900, content: { text: `caption ${i}` } }));
+    const command = createAddTrackWithClipsCommand(deps, { kind: "SUBTITLE" }, clipInputs);
+
+    await expect(command.execute()).rejects.toThrow("Simulated transient failure");
+
+    // REAL EVIDENCE: 4 captions genuinely landed server-side — deps.addClip
+    // was called 5 times and 4 of them actually created a row.
+    expect(deps.addClip).toHaveBeenCalledTimes(5);
+    expect((deps as unknown as { __createdClipIds: string[] }).__createdClipIds).toHaveLength(4);
+
+    // FIXED: undo() now deletes all 4 real, persisted clips (previously
+    // zero) AND the track — nothing orphaned.
+    await command.undo();
+    expect(deps.deleteClip).toHaveBeenCalledTimes(4);
+    for (const id of (deps as unknown as { __createdClipIds: string[] }).__createdClipIds) {
+      expect(deps.deleteClip).toHaveBeenCalledWith(id);
+    }
+    expect(deps.removeTrack).toHaveBeenCalledWith("track-1");
+  });
+
+  it("createSceneRemovalCommand: undo() cleans up every surviving segment already created before a mid-batch failure, and never duplicates the original clip", async () => {
+    const deps = makeFlakyBatchDeps(2); // 3rd segment create fails
+    const originalClip: ClipView = {
+      id: "original-clip",
+      trackId: "track-1",
+      assetId: "asset-1",
+      startMs: 0,
+      durationMs: 5000,
+      trimStartMs: 0,
+      content: null,
+      transform: null,
+    } as unknown as ClipView;
+    const survivingSegments = Array.from({ length: 4 }, (_, i) => ({ startMs: i * 1000, durationMs: 900, trimStartMs: i * 1000 }));
+
+    const command = createSceneRemovalCommand(deps, originalClip, survivingSegments, []);
+
+    await expect(command.execute()).rejects.toThrow("Simulated transient failure");
+    // 2 segments genuinely landed before the 3rd failed.
+    expect((deps as unknown as { __createdClipIds: string[] }).__createdClipIds).toHaveLength(2);
+
+    await command.undo();
+    // FIXED: the 2 real surviving-segment clips get deleted, on top of the
+    // 1 deleteClip execute() itself already made for the original clip
+    // (deleted up front, before the segment loop even started) = 3 total.
+    expect(deps.deleteClip).toHaveBeenCalledTimes(1 /* execute()'s own delete of the original */ + 2 /* undo's cleanup of the 2 real segments */);
+    // ...and the original clip IS recreated by undo() (it really was
+    // deleted at the top of execute()) — exactly once, on top of
+    // execute()'s own 3 addClip attempts (2 succeeded, the 3rd threw) —
+    // never duplicated.
+    expect(deps.addClip).toHaveBeenCalledTimes(3 /* execute()'s 3 segment attempts */ + 1 /* undo's own restore of the original */);
+  });
+
+  it("createCaptionsTrackCommand and createOverlayTrackCommand are genuinely independent commands — one's failure never touches the other's own deps", async () => {
+    const captionsDeps = makeFlakyBatchDeps(0); // fails immediately
+    const overlayDeps = makeFlakyBatchDeps(-1); // never fails
+    const captionsCommand = createCaptionsTrackCommand(captionsDeps, [{ startMs: 0, durationMs: 900, content: { text: "hi" } }]);
+    const overlayCommand = createOverlayTrackCommand(overlayDeps, [{ startMs: 0, durationMs: 900, assetId: "broll-1" }]);
+
+    await expect(captionsCommand.execute()).rejects.toThrow("Simulated transient failure");
+    // Overlay runs completely independently on its OWN deps, unaffected by
+    // captions having just failed — no shared state, no shared command.
+    await expect(overlayCommand.execute()).resolves.toBeUndefined();
+    expect(overlayDeps.addTrack).toHaveBeenCalledWith({ kind: "OVERLAY", insertBelowOrder: undefined });
+    expect((overlayDeps as unknown as { __createdClipIds: string[] }).__createdClipIds).toHaveLength(1);
+  });
+
+  it("orchestration-level: a fully-successful sibling module is NEVER touched when an unrelated module fails and self-rolls-back — no shared composite anymore", async () => {
+    // Simulates ai-auto-edit-panel.tsx's handleApply own per-module loop:
+    // each module gets its own independent try/catch and self-rollback,
+    // never a shared createCompositeCommand.
+    const sceneRemovalUndo = vi.fn().mockResolvedValue(undefined);
+    const sceneRemovalCommand: EditorCommand = {
+      label: "AI Scene Removal",
+      execute: vi.fn().mockResolvedValue(undefined), // the cuts genuinely applied
+      undo: sceneRemovalUndo,
+    };
+
+    const captionsDeps = makeFlakyBatchDeps(2);
+    const captionInputs = Array.from({ length: 4 }, (_, i) => ({ startMs: i * 1000, durationMs: 900, content: { text: `caption ${i}` } }));
+    const captionsCommand = createCaptionsTrackCommand(captionsDeps, captionInputs);
+
+    const modules: { module: string; command: EditorCommand }[] = [
+      { module: "sceneRemoval", command: sceneRemovalCommand },
+      { module: "captions", command: captionsCommand },
+    ];
+    const failedModules: string[] = [];
+    for (const { module, command } of modules) {
+      try {
+        await command.execute();
+      } catch {
+        await command.undo();
+        failedModules.push(module);
+      }
+    }
+
+    expect(failedModules).toEqual(["captions"]);
+    // FIXED: scene removal's undo() is NEVER called — its success is
+    // completely unaffected by captions' failure (previously: the shared
+    // composite rolled it back regardless).
+    expect(sceneRemovalUndo).not.toHaveBeenCalled();
+    // FIXED: captions' OWN partial work (2 real clips + the track) IS
+    // fully cleaned up via its own explicit self-rollback undo() call
+    // (previously: undo() was never even invoked on a rejected command by
+    // the old composite's rollback loop, so this never happened at all).
+    expect((captionsDeps as unknown as { __createdClipIds: string[] }).__createdClipIds).toHaveLength(2);
+    expect(captionsDeps.deleteClip).toHaveBeenCalledTimes(2);
+    expect(captionsDeps.removeTrack).toHaveBeenCalledWith("track-1");
   });
 });

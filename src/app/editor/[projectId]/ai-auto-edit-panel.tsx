@@ -62,13 +62,14 @@ import {
   useUpdateTransitionMutation,
 } from "./queries";
 import { useEditorStoreApi } from "./store";
-import { translateAITimelinePlan, type AITimelineProjectSnapshot, type AITimelineTranslatorDeps } from "./ai-timeline-translator";
-import { createAddClipCommand, createAddTrackAndClipCommand } from "./commands";
+import { translateAITimelinePlan, type AITimelineModuleRunContext, type AITimelineProjectSnapshot, type AITimelineTranslatorDeps } from "./ai-timeline-translator";
+import { createAddClipCommand, createAddTrackAndClipCommand, type EditorCommand } from "./commands";
 import { filterAcceptedPlan, itemKey } from "./ai-review-selection";
 import { summarizePlanCounts } from "./ai-plan-summary";
 import { aiTimelinePlanSchema, AI_ZOOM_SOURCE_CLIP_PLACEHOLDER, type AISceneRemovalReason, type AITimelinePlan } from "@/lib/validations/ai-timeline";
 import { AI_STYLE_PRESETS } from "@/lib/validations/ai-style-presets";
 import { AI_BROLL_DENSITIES, AI_EDIT_MODULES, type AiEditModule } from "@/lib/validations/video-editor";
+import { describeThrown, logApplyFailure, logApplyStage, type AIEditModule } from "@/lib/video-editor/apply-pipeline-logger";
 import type { AiEditJobStatus, AiEditJobView, AssetView, EditorTrackKind, ProjectView } from "../types";
 
 // Phase 12 Module 8 — same "genuine PATCH, not a display-only toggle"
@@ -132,6 +133,25 @@ const MODULE_LABELS: Record<AiEditModule, string> = {
   transitions: "Transitions",
 };
 const MODULE_CHECKBOX_ORDER: AiEditModule[] = ["captions", "sceneRemoval", "zoom", "broll", "music", "sfx", "stickers", "transitions"];
+
+// Distinct from AiEditModule/MODULE_LABELS above (the plan-content module
+// selection checkboxes, e.g. "broll" and "stickers" as two separate user
+// choices) — this is the EXECUTION-layer unit translateAITimelinePlan
+// actually runs and rolls back independently (requirement 3, module
+// independence), where broll+stickers collapse into one "overlay" unit
+// since they share a track. Same "two similarly-named-but-different
+// module concepts" shape already flagged elsewhere in this codebase's own
+// history (ProviderCategory/GenerationCategory) — kept as two real,
+// separately-justified types rather than forced into one.
+const APPLY_MODULE_LABEL: Record<AIEditModule, string> = {
+  sceneRemoval: "Silence Removal / Cuts",
+  captions: "Captions",
+  overlay: "B-roll / Stickers",
+  zoom: "Zoom",
+  sfx: "SFX",
+  music: "Music",
+  transitions: "Transitions",
+};
 
 const REASON_LABEL: Record<AISceneRemovalReason, string> = {
   silence: "Silence",
@@ -522,6 +542,7 @@ export function AiAutoEditPanel({
       console.error(parsed.error);
       return;
     }
+    logApplyStage({ stage: "timeline_generated", jobId: job.id });
     const ws = projectQuery.data;
     if (!ws) return;
     const targetClip = ws.clips.find((c) => c.assetId === job.sourceAssetId);
@@ -569,56 +590,100 @@ export function AiAutoEditPanel({
     };
 
     const snapshot: AITimelineProjectSnapshot = { tracks: ws.tracks, clips: ws.clips, durationMs: ws.project.durationMs };
+    logApplyStage({ stage: "timeline_translated", jobId: job.id });
     const result = translateAITimelinePlan(remapped, snapshot, translatorDeps);
     if (result.warnings.length > 0) console.warn("[AI Auto-Edit] translator warnings:", result.warnings);
-    if (!result.command) {
+    if (result.modules.length === 0) {
       setApplyError("Nothing to apply — every item was unchecked, or every proposed change fell outside this clip's current range.");
       return;
     }
 
     setApplying(true);
-    try {
-      await storeApi.getState().runCommand(result.command);
-      setAppliedJobIds((prev) => new Set(prev).add(job.id));
-      // Phase 12 Module 5 — items with no resolvedAssetId (a broll slot
-      // that failed to resolve) are never silently dropped: the
-      // translator pushes them into unresolvedAssets instead of building
-      // a command for them. Surfaced here so a partial apply (some items
-      // landed, some didn't) is visible, not just "Applied to timeline"
-      // with no mention of what got left out.
-      if (result.unresolvedAssets.length > 0) {
-        setUnresolvedCountByJobId((prev) => ({ ...prev, [job.id]: result.unresolvedAssets.length }));
+    // Requirement 3 (2026-08, module independence) — each module (cuts,
+    // captions, b-roll/stickers, zoom, sfx, music, transitions) is run and
+    // caught INDEPENDENTLY here, never inside one shared try/catch around
+    // a single mega-composite. A failure in one module self-rolls-back
+    // ONLY that module's own partial work (via command.undo() — runCommand
+    // itself never calls undo() on a throwing execute(), see store.tsx)
+    // and the loop continues to every remaining module regardless. Real
+    // bug this replaces (2026-07-18, and reconfirmed 2026-08 with actual
+    // reproducing evidence): the old single createCompositeCommand rolled
+    // back every ALREADY-SUCCEEDED sibling module the moment any one
+    // module rejected, and a rejected command's own undo() was never even
+    // invoked at all (createCompositeCommand's rollback loop only ever
+    // calls undo() on FULFILLED siblings) — so failed work was silently
+    // orphaned server-side while successful work was needlessly undone.
+    const ctx: AITimelineModuleRunContext = {};
+    const failedModules: string[] = [];
+    let anyModuleApplied = false;
+    logApplyStage({ stage: "command_created", jobId: job.id, detail: { moduleCount: result.modules.length } });
+    for (const { module, buildCommand } of result.modules) {
+      const command = buildCommand(ctx);
+      logApplyStage({ stage: "command_executed", module, jobId: job.id });
+      try {
+        await storeApi.getState().runCommand(command);
+        anyModuleApplied = true;
+        logApplyStage({ stage: "command_applied", module, jobId: job.id });
+        // Threads captions' real committed SUBTITLE track order into a
+        // still-to-run overlay module (soft stacking-order hint only —
+        // see AITimelineModuleRunContext's own doc comment); a plain
+        // type-guard rather than an import of createCaptionsTrackCommand's
+        // own return type, since every OTHER module's command has no such
+        // method and `in` alone doesn't need the concrete constructor.
+        if (module === "captions" && "getCommittedOrder" in command && typeof command.getCommittedOrder === "function") {
+          const order = (command as EditorCommand & { getCommittedOrder: () => number | undefined }).getCommittedOrder();
+          if (order !== undefined) ctx.subtitleTrackOrderHint = order;
+        }
+      } catch (err) {
+        const { reason, stack } = describeThrown(err);
+        let rollbackResult: "rolled_back" | "rollback_failed" = "rolled_back";
+        try {
+          await command.undo();
+        } catch (undoErr) {
+          rollbackResult = "rollback_failed";
+          console.error(`[AI Auto-Edit] rollback of module "${module}" itself failed — some of its partial work may remain on the server`, undoErr);
+        }
+        logApplyFailure({ module, reason, stack, affectedClipIds: [], rollbackResult, jobId: job.id });
+        failedModules.push(`${APPLY_MODULE_LABEL[module]}: ${reason}`);
+        // Deliberately NO throw/return/break here — every remaining
+        // module still gets its own independent attempt.
       }
-    } catch (err) {
-      // Real bug found live (2026-07-18) — this catch never existed before,
-      // so a genuine mid-apply failure (live-reproduced: a "TypeError:
-      // Failed to fetch" on ONE of the composite command's many concurrent
-      // addTrack/addClip/updateTrack requests — this command fires one
-      // request per proposed captions/broll/stickers/sfx/music/transition
-      // item, all via createCompositeCommand's Promise.all, no throttling)
-      // was completely silent: no error shown, and since Promise.all
-      // doesn't roll back already-resolved siblings, whatever DID land
-      // server-side (confirmed via direct DB inspection to usually be
-      // nearly everything) was orphaned from the client's view until a
-      // full reload. Surfacing it here at least tells the founder/user
-      // something went wrong instead of a mysteriously "frozen" preview.
-      setApplyError(err instanceof Error ? `Apply may have partially failed: ${err.message}. Reload and check the timeline before retrying.` : "Apply may have partially failed. Reload and check the timeline before retrying.");
-      console.error("[AI Auto-Edit] apply failed", err);
-    } finally {
-      // Always refresh, success or failure — closes two real, live-
-      // reproduced gaps at once: (1) newly-resolved assets (music/broll/
-      // stickers/sfx can all reference a BRAND-NEW EditorAsset materialized
-      // by RESOLVING_ASSETS) are invisible in the compositor because
-      // `assetById` (preview-window.tsx) reads useEditorAssetsQuery() with
-      // NO projectId — a separate cache (["editor","assets"]) nothing else
-      // in this chain ever invalidates; (2) on the failure path above,
-      // whatever partial work landed server-side is still reflected
-      // instead of requiring a manual reload to even see it. Invalidating
-      // the unscoped assets key cascades to every project-scoped variant
-      // too, via TanStack's own prefix-match invalidation.
-      await Promise.all([projectQuery.refetch(), queryClient.invalidateQueries({ queryKey: assetsQueryKey() })]);
-      setApplying(false);
     }
+
+    if (anyModuleApplied) {
+      setAppliedJobIds((prev) => new Set(prev).add(job.id));
+    }
+    // Phase 12 Module 5 — items with no resolvedAssetId (a broll slot that
+    // failed to resolve) are never silently dropped: the translator pushes
+    // them into unresolvedAssets instead of building a command for them.
+    // Surfaced here so a partial apply (some items landed, some didn't) is
+    // visible, not just "Applied to timeline" with no mention of what got
+    // left out.
+    if (result.unresolvedAssets.length > 0) {
+      setUnresolvedCountByJobId((prev) => ({ ...prev, [job.id]: result.unresolvedAssets.length }));
+    }
+    if (failedModules.length > 0) {
+      setApplyError(`${failedModules.length} of ${result.modules.length} module(s) failed and were rolled back individually — the rest applied normally: ${failedModules.join("; ")}`);
+    }
+    logApplyStage({
+      stage: "saved",
+      jobId: job.id,
+      detail: { modulesApplied: result.modules.length - failedModules.length, modulesFailed: failedModules.length },
+    });
+
+    // Always refresh, success or failure — closes two real, live-
+    // reproduced gaps at once: (1) newly-resolved assets (music/broll/
+    // stickers/sfx can all reference a BRAND-NEW EditorAsset materialized
+    // by RESOLVING_ASSETS) are invisible in the compositor because
+    // `assetById` (preview-window.tsx) reads useEditorAssetsQuery() with
+    // NO projectId — a separate cache (["editor","assets"]) nothing else
+    // in this chain ever invalidates; (2) on the failure path above,
+    // whatever partial work landed server-side is still reflected instead
+    // of requiring a manual reload to even see it. Invalidating the
+    // unscoped assets key cascades to every project-scoped variant too,
+    // via TanStack's own prefix-match invalidation.
+    await Promise.all([projectQuery.refetch(), queryClient.invalidateQueries({ queryKey: assetsQueryKey() })]);
+    setApplying(false);
   }
 
   // TASK 11 (2026-08-07) — full panel restructure. Root causes of the

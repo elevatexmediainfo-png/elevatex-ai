@@ -19,8 +19,9 @@ import {
   createAddMusicTrackCommand,
   createAddTrackWithClipsCommand,
   createAddTransitionCommand,
-  createCaptionsAboveOverlayCommand,
+  createCaptionsTrackCommand,
   createCompositeCommand,
+  createOverlayTrackCommand,
   createSceneRemovalCommand,
   createUpdateTrackCommand,
   createUpdateTransformCommand,
@@ -34,6 +35,7 @@ import {
   type TrackCommandDeps,
   type TransitionCommandDeps,
 } from "./commands";
+import type { AIEditModule } from "@/lib/video-editor/apply-pipeline-logger";
 import type { AddClipPatch } from "./queries";
 import type { ClipContent, ClipView, TrackView } from "../types";
 import { DEFAULT_CLIP_TRANSFORM, DEFAULT_KEYFRAME_EASING, type ClipTransform } from "@/lib/video-editor/transform";
@@ -81,11 +83,44 @@ export interface UnresolvedAssetItem {
   item: AIBroll | AISticker | AISfx | AIMusic;
 }
 
+// Module-independence fix (2026-08, requirement 3) — the ENTIRE plan used
+// to collapse into ONE createCompositeCommand, so any single item's
+// failure anywhere rolled back every OTHER section that had already fully
+// succeeded (a real, live-reproduced bug: a captions failure undid a
+// fully-successful scene-removal cut). Each module below (sceneRemoval,
+// captions, overlay/broll+stickers, zoom, sfx, music, transitions) is now
+// its own independently-run, independently-rolled-back top-level command
+// — see ai-auto-edit-panel.tsx's handleApply for the orchestration loop
+// that runs each one, catches its own failure without aborting the rest,
+// and self-rolls-back only that module's own partial work.
+export interface AITimelineModuleRunContext {
+  // Populated by the orchestrator with the SUBTITLE track's real committed
+  // `order` once the captions module has finished running — present only
+  // when captions actually created a FRESH track this apply and succeeded;
+  // undefined otherwise (captions hasn't run yet, failed, targeted an
+  // already-existing track, or wasn't part of this plan at all).
+  // Consulted ONLY by the overlay module, and only as a soft
+  // stacking-order hint (see createOverlayTrackCommand's own doc comment
+  // in commands.ts) — never a hard dependency gating whether overlay runs.
+  subtitleTrackOrderHint?: number;
+}
+
+export interface AITimelineModuleCommand {
+  module: AIEditModule;
+  // A factory, not a pre-built command — the overlay module's real
+  // insertBelowOrder value (in the "both need a fresh track" case) is only
+  // known once the captions module has actually run, so its command can't
+  // be fully constructed until the orchestrator calls this with the
+  // context it collected from any earlier module. Every OTHER module
+  // ignores `ctx` and returns an already-fully-determined command.
+  buildCommand: (ctx: AITimelineModuleRunContext) => EditorCommand;
+}
+
 export interface AITimelineTranslationResult {
-  // null when the plan produced no commands at all (e.g. every section
-  // empty, or every item unresolved) — callers should treat this as
-  // "nothing to run", not construct an empty composite.
-  command: EditorCommand | null;
+  // One independently-runnable unit per non-empty module — empty when the
+  // plan produced no commands at all (every section empty, or every item
+  // unresolved). Callers should treat an empty array as "nothing to run."
+  modules: AITimelineModuleCommand[];
   unresolvedAssets: UnresolvedAssetItem[];
   // Non-fatal issues that caused an item to be skipped for a reason OTHER
   // than "needs asset resolution" (e.g. a zoom/transition referencing a
@@ -442,8 +477,8 @@ function resolveCaptionHighlightRuns(text: string, highlightWords: AICaption["hi
 // Pure — computes the clip inputs a set of AI captions would produce,
 // with no track-resolution decision baked in. Extracted (2026-07-19) so
 // the "both SUBTITLE and OVERLAY need fresh creation" coordination case
-// (see createCaptionsAboveOverlayCommand's own doc comment) can build
-// this same data without going through translateCaptions' own
+// (see createCaptionsTrackCommand's own doc comment, commands.ts) can
+// build this same data without going through translateCaptions' own
 // existing-vs-fresh-track branching, which doesn't apply there.
 function buildCaptionClipInputs(items: AICaption[]): Omit<AddClipPatch, "trackId">[] {
   return items.map((caption) => {
@@ -574,7 +609,8 @@ function buildOverlayClipInputs(broll: AIBroll[], stickers: AISticker[], unresol
 // to prevent that. The "BOTH need fresh creation" case is NOT handled
 // here at all — that needs genuine sequencing between the two track
 // creates, which this single-section function has no way to do; see
-// createCaptionsAboveOverlayCommand and this function's own call site.
+// createCaptionsTrackCommand/createOverlayTrackCommand (commands.ts) and
+// this function's own call site (translateCaptionsAndOverlay below).
 // Given ALREADY-COMPUTED clip inputs (see buildOverlayClipInputs) — split
 // out (2026-07-19) so translateCaptionsAndOverlay's "otherwise" branch
 // below can reuse this without calling buildOverlayClipInputs a second
@@ -601,8 +637,10 @@ function buildOverlayCommands(
 
 // Real bug found live (2026-07-18/19) — the top-level coordination point
 // for the caption/b-roll stacking-order guarantee (see
-// createCaptionsAboveOverlayCommand's own doc comment, commands.ts, for
-// the root mechanism). translateCaptions and buildOverlayCommands each
+// createCaptionsTrackCommand's own doc comment, commands.ts, for the root
+// mechanism, and its 2026-08 update for why this is now a soft hint
+// rather than a hard sequencing dependency). translateCaptions and
+// buildOverlayCommands each
 // independently decide "existing track vs. create fresh" — the ONE case
 // neither of them can safely handle alone is "both need fresh creation
 // this apply," since that requires genuine sequencing between two track
@@ -610,6 +648,14 @@ function buildOverlayCommands(
 // section's track state. This function is the one place with visibility
 // into BOTH `subtitleTrack` and `overlayTrack` at once, so it's the
 // right (and only) place to detect that case and route around it.
+interface CaptionsAndOverlayTranslation {
+  captionsCommands: EditorCommand[];
+  // Deferred, not a plain array — see AITimelineModuleCommand's own doc
+  // comment for why. Ignoring the argument is always safe/correct except
+  // in the "both need a fresh track" branch below.
+  buildOverlayCommands: (subtitleTrackOrderHint?: number) => EditorCommand[];
+}
+
 function translateCaptionsAndOverlay(
   captions: AICaption[],
   broll: AIBroll[],
@@ -618,18 +664,27 @@ function translateCaptionsAndOverlay(
   overlayTrack: TrackView | undefined,
   deps: { clip: ClipCommandDeps; addTrackAndClip: AddTrackAndClipDeps },
   unresolved: UnresolvedAssetItem[]
-): EditorCommand[] {
+): CaptionsAndOverlayTranslation {
   const overlayClipInputs = buildOverlayClipInputs(broll, stickers, unresolved);
   const needsFreshOverlayTrack = overlayClipInputs.length > 0 && !overlayTrack;
   const needsFreshSubtitleTrack = captions.length > 0 && !subtitleTrack;
 
   if (needsFreshOverlayTrack && needsFreshSubtitleTrack) {
-    // Both fresh — the one case that needs real sequencing (see
-    // createCaptionsAboveOverlayCommand). translateCaptions' own
-    // resolveCaptionY/reveal-defaults logic is duplicated via
-    // buildCaptionClipInputs (same pure function translateCaptions
-    // itself calls), not reimplemented.
-    return [createCaptionsAboveOverlayCommand(deps.addTrackAndClip, buildCaptionClipInputs(captions), overlayClipInputs)];
+    // Both fresh — captions and overlay are still two fully INDEPENDENT
+    // top-level module commands (see createCaptionsTrackCommand's own doc
+    // comment in commands.ts for why this is no longer one bundled
+    // command); this only threads a SOFT stacking-order hint from
+    // captions' real committed order into overlay's insertBelowOrder, via
+    // the orchestrator, which runs captions first and passes its result
+    // (or undefined, if captions failed) into buildOverlayCommands below
+    // regardless of the outcome — overlay always still runs.
+    // translateCaptions' own resolveCaptionY/reveal-defaults logic is
+    // reused via buildCaptionClipInputs (the same pure function
+    // translateCaptions itself calls), not reimplemented.
+    return {
+      captionsCommands: [createCaptionsTrackCommand(deps.addTrackAndClip, buildCaptionClipInputs(captions))],
+      buildOverlayCommands: (subtitleTrackOrderHint) => [createOverlayTrackCommand(deps.addTrackAndClip, overlayClipInputs, subtitleTrackOrderHint)],
+    };
   }
 
   // Otherwise, at most ONE side needs fresh creation (or neither does) —
@@ -640,10 +695,12 @@ function translateCaptionsAndOverlay(
   // prepend-to-top (which would otherwise cover the existing captions).
   // Reuses the overlayClipInputs already computed above — calling
   // buildOverlayClipInputs a second time would double-push `unresolved`.
-  return [
-    ...translateCaptions(captions, subtitleTrack, deps),
-    ...buildOverlayCommands(overlayClipInputs, overlayTrack, deps, needsFreshOverlayTrack ? subtitleTrack?.order : undefined),
-  ];
+  // Fully determined already — the returned closure ignores its argument.
+  const overlayCommands = buildOverlayCommands(overlayClipInputs, overlayTrack, deps, needsFreshOverlayTrack ? subtitleTrack?.order : undefined);
+  return {
+    captionsCommands: translateCaptions(captions, subtitleTrack, deps),
+    buildOverlayCommands: () => overlayCommands,
+  };
 }
 
 const DEFAULT_SFX_DURATION_MS = 800;
@@ -857,33 +914,69 @@ export function translateAITimelinePlan(
     })
     .filter((s): s is AISfx => s !== null);
 
-  const commands: EditorCommand[] = [
-    ...sceneRemovalResult.commands,
-    ...translateCaptionsAndOverlay(
-      remappedCaptions,
-      remappedBroll,
-      remappedStickers,
-      subtitleTrack,
-      overlayTrack,
-      { clip: deps.clip, addTrackAndClip: deps.addTrackAndClip },
-      unresolvedAssets
-    ),
-    ...translateZoom(independentZoomItems, project, deps.clip, warnings),
-    ...translateSfx(remappedSfx, sfxTrack, { clip: deps.clip, addTrackAndClip: deps.addTrackAndClip }, unresolvedAssets),
-    ...translateMusic(
+  const captionsAndOverlay = translateCaptionsAndOverlay(
+    remappedCaptions,
+    remappedBroll,
+    remappedStickers,
+    subtitleTrack,
+    overlayTrack,
+    { clip: deps.clip, addTrackAndClip: deps.addTrackAndClip },
+    unresolvedAssets
+  );
+
+  // Wraps a module's own (possibly multi-item) command list into ONE
+  // atomic unit — a module still succeeds/fails/rolls back as a whole
+  // (e.g. captions' own N-clip batch is all-or-nothing), but that
+  // atomicity boundary now stops at the module, never spanning siblings.
+  // See createCompositeCommand's own doc comment (commands.ts) for the
+  // Promise.allSettled-based rollback-on-any-rejection mechanics reused
+  // here, just scoped one level down from "the whole plan" to "one section."
+  function wrapModule(commands: EditorCommand[], label: string): EditorCommand | null {
+    if (commands.length === 0) return null;
+    if (commands.length === 1) return commands[0];
+    return createCompositeCommand(label, commands);
+  }
+
+  const modules: AITimelineModuleCommand[] = [];
+  function pushStaticModule(module: AIEditModule, commands: EditorCommand[], label: string) {
+    const wrapped = wrapModule(commands, label);
+    if (wrapped) modules.push({ module, buildCommand: () => wrapped });
+  }
+
+  pushStaticModule("sceneRemoval", sceneRemovalResult.commands, "AI Scene Removal");
+  pushStaticModule("captions", captionsAndOverlay.captionsCommands, "AI Captions");
+
+  // Overlay alone needs the deferred/context-aware form (see
+  // AITimelineModuleCommand's own doc comment) — but whether there's
+  // anything to run at all is already fully known now (item COUNT never
+  // depends on the hint, only individual commands' insertBelowOrder does),
+  // so a throwaway peek call (ctx-independent count) safely decides
+  // whether to register the module at all.
+  const overlayPeek = captionsAndOverlay.buildOverlayCommands();
+  if (overlayPeek.length > 0) {
+    modules.push({
+      module: "overlay",
+      buildCommand: (ctx) => {
+        const wrapped = wrapModule(captionsAndOverlay.buildOverlayCommands(ctx.subtitleTrackOrderHint), "AI B-roll/Stickers");
+        return wrapped as EditorCommand; // non-null: overlayPeek.length > 0 guarantees this
+      },
+    });
+  }
+
+  pushStaticModule("zoom", translateZoom(independentZoomItems, project, deps.clip, warnings), "AI Zoom");
+  pushStaticModule("sfx", translateSfx(remappedSfx, sfxTrack, { clip: deps.clip, addTrackAndClip: deps.addTrackAndClip }, unresolvedAssets), "AI SFX");
+  pushStaticModule(
+    "music",
+    translateMusic(
       plan.music,
       { ...project, durationMs: effectiveDurationMs },
       musicTrack,
       { clip: deps.clip, track: deps.track, addMusicTrack: deps.addMusicTrack },
       unresolvedAssets
     ),
-    ...translateTransitions(independentTransitionItems, project, deps.transition, warnings),
-  ];
+    "AI Music"
+  );
+  pushStaticModule("transitions", translateTransitions(independentTransitionItems, project, deps.transition, warnings), "AI Transitions");
 
-  if (commands.length === 0) {
-    return { command: null, unresolvedAssets, warnings };
-  }
-  // The ENTIRE AI pass undoes/redoes as one action (per the founder's own
-  // requirement) — createCompositeCommand (Module 9's existing pattern).
-  return { command: createCompositeCommand("AI Auto-Edit", commands), unresolvedAssets, warnings };
+  return { modules, unresolvedAssets, warnings };
 }

@@ -6,11 +6,48 @@ import {
   mapZoomToSurvivingSegments,
   normalizeSceneRemovalWindows,
   translateAITimelinePlan,
+  type AITimelineModuleRunContext,
   type AITimelineProjectSnapshot,
+  type AITimelineTranslationResult,
   type AITimelineTranslatorDeps,
 } from "./ai-timeline-translator";
+import type { EditorCommand } from "./commands";
 import type { ClipView, TrackView } from "../types";
 import { AI_TIMELINE_SCHEMA_VERSION, AI_TRANSITION_SEGMENT_PLACEHOLDER_PREFIX, type AITimelinePlan } from "@/lib/validations/ai-timeline";
+
+// Module-independence fix (2026-08, requirement 3) — translateAITimelinePlan
+// no longer returns ONE composite `command`; it returns an array of
+// independently-runnable `modules`. This test-only helper drives them the
+// SAME way the real orchestrator (ai-auto-edit-panel.tsx's handleApply)
+// does — sequentially, threading the captions module's real committed
+// SUBTITLE order into a later overlay module exactly like production —
+// so every pre-existing "run it, check the calls, undo it" test below
+// keeps working unchanged against the new per-module shape. Tests that
+// specifically exercise MODULE INDEPENDENCE (a failure in one module not
+// affecting a sibling) live in commands.test.ts's own "FIX VERIFICATION"
+// describe block, run against the raw per-module commands directly.
+function runModules(result: AITimelineTranslationResult): { execute: () => Promise<void>; undo: () => Promise<void> } {
+  const ctx: AITimelineModuleRunContext = {};
+  const built: EditorCommand[] = [];
+  return {
+    execute: async () => {
+      for (const m of result.modules) {
+        const command = m.buildCommand(ctx);
+        built.push(command);
+        await command.execute();
+        if (m.module === "captions" && "getCommittedOrder" in command && typeof command.getCommittedOrder === "function") {
+          const order = (command as EditorCommand & { getCommittedOrder: () => number | undefined }).getCommittedOrder();
+          if (order !== undefined) ctx.subtitleTrackOrderHint = order;
+        }
+      }
+    },
+    undo: async () => {
+      for (const command of [...built].reverse()) {
+        await command.undo();
+      }
+    },
+  };
+}
 
 // Same framework-agnostic, fake-injected-deps testing style as
 // commands.test.ts (this translator sits directly on top of it).
@@ -433,7 +470,7 @@ describe("translateAITimelinePlan", () => {
   it("an empty plan produces a null command and no warnings/unresolved items", async () => {
     const deps = makeFakeDeps();
     const result = translateAITimelinePlan(emptyPlan(), baseProject(), deps);
-    expect(result.command).toBeNull();
+    expect(result.modules).toHaveLength(0);
     expect(result.unresolvedAssets).toEqual([]);
     expect(result.warnings).toEqual([]);
   });
@@ -445,8 +482,8 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    expect(result.command).not.toBeNull();
-    await result.command!.execute();
+    expect(result.modules.length).toBeGreaterThan(0);
+    await runModules(result).execute();
 
     expect(deps.clip.deleteClip).toHaveBeenCalledWith("clip-1");
     expect(deps.clip.addClip).toHaveBeenCalledTimes(2); // two surviving segments
@@ -472,7 +509,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     // Real post-removal duration: 10_000 - (6000-4000) = 8_000, NOT the
     // stale project.durationMs (20_000) the bug used to read.
@@ -483,7 +520,7 @@ describe("translateAITimelinePlan", () => {
     const project = baseProject({ tracks: [], clips: [] });
     const plan = emptyPlan({ sceneRemoval: [{ startMs: 0, endMs: 1000, reason: "filler_word" }] });
     const result = translateAITimelinePlan(plan, project, makeFakeDeps());
-    expect(result.command).toBeNull();
+    expect(result.modules).toHaveLength(0);
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]).toContain("sceneRemoval");
   });
@@ -509,7 +546,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.clip.addClip).toHaveBeenCalledWith(
       expect.objectContaining({ trackId: "sub-1", startMs: 5000, durationMs: 1000, content: expect.objectContaining({ text: "kept line" }) })
@@ -526,7 +563,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.addTrackAndClip.addTrack).not.toHaveBeenCalled(); // no SUBTITLE track needed — nothing survived to caption
     expect(result.warnings.some((w) => w.includes("removed line") && w.includes("fell entirely within a removed scene-removal window"))).toBe(true);
@@ -542,7 +579,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.addTrackAndClip.addTrack).toHaveBeenCalledWith({ kind: "OVERLAY" });
     expect(deps.addTrackAndClip.addClip).toHaveBeenCalledWith(expect.objectContaining({ assetId: "asset-broll", startMs: 5000, durationMs: 1000 }));
@@ -558,7 +595,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.addTrackAndClip.addTrack).not.toHaveBeenCalledWith({ kind: "AUDIO", audioSubtype: "SFX" });
     expect(result.warnings.some((w) => w.includes("sfx at 4800") && w.includes("fell entirely within a removed scene-removal window"))).toBe(true);
@@ -573,7 +610,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.addTrackAndClip.addClip).toHaveBeenCalledWith(expect.objectContaining({ startMs: 1000, durationMs: 1000 }));
     expect(result.warnings).toEqual([]);
@@ -586,7 +623,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.clip.addClip).toHaveBeenCalledWith(expect.objectContaining({ trackId: "sub-1", startMs: 0, durationMs: 2000 }));
     expect(deps.addTrackAndClip.addTrack).not.toHaveBeenCalled();
@@ -602,7 +639,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.clip.addClip).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -625,7 +662,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.clip.addClip).toHaveBeenCalledWith(
       expect.objectContaining({ content: expect.not.objectContaining({ richRuns: expect.anything() }) })
@@ -639,7 +676,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.clip.addClip).toHaveBeenCalledWith(
       expect.objectContaining({ content: expect.not.objectContaining({ richRuns: expect.anything() }) })
@@ -652,7 +689,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.addTrackAndClip.addTrack).toHaveBeenCalledWith({ kind: "SUBTITLE" });
     expect(deps.addTrackAndClip.addClip).toHaveBeenCalledWith(expect.objectContaining({ startMs: 0, durationMs: 2000 }));
@@ -678,7 +715,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.addTrackAndClip.addTrack).toHaveBeenCalledTimes(1);
     expect(deps.addTrackAndClip.addTrack).toHaveBeenCalledWith({ kind: "SUBTITLE" });
@@ -698,8 +735,9 @@ describe("translateAITimelinePlan", () => {
     }));
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
-    await result.command!.undo();
+    const run = runModules(result);
+    await run.execute();
+    await run.undo();
 
     expect(deps.addTrackAndClip.deleteClip).toHaveBeenCalledWith("caption-clip-0");
     expect(deps.addTrackAndClip.deleteClip).toHaveBeenCalledWith("caption-clip-1");
@@ -712,7 +750,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.clip.addClip).toHaveBeenCalledWith(
       expect.objectContaining({ content: expect.objectContaining({ reveal: expect.objectContaining({ mode: "WORD" }) }) })
@@ -726,7 +764,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.clip.updateClip).toHaveBeenCalledWith({
       clipId: "clip-1",
@@ -748,7 +786,7 @@ describe("translateAITimelinePlan", () => {
     const project = baseProject({ clips: [] });
     const plan = emptyPlan({ zoom: [{ clipId: "does-not-exist", startMs: 0, endMs: 1000, scaleFrom: 100, scaleTo: 120 }] });
     const result = translateAITimelinePlan(plan, project, makeFakeDeps());
-    expect(result.command).toBeNull();
+    expect(result.modules).toHaveLength(0);
     expect(result.warnings[0]).toContain("does-not-exist");
   });
 
@@ -776,8 +814,8 @@ describe("translateAITimelinePlan", () => {
     }));
 
     const result = translateAITimelinePlan(plan, project, deps);
-    expect(result.command).not.toBeNull();
-    await result.command!.execute();
+    expect(result.modules.length).toBeGreaterThan(0);
+    await runModules(result).execute();
 
     // The delete targets the ORIGINAL clip — unchanged, expected.
     expect(deps.clip.deleteClip).toHaveBeenCalledWith("original-clip");
@@ -808,7 +846,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     // clip-b was never touched by sceneRemoval, so its zoom goes through
     // the plain, independent translateZoom path — targeting its own real
@@ -825,7 +863,7 @@ describe("translateAITimelinePlan", () => {
       broll: [{ startMs: 0, endMs: 2000, trackHint: "broll", source: "stock", searchQuery: "city skyline at night" }],
     });
     const result = translateAITimelinePlan(plan, project, makeFakeDeps());
-    expect(result.command).toBeNull();
+    expect(result.modules).toHaveLength(0);
     expect(result.unresolvedAssets).toHaveLength(1);
     expect(result.unresolvedAssets[0]).toMatchObject({ section: "broll", reason: "missing_resolved_asset_id" });
   });
@@ -840,7 +878,7 @@ describe("translateAITimelinePlan", () => {
 
     const result = translateAITimelinePlan(plan, project, deps);
     expect(result.unresolvedAssets).toEqual([]);
-    await result.command!.execute();
+    await runModules(result).execute();
     expect(deps.clip.addClip).toHaveBeenCalledWith(expect.objectContaining({ trackId: "overlay-1", assetId: "asset-42" }));
   });
 
@@ -864,7 +902,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.addMusicTrack.addTrack).toHaveBeenCalledWith({ kind: "AUDIO", audioSubtype: "MUSIC" });
     expect(deps.addMusicTrack.addClip).toHaveBeenCalledWith(expect.objectContaining({ assetId: "music-asset-1", startMs: 0, durationMs: 15_000 }));
@@ -890,7 +928,7 @@ describe("translateAITimelinePlan", () => {
     });
     const deps = makeFakeDeps();
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.addMusicTrack.addClip).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -913,7 +951,7 @@ describe("translateAITimelinePlan", () => {
     const plan = emptyPlan({ music: { assetId: "music-asset-1", duckingEnabled: true } });
     const deps = makeFakeDeps();
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.addMusicTrack.addClip).toHaveBeenCalledWith(expect.not.objectContaining({ content: expect.anything() }));
   });
@@ -925,7 +963,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.clip.addClip).toHaveBeenCalledWith(expect.objectContaining({ trackId: "music-1", assetId: "music-asset-1", durationMs: 12_000 }));
     expect(deps.track.updateTrack).toHaveBeenCalledWith(expect.objectContaining({ trackId: "music-1", patch: expect.objectContaining({ duckingEnabled: true }) }));
@@ -947,7 +985,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.transition.addTransition).toHaveBeenCalledWith(
       expect.objectContaining({ trackId: "track-1", clipAId: "clip-a", clipBId: "clip-b", type: "CROSSFADE", durationMs: 500 })
@@ -960,7 +998,7 @@ describe("translateAITimelinePlan", () => {
     const project = baseProject({ clips: [clipA, clipB] });
     const plan = emptyPlan({ transitions: [{ betweenClipIds: ["clip-a", "clip-b"], type: "CROSSFADE", durationMs: 500 }] });
     const result = translateAITimelinePlan(plan, project, makeFakeDeps());
-    expect(result.command).toBeNull();
+    expect(result.modules).toHaveLength(0);
     expect(result.warnings[0]).toContain("same track");
   });
 
@@ -988,8 +1026,8 @@ describe("translateAITimelinePlan", () => {
     }));
 
     const result = translateAITimelinePlan(plan, project, deps);
-    expect(result.command).not.toBeNull();
-    await result.command!.execute();
+    expect(result.modules.length).toBeGreaterThan(0);
+    await runModules(result).execute();
 
     expect(deps.transition.addTransition).toHaveBeenCalledWith(
       expect.objectContaining({ trackId: "track-1", clipAId: "segment-0", clipBId: "segment-1", type: "DISSOLVE", durationMs: 400 })
@@ -1014,7 +1052,7 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.addTrackAndClip.addTrack).toHaveBeenCalledTimes(1);
     expect(deps.addTrackAndClip.addTrack).toHaveBeenCalledWith({ kind: "OVERLAY" });
@@ -1033,14 +1071,14 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
+    await runModules(result).execute();
 
     expect(deps.addTrackAndClip.addTrack).not.toHaveBeenCalled();
     expect(deps.clip.addClip).toHaveBeenCalledWith(expect.objectContaining({ trackId: "overlay-1", assetId: "broll-asset" }));
     expect(deps.clip.addClip).toHaveBeenCalledWith(expect.objectContaining({ trackId: "overlay-1", assetId: "sticker-asset" }));
   });
 
-  it("wraps a multi-section plan in ONE composite command — undo() reverses every section together", async () => {
+  it("a multi-section plan produces one INDEPENDENT module command per section — undoing every module together still reverses everything", async () => {
     const subtitleTrack = makeTrack({ id: "sub-1", kind: "SUBTITLE" });
     const project = baseProject({ tracks: [subtitleTrack] });
     const plan = emptyPlan({
@@ -1050,8 +1088,16 @@ describe("translateAITimelinePlan", () => {
     const deps = makeFakeDeps();
 
     const result = translateAITimelinePlan(plan, project, deps);
-    await result.command!.execute();
-    await result.command!.undo();
+    // Module-independence fix (2026-08, requirement 3) — captions and sfx
+    // are now two SEPARATE top-level modules (previously one shared
+    // createCompositeCommand), each independently undo-able. runModules
+    // below drives them the same way the real orchestrator
+    // (ai-auto-edit-panel.tsx's handleApply) does — sequentially, each
+    // with its own execute()/undo() — not bundled into one command.
+    expect(result.modules.map((m) => m.module).sort()).toEqual(["captions", "sfx"]);
+    const run = runModules(result);
+    await run.execute();
+    await run.undo();
 
     // Both the caption clip and the sfx clip (auto-created AUDIO/SFX track) got deleted on undo.
     expect(deps.clip.deleteClip).toHaveBeenCalled();
@@ -1063,13 +1109,23 @@ describe("translateAITimelinePlan", () => {
   // data on 2026-07-19 (OVERLAY order -2, SUBTITLE order -1, b-roll
   // rendering over captions in an overlapping window) after an earlier
   // investigation had flagged but never actually fixed it — see
-  // createCaptionsAboveOverlayCommand's own doc comment (commands.ts) for
-  // the root mechanism (createCompositeCommand's Promise.all gives no
+  // createCaptionsTrackCommand's own doc comment (commands.ts) for the
+  // root mechanism (createCompositeCommand's Promise.all gives no
   // ordering guarantee between sibling track-creates). This mock
   // simulates addTrack()'s REAL order semantics (prepend decrements
   // below the current lowest order; insertBelowOrder lands one above the
   // given reference) closely enough to prove the fix's actual numeric
   // outcome, not just "some command ran."
+  //
+  // Module-independence update (2026-08, requirement 3) — captions and
+  // overlay are now two separate top-level modules (no longer one bundled
+  // createCaptionsAboveOverlayCommand), sequenced by the orchestrator
+  // (runModules below, mirroring ai-auto-edit-panel.tsx's handleApply):
+  // captions still runs first and its real committed order still feeds
+  // overlay's insertBelowOrder as a SOFT hint, but the two are
+  // independently undo-able and a captions failure no longer blocks
+  // overlay from running (see commands.test.ts's own "FIX VERIFICATION"
+  // describe block for that independence property, unit-tested directly).
   describe("caption/b-roll stacking order (2026-07-19 fix)", () => {
     function makeOrderTrackingDeps(): { deps: AITimelineTranslatorDeps; getCreatedOrder: (trackId: string) => number | undefined } {
       const orders = new Map<string, number>();
@@ -1097,8 +1153,8 @@ describe("translateAITimelinePlan", () => {
       for (let i = 0; i < 10; i++) {
         const { deps, getCreatedOrder } = makeOrderTrackingDeps();
         const result = translateAITimelinePlan(plan, project, deps);
-        expect(result.command).not.toBeNull();
-        await result.command!.execute();
+        expect(result.modules.length).toBeGreaterThan(0);
+        await runModules(result).execute();
 
         const addTrackCalls = (deps.addTrackAndClip.addTrack as ReturnType<typeof vi.fn>).mock.calls;
         expect(addTrackCalls).toHaveLength(2);
@@ -1132,7 +1188,7 @@ describe("translateAITimelinePlan", () => {
       const { deps } = makeOrderTrackingDeps();
 
       const result = translateAITimelinePlan(plan, project, deps);
-      await result.command!.execute();
+      await runModules(result).execute();
 
       expect(deps.addTrackAndClip.addTrack).toHaveBeenCalledWith({ kind: "OVERLAY", insertBelowOrder: -5 });
     });
@@ -1146,7 +1202,7 @@ describe("translateAITimelinePlan", () => {
       const { deps } = makeOrderTrackingDeps();
 
       const result = translateAITimelinePlan(plan, project, deps);
-      await result.command!.execute();
+      await runModules(result).execute();
 
       expect(deps.addTrackAndClip.addTrack).toHaveBeenCalledWith({ kind: "SUBTITLE" });
       expect(deps.addTrackAndClip.addTrack).not.toHaveBeenCalledWith(expect.objectContaining({ insertBelowOrder: expect.anything() }));
@@ -1163,14 +1219,14 @@ describe("translateAITimelinePlan", () => {
       const { deps } = makeOrderTrackingDeps();
 
       const result = translateAITimelinePlan(plan, project, deps);
-      await result.command!.execute();
+      await runModules(result).execute();
 
       expect(deps.addTrackAndClip.addTrack).not.toHaveBeenCalled();
       expect(deps.clip.addClip).toHaveBeenCalledWith(expect.objectContaining({ trackId: "sub-existing" }));
       expect(deps.clip.addClip).toHaveBeenCalledWith(expect.objectContaining({ trackId: "overlay-existing" }));
     });
 
-    it("the combined command's undo() removes BOTH the caption and b-roll tracks/clips it created", async () => {
+    it("undoing both the captions AND overlay modules removes BOTH tracks/clips they created, even though they're independent commands", async () => {
       const project = { tracks: [], clips: [], durationMs: 20_000 };
       const plan = emptyPlan({
         captions: [{ text: "Hello", startMs: 0, endMs: 1000 }],
@@ -1179,8 +1235,10 @@ describe("translateAITimelinePlan", () => {
       const { deps } = makeOrderTrackingDeps();
 
       const result = translateAITimelinePlan(plan, project, deps);
-      await result.command!.execute();
-      await result.command!.undo();
+      expect(result.modules.map((m) => m.module).sort()).toEqual(["captions", "overlay"]);
+      const run = runModules(result);
+      await run.execute();
+      await run.undo();
 
       expect(deps.addTrackAndClip.deleteClip).toHaveBeenCalledTimes(2);
       expect(deps.addTrackAndClip.removeTrack).toHaveBeenCalledTimes(2);

@@ -94,11 +94,18 @@ function useInvalidateProject(projectId: string) {
   return () => queryClient.invalidateQueries({ queryKey: projectQueryKey(projectId) });
 }
 
+// `retry: true` (2026-08 AI Auto-Edit apply reliability fix) — addTrack is
+// on the critical path of every AI Auto-Edit batch apply (createSceneRemovalCommand
+// notwithstanding, every fresh-track create in commands.ts goes through this
+// hook); a transient failure here previously killed the entire batch with no
+// retry. Safe to enable for every caller (manual editing included) since
+// editorApi() only ever retries a genuinely transient failure (5xx/network),
+// never a validation rejection — see isTransientApiFailure's own doc comment.
 export function useAddTrackMutation(projectId: string) {
   const invalidate = useInvalidateProject(projectId);
   return useMutation({
     mutationFn: ({ kind, audioSubtype, insertBelowOrder }: { kind: EditorTrackKind; audioSubtype?: EditorAudioSubtype; insertBelowOrder?: number }) =>
-      editorApi<{ track: TrackView }>(`/api/editor/projects/${projectId}/tracks`, "POST", { kind, audioSubtype, insertBelowOrder }),
+      editorApi<{ track: TrackView }>(`/api/editor/projects/${projectId}/tracks`, "POST", { kind, audioSubtype, insertBelowOrder }, { retry: true }),
     onSuccess: invalidate,
   });
 }
@@ -229,11 +236,18 @@ export interface AddClipPatch {
   transform?: ClipTransform;
 }
 
+// `retry: true` (2026-08 AI Auto-Edit apply reliability fix, requirement 2)
+// — addClip is the single most-called mutation in an AI Auto-Edit batch
+// apply (one call per caption/broll/sticker/sfx/zoom-segment item, often
+// dozens per job); previously any one transient failure anywhere in that
+// sequence permanently aborted the whole batch. Bounded exponential-backoff
+// retry lives in editorApi() itself and only ever fires for a genuinely
+// transient failure (5xx/429/network) — never a validation rejection.
 export function useAddClipMutation(projectId: string) {
   const invalidate = useInvalidateProject(projectId);
   return useMutation({
     mutationFn: (patch: AddClipPatch) =>
-      editorApi<{ clip: ClipView }>(`/api/editor/projects/${projectId}/clips`, "POST", patch),
+      editorApi<{ clip: ClipView }>(`/api/editor/projects/${projectId}/clips`, "POST", patch, { retry: true }),
     onSuccess: invalidate,
   });
 }
@@ -794,6 +808,22 @@ export function useCaptionPresetsQuery() {
   return useQuery({
     queryKey: ["editor", "caption-presets"] as const,
     queryFn: () => editorApi<{ presets: CaptionStylePreset[] }>("/api/editor/caption-presets", "GET").then((d) => d.presets),
+    staleTime: 60 * 60 * 1000,
+  });
+}
+
+// Phase 3 — manual editor's Theme picker (Subtitle Engine themes, distinct
+// from the ad hoc "Caption template" presets above). `version` is each
+// theme's current latest — pinned onto the clip at selection time.
+export interface SubtitleThemeOption {
+  id: string;
+  name: string;
+  version: number;
+}
+export function useSubtitleThemesQuery() {
+  return useQuery({
+    queryKey: ["editor", "subtitle-themes"] as const,
+    queryFn: () => editorApi<{ themes: SubtitleThemeOption[] }>("/api/editor/subtitle-themes", "GET").then((d) => d.themes),
     staleTime: 60 * 60 * 1000,
   });
 }

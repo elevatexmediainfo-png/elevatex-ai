@@ -326,6 +326,17 @@ export function createSceneRemovalCommand(
 ): EditorCommand {
   let currentOriginalId: string | null = originalClip.id;
   let createdSegmentIds: string[] = [];
+  // Module-independence fix (2026-08, requirement 3) hardening — the
+  // orchestrator now explicitly calls a failed module's own undo() to
+  // self-rollback (see ai-auto-edit-panel.tsx's handleApply), which means
+  // undo() must now be safe to call after execute() throws at ANY point,
+  // not only after a full success. Tracks whether the later-clips shift
+  // actually ran, so undo() never "un-shifts" clips that were never
+  // shifted in the first place (a throw before that step, e.g. the very
+  // first deleteClip call below, previously left totalShiftMs > 0 true
+  // regardless — undo() would incorrectly move laterClipsOnTrack even
+  // though execute() never touched them).
+  let didShiftLaterClips = false;
   const totalShiftMs = originalClip.durationMs - survivingSegments.reduce((sum, s) => sum + s.durationMs, 0);
 
   return {
@@ -334,7 +345,20 @@ export function createSceneRemovalCommand(
       const targetId = currentOriginalId ?? originalClip.id;
       await deps.deleteClip(targetId);
       currentOriginalId = null;
-      const created: string[] = [];
+      // Requirement 1 fix (2026-08, partial-rollback bug) — createdSegmentIds
+      // is pushed to DIRECTLY, inside the loop, the moment each segment's
+      // addClip resolves, instead of accumulating in a local array only
+      // assigned to this outer undo-tracking variable after the ENTIRE loop
+      // completes. Previously, a throw partway through (segment 8 of 17,
+      // say) left createdSegmentIds at whatever it was BEFORE this execute()
+      // ran (empty, on a first attempt) even though segments 1-7 were
+      // already real, persisted server rows — undo() would then recreate
+      // the original clip on top of those 7 orphans (since undo()
+      // unconditionally restores the original regardless of
+      // createdSegmentIds) without ever deleting them first, producing
+      // visibly overlapping/duplicate clips. Reset to [] here (not just at
+      // undo()) so a redo-after-undo starts clean too.
+      createdSegmentIds = [];
       for (let i = 0; i < survivingSegments.length; i++) {
         const seg = survivingSegments[i];
         const { clip } = await deps.addClip({
@@ -346,7 +370,7 @@ export function createSceneRemovalCommand(
           content: (originalClip.content as Record<string, unknown> | null) ?? undefined,
           transform: originalClip.transform ?? undefined,
         });
-        created.push(clip.id);
+        createdSegmentIds.push(clip.id);
 
         const zoom = zoomBySegment[i];
         if (zoom) {
@@ -364,38 +388,47 @@ export function createSceneRemovalCommand(
           await deps.updateClip({ clipId: clip.id, patch: { transform: next } });
         }
       }
-      createdSegmentIds = created;
       if (totalShiftMs > 0) {
         await Promise.all(laterClipsOnTrack.map((c) => deps.updateClip({ clipId: c.id, patch: { startMs: c.startMs - totalShiftMs } })));
+        didShiftLaterClips = true;
       }
       // Runs AFTER every segment exists — both sides of any boundary
       // pair now have real ids, so this is safe as a sequential tail,
       // never a race against the creates above.
       if (transitionDeps) {
         for (const t of segmentBoundaryTransitions) {
-          const clipAId = created[t.afterSegmentIndex];
-          const clipBId = created[t.afterSegmentIndex + 1];
+          const clipAId = createdSegmentIds[t.afterSegmentIndex];
+          const clipBId = createdSegmentIds[t.afterSegmentIndex + 1];
           if (!clipAId || !clipBId) continue; // out-of-range index — already warned at translate time
           await transitionDeps.addTransition({ trackId: originalClip.trackId, clipAId, clipBId, type: t.type, durationMs: t.durationMs });
         }
       }
     },
     undo: async () => {
-      if (totalShiftMs > 0) {
+      if (didShiftLaterClips) {
         await Promise.all(laterClipsOnTrack.map((c) => deps.updateClip({ clipId: c.id, patch: { startMs: c.startMs } })));
+        didShiftLaterClips = false;
       }
       await Promise.all(createdSegmentIds.map((id) => deps.deleteClip(id)));
       createdSegmentIds = [];
-      const { clip } = await deps.addClip({
-        trackId: originalClip.trackId,
-        assetId: originalClip.assetId ?? undefined,
-        startMs: originalClip.startMs,
-        durationMs: originalClip.durationMs,
-        trimStartMs: originalClip.trimStartMs,
-        content: (originalClip.content as Record<string, unknown> | null) ?? undefined,
-        transform: originalClip.transform ?? undefined,
-      });
-      currentOriginalId = clip.id;
+      // Only recreate the original clip if it was actually deleted.
+      // currentOriginalId is set back to non-null the moment this recreate
+      // succeeds (or stays at its initial originalClip.id if the very
+      // first deleteClip in execute() never even ran/succeeded) — either
+      // way, a non-null value here means the original clip is still live
+      // server-side, so recreating it would produce a visible duplicate.
+      if (currentOriginalId === null) {
+        const { clip } = await deps.addClip({
+          trackId: originalClip.trackId,
+          assetId: originalClip.assetId ?? undefined,
+          startMs: originalClip.startMs,
+          durationMs: originalClip.durationMs,
+          trimStartMs: originalClip.trimStartMs,
+          content: (originalClip.content as Record<string, unknown> | null) ?? undefined,
+          transform: originalClip.transform ?? undefined,
+        });
+        currentOriginalId = clip.id;
+      }
     },
   };
 }
@@ -538,12 +571,21 @@ export function createAddTrackWithClipsCommand(
     execute: async () => {
       const { track } = await deps.addTrack(trackInput);
       createdTrackId = track.id;
-      const clipIds: string[] = [];
+      // Requirement 1 fix (2026-08, partial-rollback bug) — pushed directly
+      // to the outer undo-tracking variable as each clip lands, not
+      // accumulated in a local array only assigned here after the whole
+      // loop finishes. Previously a throw partway (item 5 of 5 captions,
+      // say) left createdClipIds still empty even though items 1-4 were
+      // already real, persisted rows — undo() then deleted zero clips
+      // (though it DID still remove the track, since createdTrackId was
+      // already set), leaving 4 orphaned clips with no track to belong to.
+      // See commands.test.ts's "PRODUCTION BUG" describe block for the
+      // reproducing evidence this fix resolves.
+      createdClipIds = [];
       for (const clipInput of clipInputs) {
         const { clip } = await deps.addClip({ ...clipInput, trackId: track.id });
-        clipIds.push(clip.id);
+        createdClipIds.push(clip.id);
       }
-      createdClipIds = clipIds;
     },
     undo: async () => {
       await Promise.all(createdClipIds.map((id) => deps.deleteClip(id)));
@@ -554,64 +596,93 @@ export function createAddTrackWithClipsCommand(
   };
 }
 
-// Real bug found live (2026-07-18/19) — when the AI Auto-Editor needs to
-// create BOTH a fresh SUBTITLE (captions) track AND a fresh OVERLAY
-// (b-roll/stickers) track in the SAME apply, running them as two
-// independent createAddTrackWithClipsCommands inside the top-level
-// parallel createCompositeCommand raced for which one landed at the
-// lower `order` (renders in front, see track-stacking.ts's own
-// convention) — live-confirmed b-roll winning that race and covering
-// captions for an overlapping time window. Promise.all gives no ordering
-// guarantee between sibling promises, so no amount of array-ordering in
-// ai-timeline-translator.ts's own `commands` list could have fixed this;
-// it needed genuine sequencing. This command creates SUBTITLE first,
-// AWAITS its real committed order, THEN creates OVERLAY via addTrack's
-// insertBelowOrder param targeting that real value — captions render
-// above b-roll by construction now, not by chance of scheduling.
-// Deliberately builds only the "both fresh" case; ai-timeline-translator.ts
-// only reaches for this when it actually applies (see its own call site).
-export function createCaptionsAboveOverlayCommand(
-  deps: AddTrackAndClipDeps,
-  captionClipInputs: Omit<AddClipPatch, "trackId">[],
-  overlayClipInputs: Omit<AddClipPatch, "trackId">[]
-): EditorCommand {
-  let subtitleTrackId: string | null = null;
-  let subtitleClipIds: string[] = [];
-  let overlayTrackId: string | null = null;
-  let overlayClipIds: string[] = [];
+// SUPERSEDED (2026-08, module-independence fix, requirement 3) by the pair
+// createCaptionsTrackCommand + createOverlayTrackCommand directly below.
+//
+// History for context: real bug found live (2026-07-18/19) — when the AI
+// Auto-Editor needed to create BOTH a fresh SUBTITLE (captions) track AND
+// a fresh OVERLAY (b-roll/stickers) track in the SAME apply, running them
+// as two independent createAddTrackWithClipsCommands inside the top-level
+// parallel createCompositeCommand raced for which one landed at the lower
+// `order` (renders in front, see track-stacking.ts's own convention) —
+// live-confirmed b-roll winning that race and covering captions for an
+// overlapping time window. The original fix bundled both track-creates
+// into ONE command (createCaptionsAboveOverlayCommand) so captions could
+// finish first and hand its real committed `order` to overlay's
+// insertBelowOrder — correct for the stacking-order guarantee, but it had
+// a side effect nobody asked for: captions and overlay became a single
+// atomic unit, so a captions failure aborted b-roll entirely (never even
+// attempted) and a stickers/b-roll failure rolled captions back too, even
+// though neither module's CORRECTNESS depends on the other succeeding
+// (only the render-order guarantee does, and only in the both-fresh case).
+// A later requirement ("Failure in captions must NOT prevent b-roll...
+// Failure in stickers must NOT remove captions... Only rollback the module
+// that actually failed") explicitly asked for exactly the independence
+// this old design traded away. The fix: keep the SEQUENCING (captions
+// attempted first, its real order handed to overlay) but make them two
+// separate top-level EditorCommands — see translateCaptionsAndOverlay in
+// ai-timeline-translator.ts for how they're now run and independently
+// rolled back at the orchestration layer.
+
+// createCaptionsTrackCommand — creates a fresh SUBTITLE track plus every
+// caption clip, as one atomic, independently undo-able unit. Incrementally
+// tracks each created clip id (same requirement-1 fix as
+// createAddTrackWithClipsCommand above) so a mid-batch failure's own undo
+// is always accurate. `getCommittedOrder()` exposes the real server-side
+// `order` this track landed at once execute() succeeds, so a sibling
+// createOverlayTrackCommand run afterward can target insertBelowOrder —
+// this is now a SOFT ordering hint the caller opts into, never a hard
+// execution dependency: overlay still runs (and still succeeds or fails)
+// whether or not captions ran first, or ran at all.
+export function createCaptionsTrackCommand(deps: AddTrackAndClipDeps, captionClipInputs: Omit<AddClipPatch, "trackId">[]): EditorCommand & { getCommittedOrder: () => number | undefined } {
+  let trackId: string | null = null;
+  let clipIds: string[] = [];
+  let committedOrder: number | undefined;
   return {
-    label: "Add Captions + B-roll",
+    label: "Add Captions",
     execute: async () => {
-      let subtitleOrder: number | undefined;
-      if (captionClipInputs.length > 0) {
-        const { track } = await deps.addTrack({ kind: "SUBTITLE" });
-        subtitleTrackId = track.id;
-        subtitleOrder = track.order;
-        const clipIds: string[] = [];
-        for (const clipInput of captionClipInputs) {
-          const { clip } = await deps.addClip({ ...clipInput, trackId: track.id });
-          clipIds.push(clip.id);
-        }
-        subtitleClipIds = clipIds;
-      }
-      if (overlayClipInputs.length > 0) {
-        const { track } = await deps.addTrack({ kind: "OVERLAY", insertBelowOrder: subtitleOrder });
-        overlayTrackId = track.id;
-        const clipIds: string[] = [];
-        for (const clipInput of overlayClipInputs) {
-          const { clip } = await deps.addClip({ ...clipInput, trackId: track.id });
-          clipIds.push(clip.id);
-        }
-        overlayClipIds = clipIds;
+      const { track } = await deps.addTrack({ kind: "SUBTITLE" });
+      trackId = track.id;
+      committedOrder = track.order;
+      clipIds = [];
+      for (const clipInput of captionClipInputs) {
+        const { clip } = await deps.addClip({ ...clipInput, trackId: track.id });
+        clipIds.push(clip.id);
       }
     },
     undo: async () => {
-      await Promise.all([...subtitleClipIds, ...overlayClipIds].map((id) => deps.deleteClip(id)));
-      subtitleClipIds = [];
-      overlayClipIds = [];
-      await Promise.all([subtitleTrackId, overlayTrackId].filter((id): id is string => !!id).map((id) => deps.removeTrack(id)));
-      subtitleTrackId = null;
-      overlayTrackId = null;
+      await Promise.all(clipIds.map((id) => deps.deleteClip(id)));
+      clipIds = [];
+      if (trackId) await deps.removeTrack(trackId);
+      trackId = null;
+      committedOrder = undefined;
+    },
+    getCommittedOrder: () => committedOrder,
+  };
+}
+
+// createOverlayTrackCommand — same shape as createCaptionsTrackCommand,
+// for the OVERLAY (b-roll + stickers) track. See that command's own doc
+// comment for why these are now two independent commands instead of one.
+export function createOverlayTrackCommand(deps: AddTrackAndClipDeps, overlayClipInputs: Omit<AddClipPatch, "trackId">[], insertBelowOrder?: number): EditorCommand {
+  let trackId: string | null = null;
+  let clipIds: string[] = [];
+  return {
+    label: "Add B-roll/Stickers",
+    execute: async () => {
+      const { track } = await deps.addTrack({ kind: "OVERLAY", insertBelowOrder });
+      trackId = track.id;
+      clipIds = [];
+      for (const clipInput of overlayClipInputs) {
+        const { clip } = await deps.addClip({ ...clipInput, trackId: track.id });
+        clipIds.push(clip.id);
+      }
+    },
+    undo: async () => {
+      await Promise.all(clipIds.map((id) => deps.deleteClip(id)));
+      clipIds = [];
+      if (trackId) await deps.removeTrack(trackId);
+      trackId = null;
     },
   };
 }
