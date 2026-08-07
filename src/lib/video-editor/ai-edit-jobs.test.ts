@@ -41,6 +41,16 @@ vi.mock("@/lib/generation/video-understanding", () => ({ analyzeVideo: (...args:
 const planTimelineMock = vi.fn();
 vi.mock("@/lib/generation/reasoning", () => ({ planTimeline: (...args: unknown[]) => planTimelineMock(...args) }));
 
+// AI Video Director (2026-08-07) — mocked at the orchestrator boundary
+// (not the individual planStory/planCaptions/... calls) so these
+// integration-point tests stay focused on ai-edit-jobs.ts's own wiring
+// (does it call the Director pipeline when the flag is on, does it
+// persist story/v2 qualityScores/cost correctly) rather than
+// re-exercising the orchestrator's own internal logic, which already has
+// its own dedicated, thorough test suite (director/orchestrator.test.ts).
+const runDirectorPipelineMock = vi.fn();
+vi.mock("./director/orchestrator", () => ({ runDirectorPipeline: (...args: unknown[]) => runDirectorPipelineMock(...args) }));
+
 const resolveBrollItemsMock = vi.fn();
 vi.mock("./ai-broll-resolver", () => ({ resolveBrollItems: (...args: unknown[]) => resolveBrollItemsMock(...args) }));
 
@@ -114,7 +124,13 @@ beforeEach(() => {
   getStorageProviderMock.mockResolvedValue({ getPublicUrl: () => "https://example.com/a.mp4" });
   global.fetch = vi.fn().mockResolvedValue({ ok: true });
   transcribeAudioMock.mockResolvedValue({ providerId: "assemblyai", words: [], durationSeconds: 10, costUsd: 0.01 });
-  getConfigMock.mockResolvedValue(700);
+  // AI Video Director (2026-08-07) — this whole test file exercises the
+  // LEGACY single-call planTimeline() path; the flag must resolve falsy
+  // here or every test below would silently route into the (unmocked)
+  // Director pipeline instead. Every OTHER config key keeps the
+  // pre-existing blanket 700 default — none of these tests care about
+  // its exact value beyond "some plausible number."
+  getConfigMock.mockImplementation((key: string) => Promise.resolve(key === "AI_EDIT_DIRECTOR_PIPELINE_ENABLED" ? false : 700));
   proposeSceneRemovalsMock.mockReturnValue([{ startMs: 0, endMs: 200, reason: "silence" }]);
   mergeSceneRemovalCandidatesMock.mockReturnValue([{ startMs: 0, endMs: 200, reason: "silence" }]);
   resolveTimelinePlanAssetsMock.mockResolvedValue({ stickers: [], music: undefined, sfx: [] });
@@ -263,5 +279,67 @@ describe("processAiEditJob — quality-triggered retry", () => {
     // The job still reaches READY_FOR_REVIEW — a failed retry is never
     // fatal to an already-successful first attempt.
     expect(aiEditJobUpdateMock).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "READY_FOR_REVIEW" }) }));
+  });
+});
+
+// AI Video Director (2026-08-07) — the integration point itself: does
+// ai-edit-jobs.ts correctly branch on AI_EDIT_DIRECTOR_PIPELINE_ENABLED,
+// call the Director pipeline instead of legacy planTimeline when it's on,
+// and persist its story/v2-qualityScores/cost onto the saved plan? The
+// orchestrator's own internal logic (agent ordering, the retry loop,
+// stagnation detection, etc.) is NOT re-tested here — see
+// director/orchestrator.test.ts for that.
+describe("processAiEditJob — AI Video Director pipeline (flag on)", () => {
+  const DIRECTOR_RESULT = {
+    captions: [{ text: "director caption", startMs: 0, endMs: 9500 }],
+    zoom: [{ startMs: 0, endMs: 500, scaleFrom: 100, scaleTo: 112 }],
+    broll: [{ startMs: 0, endMs: 500, trackHint: "broll", source: "stock", searchQuery: "office" }],
+    stickers: [],
+    transitions: [],
+    music: undefined,
+    sfx: [],
+    story: { beats: [{ kind: "hook", startMs: 0, endMs: 500, description: "opening" }], hookText: "director hook", retentionRisks: [] },
+    scores: {
+      captionScore: 90, brollScore: 90, visualVarietyScore: 90, pacingScore: 90, musicScore: 100, sfxScore: 100,
+      hookScore: 90, emotionScore: 90, retentionScore: 90, storyFlowScore: 90,
+      overallScore: 92, thresholdMet: true, iterations: 1, weakCategoriesFinal: [],
+    },
+    reasoningCostUsd: 0.2,
+    warnings: [],
+    iterationHistory: [],
+  };
+
+  beforeEach(() => {
+    getConfigMock.mockImplementation((key: string) => Promise.resolve(key === "AI_EDIT_DIRECTOR_PIPELINE_ENABLED" ? true : 700));
+    runDirectorPipelineMock.mockResolvedValue(DIRECTOR_RESULT);
+  });
+
+  it("calls runDirectorPipeline instead of planTimeline, and persists story + v2 qualityScores + cost onto the saved plan", async () => {
+    aiEditJobFindUniqueMock.mockResolvedValue({ ...BASE_JOB, selectedModules: null });
+
+    await processAiEditJob("job_1");
+
+    expect(runDirectorPipelineMock).toHaveBeenCalledTimes(1);
+    expect(planTimelineMock).not.toHaveBeenCalled();
+
+    const savedPlan = aiEditJobUpdateMock.mock.calls[0][0].data.timelinePlan;
+    expect(savedPlan.captions[0].text).toBe("director caption");
+    expect(savedPlan.story.hookText).toBe("director hook");
+    expect(savedPlan.qualityScores.overallScore).toBe(92);
+    expect(savedPlan.qualityScores.thresholdMet).toBe(true);
+    expect(savedPlan.cost.reasoningUsd).toBeCloseTo(0.2);
+    // The job still reaches READY_FOR_REVIEW on the Director path.
+    expect(aiEditJobUpdateMock).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "READY_FOR_REVIEW" }) }));
+  });
+
+  it("a Director pipeline failure is non-fatal — job continues with sceneRemoval-only, planningError surfaced", async () => {
+    aiEditJobFindUniqueMock.mockResolvedValue({ ...BASE_JOB, selectedModules: null });
+    runDirectorPipelineMock.mockRejectedValue(new Error("director pipeline blew up"));
+
+    await processAiEditJob("job_1");
+
+    expect(aiEditJobUpdateMock).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "READY_FOR_REVIEW" }) }));
+    const savedPlan = aiEditJobUpdateMock.mock.calls[0][0].data.timelinePlan;
+    expect(savedPlan.captions).toEqual([]);
   });
 });

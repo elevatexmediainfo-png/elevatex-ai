@@ -19,6 +19,7 @@ import { InvalidStateError } from "./errors";
 import { getOwnedProject } from "./projects";
 import { mergeSceneRemovalCandidates, proposeSceneRemovals } from "./ai-scene-removal-proposer";
 import { scoreAiTimelinePlan, AI_EDIT_QUALITY_RETRY_THRESHOLD } from "./ai-edit-quality-scoring";
+import { runDirectorPipeline } from "./director/orchestrator";
 import {
   aiTimelinePlanSchema,
   AI_TIMELINE_SCHEMA_VERSION,
@@ -27,6 +28,7 @@ import {
   type AICaption,
   type AIIntake,
   type AISceneRemoval,
+  type AIStoryPlan,
   type AITimelinePlan,
   type AITransitionPlan,
   type AIZoom,
@@ -34,6 +36,7 @@ import {
   type AISfx,
   type AISticker,
   type AICostSummary,
+  type AiQualityScoresV2,
 } from "@/lib/validations/ai-timeline";
 import { AI_EDIT_MODULES, type AiEditModule } from "@/lib/validations/video-editor";
 
@@ -415,6 +418,15 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     // given stock resolution's real success rate, not the final, more
     // precise number computed after RESOLVING_ASSETS below.
     let attemptScores: ReturnType<typeof scoreAiTimelinePlan> | null = null;
+    // AI Video Director (2026-08-07) — only populated when
+    // AI_EDIT_DIRECTOR_PIPELINE_ENABLED is on; the legacy path (below)
+    // never touches these. `story` is additive-optional on AITimelinePlan;
+    // `directorScores` is the v2 10-category rubric, kept separate from
+    // `attemptScores` (the legacy 4-dimension shape) since the two scoring
+    // systems aren't interchangeable — see ai-edit-quality-scoring.ts's
+    // own flagged comment for why.
+    let story: AIStoryPlan | undefined;
+    let directorScores: AiQualityScoresV2 | null = null;
     // Founder request (2026-07-30) — module selection. captions/zoom/broll/
     // stickers/music/sfx/transitions all come back from this ONE planTimeline()
     // call — there's no way to ask GPT for a subset, so the call itself only
@@ -422,6 +434,62 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     // of its 7 output sections weren't selected are discarded immediately
     // below, before they ever reach asset resolution or the assembled plan.
     if (TIMELINE_PLANNING_MODULES.some(wantsModule)) {
+      // AI Video Director (2026-08-07) — feature flag, default OFF. While
+      // off, everything below this branch is the ORIGINAL single-call
+      // planTimeline() path, kept byte-identical (see the "else" branch —
+      // nothing in it was touched). While on, the multi-agent Director
+      // pipeline (director/orchestrator.ts) replaces it entirely: separate
+      // Story/Captions/Visuals/Audio/Quality-Reviewer reasoning calls with
+      // its own iterative, targeted quality-review loop. See
+      // AI_EDIT_DIRECTOR_PIPELINE_ENABLED's own admin-config doc comment
+      // for the real cost tradeoff (5-15x today's reasoning spend per job)
+      // — this must stay a deliberate opt-in until that's been priced.
+      const directorPipelineEnabled = await getConfig("AI_EDIT_DIRECTOR_PIPELINE_ENABLED");
+      if (directorPipelineEnabled) {
+        const jobUserId = job.userId;
+        const jobBrollDensity = job.brollDensity as "MINIMAL" | "BALANCED" | "HEAVY" | undefined;
+        const repairMaxAttemptsForDirector = await getConfig("AI_EDIT_REASONING_REPAIR_MAX_ATTEMPTS");
+
+        try {
+          const result = await runDirectorPipeline({
+            videoAnalysis: videoAnalysis
+              ? { emphasisMoments: videoAnalysis.emphasisMoments, emotionBeats: videoAnalysis.emotionBeats, visualContext: videoAnalysis.visualContext }
+              : null,
+            speech: { words: transcript.words, sceneRemoval, survivingSegmentCount, sourceDurationMs },
+            jobMeta: {
+              userId: jobUserId,
+              stylePreset: job.stylePreset ?? undefined,
+              brollDensity: jobBrollDensity,
+              brollStockOnly: job.brollStockOnly,
+              referenceScript: job.script ?? undefined,
+              repairMaxAttempts: repairMaxAttemptsForDirector,
+            },
+            wantsModule,
+          });
+
+          captions = result.captions;
+          zoom = result.zoom.map((z) => ({ ...z, clipId: AI_ZOOM_SOURCE_CLIP_PLACEHOLDER }));
+          brollProposals = result.broll;
+          stickers = result.stickers;
+          music = result.music;
+          sfx = result.sfx;
+          transitions = result.transitions;
+          reasoningCostUsd = result.reasoningCostUsd;
+          story = result.story;
+          directorScores = result.scores;
+          if (result.warnings.length > 0) {
+            planningError = `Some items in the AI Director's plan were invalid and were skipped, everything else still applied: ${result.warnings.join(" ")}`;
+            logger.warn({ jobId, warnings: result.warnings }, "[ai edit job] director pipeline timeline planning partially degraded — some items dropped, continuing with the rest");
+          }
+          logger.info(
+            { jobId, overallScore: directorScores.overallScore, thresholdMet: directorScores.thresholdMet, iterations: directorScores.iterations },
+            "[ai edit job] director pipeline planning complete"
+          );
+        } catch (err) {
+          planningError = err instanceof Error ? err.message : "AI Video Director timeline planning failed.";
+          logger.error({ err, jobId }, "[ai edit job] director pipeline planning failed — continuing with sceneRemoval only");
+        }
+      } else {
       const repairMaxAttempts = await getConfig("AI_EDIT_REASONING_REPAIR_MAX_ATTEMPTS");
       const planRequest: ReasoningPlanRequest = {
         words: transcript.words,
@@ -538,6 +606,7 @@ export async function processAiEditJob(jobId: string): Promise<void> {
         planningError = err instanceof Error ? err.message : "Timeline planning (captions/zoom/broll/stickers/music/sfx/transitions) failed.";
         logger.error({ err, jobId }, "[ai edit job] timeline planning failed — continuing with sceneRemoval only");
       }
+      }
     }
 
     // Phase 12 Module 5/6 — resolve every proposed asset-needing slot
@@ -616,8 +685,15 @@ export async function processAiEditJob(jobId: string): Promise<void> {
       // TASK 12 — computed pre-resolution (see attemptPlanning above),
       // absent when the reasoning call never ran at all (e.g. no TIMELINE_
       // PLANNING_MODULES selected) — same "absent means not computed,
-      // never a fabricated retrofit" convention as `cost`.
-      qualityScores: attemptScores ?? undefined,
+      // never a fabricated retrofit" convention as `cost`. `directorScores`
+      // (v2, 10-category) takes priority when the Director pipeline ran;
+      // `attemptScores` (v1, 4-dimension) is the legacy path's own shape —
+      // the two are mutually exclusive per job (only one branch above ever
+      // runs), never both populated at once.
+      qualityScores: directorScores ?? attemptScores ?? undefined,
+      // AI Video Director (2026-08-07) — absent when produced by the
+      // legacy single-call planner or on any plan predating this field.
+      story,
     };
     // Defense in depth: every piece (sceneRemoval/captions/zoom) was
     // already validated at its own source (mergeSceneRemovalCandidates'
