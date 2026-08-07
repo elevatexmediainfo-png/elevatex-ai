@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { GenerationProvider } from "@/lib/generation/types";
 import {
   aiBrollSchema,
+  aiCaptionHighlightWordSchema,
   aiCaptionRevealSchema,
   aiCaptionStyleSchema,
   aiMusicSchema,
@@ -130,6 +131,9 @@ export const reasoningCaptionRawSchema = z
     sourceWordEndIndex: z.number().int().min(0),
     style: aiCaptionStyleSchema.optional(),
     reveal: aiCaptionRevealSchema.optional(),
+    // Power-word highlighting (2026-08-07) — see aiCaptionHighlightWordSchema's
+    // own doc comment (validations/ai-timeline.ts).
+    highlightWords: z.array(aiCaptionHighlightWordSchema).max(4).optional(),
   })
   .refine((v) => v.sourceWordEndIndex >= v.sourceWordStartIndex, {
     message: "sourceWordEndIndex must be >= sourceWordStartIndex",
