@@ -881,6 +881,21 @@ describe("GPT5ReasoningProvider — Director agents", () => {
     expect(userMessage).toContain("2-4 DIFFERENT colors");
   });
 
+  // Polish pass (2026-08-07, "never cover faces") — a real gap: the
+  // model could previously choose "center" for a caption's position with
+  // no guidance at all, landing directly on a talking head's face.
+  it("planCaptions prompt: NEVER COVER THE FACE — defaults to bottom, forbids center, names the reference editors", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(JSON.stringify({ captions: [] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.planCaptions({ words, storyBeats: [] });
+    const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
+    expect(userMessage).toContain("NEVER COVER THE FACE");
+    expect(userMessage).toContain('Default "style.position" to "bottom"');
+    expect(userMessage).toContain('NEVER set "position":"center"');
+    expect(userMessage).toContain("Alex Hormozi, Ali Abdaal, Iman Gadzhi, and MrBeast");
+  });
+
   it("planVisuals: returns zoom/broll/stickers/transitions and prompts no-dead-screen + visual variety", async () => {
     const json = JSON.stringify({
       zoom: [{ startMs: 0, endMs: 500, scaleFrom: 100, scaleTo: 112, reason: "question" }],
@@ -926,6 +941,25 @@ describe("GPT5ReasoningProvider — Director agents", () => {
     }
   });
 
+  // Polish pass (2026-08-07, "never insert B-roll simply because a
+  // keyword matched — only if it increases understanding, emotion or
+  // retention" + "avoid repeated B-roll duration / transition rhythm").
+  it("planVisuals prompt: EDITORIAL VALUE GATE rejects keyword-only b-roll, and explicitly asks for varied durations", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(chatResponse(JSON.stringify({ zoom: [], broll: [], stickers: [], transitions: [] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+    await provider.planVisuals({ words, videoAnalysis: null, captions: [], storyBeats: [], sourceDurationMs: 5000, survivingSegmentCount: 2 });
+    const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
+
+    expect(userMessage).toContain("EDITORIAL VALUE GATE");
+    expect(userMessage).toContain("increase understanding");
+    expect(userMessage).toContain("retention");
+    expect(userMessage).toContain("NOTHING SHOULD FEEL ALGORITHMIC");
+    expect(userMessage).toContain("never the same duration slot after slot");
+    expect(userMessage).toContain("vary the TYPE across the video");
+    expect(userMessage).toContain("1.5-2 seconds");
+  });
+
   it("planAudio: returns music/sfx and prompts SFX invisibility + anti-spam", async () => {
     const json = JSON.stringify({ music: { searchQuery: "calm ambient piano" }, sfx: [{ assetQuery: "whoosh", atMs: 1000 }] });
     const fetchMock = vi.fn().mockResolvedValue(chatResponse(json));
@@ -955,7 +989,10 @@ describe("GPT5ReasoningProvider — Director agents", () => {
     expect(userMessage).toContain("an emoji/icon-style sticker appearing");
     expect(userMessage).toContain("a caption's punchy pop-in entrance");
     expect(userMessage).toContain("a genuine reveal/surprise moment");
-    expect(userMessage).toContain("automatically EVOLVE across the video's own story arc");
+    expect(userMessage).toContain("building, pausing at a pattern interrupt, rising again into the payoff");
+    expect(userMessage).toContain("NEVER a flat, unchanging level");
+    expect(userMessage).toContain("use VERY sparingly");
+    expect(userMessage).toContain("silence is often stronger than sound");
   });
 
   it("reviewQuality: returns the 3 LLM-judged scores + weakCategories, asks the client-would-I-ship-this question", async () => {
@@ -979,7 +1016,7 @@ describe("GPT5ReasoningProvider — Director agents", () => {
     expect(result.storyScore).toBe(65);
     expect(result.weakCategories).toEqual(["editingRhythm"]);
     const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
-    expect(userMessage).toContain("would I deliver this");
-    expect(userMessage).toContain("senior editor");
+    expect(userMessage).toContain("approve this for publishing");
+    expect(userMessage).toContain("Lead Editor");
   });
 });

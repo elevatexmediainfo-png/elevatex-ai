@@ -135,6 +135,27 @@ function relevanceScore(query: string, title: string): number {
 // PRE-materialization — resolvedAssetId is a NEW EditorAsset minted per
 // materialize call, even for the identical source clip, so it can't be
 // used to detect a repeat).
+// Polish pass (2026-08-07, "reject low-quality stock footage") — a soft
+// penalty, not a hard filter: a candidate whose SMALLER dimension falls
+// below a real-HD bar loses to an otherwise-similar higher-resolution
+// candidate, but a low-res result is still better than leaving a b-roll
+// slot completely empty (this codebase's own established "never leave a
+// slot empty over a soft quality concern" principle — see FIX 4's own
+// doc comment just below for the identical reasoning applied to
+// relevance). Scaled to roughly the same magnitude as kindBonus (50) so
+// a genuinely more-relevant low-res result can still beat an irrelevant
+// high-res one — relevance stays dominant, resolution is a real but
+// secondary signal, exactly like the portrait bonus already is.
+const MIN_QUALITY_DIMENSION_PX = 720;
+const MAX_QUALITY_PENALTY = 40;
+
+function qualityPenalty(widthPx: number | undefined, heightPx: number | undefined): number {
+  if (!widthPx || !heightPx) return 0; // unknown dimensions — never penalize what we can't measure
+  const smaller = Math.min(widthPx, heightPx);
+  if (smaller >= MIN_QUALITY_DIMENSION_PX) return 0;
+  return -MAX_QUALITY_PENALTY * (1 - smaller / MIN_QUALITY_DIMENSION_PX);
+}
+
 export function pickBestStockResult(
   outcomes: StockSearchProviderOutcome[],
   preferredKind: StockSearchResult["kind"],
@@ -149,7 +170,8 @@ export function pickBestStockResult(
       const relevance = relevanceScore(query, result.title);
       const kindBonus = result.kind === preferredKind ? 50 : 0;
       const portraitBonus = options.preferPortrait && result.widthPx && result.heightPx && result.heightPx > result.widthPx ? 10 : 0;
-      candidates.push({ providerId: outcome.providerId, result, score: relevance * 1000 + kindBonus + portraitBonus - index, relevanceScore: relevance });
+      const resolutionPenalty = qualityPenalty(result.widthPx, result.heightPx);
+      candidates.push({ providerId: outcome.providerId, result, score: relevance * 1000 + kindBonus + portraitBonus + resolutionPenalty - index, relevanceScore: relevance });
     });
   }
   if (candidates.length === 0) return null;

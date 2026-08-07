@@ -1059,9 +1059,14 @@ export const CONFIG_REGISTRY = {
     description: "Feature flag for the multi-agent AI Video Director pipeline (separate Story/Hook/Retention, Captions, Visuals, Audio, and Quality Reviewer reasoning calls, with an iterative self-review loop targeting AI_EDIT_QUALITY_TARGET_SCORE). While OFF, AI Auto-Edit uses the original single combined planTimeline() call unchanged — zero behavior change. Default OFF deliberately: the Director pipeline realistically costs 5x today's GPT-5 reasoning spend per job with zero retries, and up to ~11-15x in the worst case (bounded by AI_EDIT_DIRECTOR_MAX_QUALITY_ITERATIONS). Do not enable in production before a deliberate pricing review of the AI Auto-Edit credit cost — the existing per-call cost logging/credit-charging mechanism is correct and needs no code change, but the real dollar cost per job will be materially higher.",
     category: "video_editor_policy",
   },
+  // Polish pass (2026-08-07, "improve every second... if nothing is
+  // visually happening for more than 1.5-2 seconds, introduce the best
+  // possible visual treatment") — tightened from 2000 to 1750 (the
+  // midpoint of that exact 1.5-2s window) for genuinely tighter,
+  // "micro-edited" pacing.
   AI_EDIT_NO_DEAD_SCREEN_GAP_THRESHOLD_MS: {
     schema: z.number().int().min(500).max(10_000),
-    default: 2000,
+    default: 1750,
     label: "No-dead-screen gap threshold (ms)",
     description: "A talking-head stretch with no caption/b-roll/zoom/sticker/motion-graphic visual treatment longer than this is flagged as a dead-screen violation by the Director pipeline's deterministic gap detector (visual-coverage.ts) and auto-fixed with the cheapest fitting insert. Phase 1 fixes are limited to the 5 visual types that already render (b-roll, zoom/camera-punch, sticker, animated caption, motion-graphic-as-asset) — picture-in-picture/split-screen/blur-background/progress-bar/callout/face-punch/screen-recording are a deferred future phase needing new renderer support.",
     category: "video_editor_policy",

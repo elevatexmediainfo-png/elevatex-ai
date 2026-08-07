@@ -162,4 +162,52 @@ describe("applyNoDeadScreenFixes", () => {
     expect(result.zoom).toHaveLength(1);
     expect(result.zoom[0].style).toBe("micro");
   });
+
+  // Polish pass (2026-08-07, "avoid fixed spacing... nothing should feel
+  // algorithmic") — real bug: every auto-fixed zoom used to land on the
+  // IDENTICAL scaleTo (112) and every auto-fixed sticker used the
+  // IDENTICAL 2000ms duration, a genuinely detectable "AI-generated" tell.
+  it("varies the auto-fixed zoom's scaleTo across different gaps, never a fixed constant", () => {
+    // Many small (<2500ms) gaps, widely spread, so several land on "zoom"
+    // despite the alternation window forcing kind-switching in between.
+    const gaps = Array.from({ length: 12 }, (_, i) => ({ startMs: i * 20_000, endMs: i * 20_000 + 2200, durationMs: 2200 }));
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger());
+    expect(result.zoom.length).toBeGreaterThan(1);
+
+    const scaleTos = result.zoom.map((z) => z.scaleTo);
+    expect(new Set(scaleTos).size).toBeGreaterThan(1); // genuinely different across gaps
+    for (const s of scaleTos) {
+      expect(s).toBeGreaterThanOrEqual(106);
+      expect(s).toBeLessThanOrEqual(114);
+    }
+  });
+
+  it("the SAME gap always produces the SAME scaleTo — deterministic, not truly random", () => {
+    const gap = { startMs: 42_000, endMs: 44_200, durationMs: 2200 };
+    const a = applyNoDeadScreenFixes([gap], [], createEmptyVarietyLedger());
+    const b = applyNoDeadScreenFixes([gap], [], createEmptyVarietyLedger());
+    expect(a.zoom[0].scaleTo).toBe(b.zoom[0].scaleTo);
+  });
+
+  it("varies the auto-fixed sticker's duration across different gaps, and never exceeds the gap's own size", () => {
+    // Many gaps, spread widely, so at least several land on "sticker"
+    // despite the alternation window forcing kind-switching.
+    const gaps = Array.from({ length: 12 }, (_, i) => ({ startMs: i * 20_000, endMs: i * 20_000 + 2100, durationMs: 2100 }));
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger());
+    expect(result.stickers.length).toBeGreaterThan(1);
+
+    const durations = result.stickers.map((s) => s.endMs - s.startMs);
+    expect(new Set(durations).size).toBeGreaterThan(1); // genuinely varies
+    for (const d of durations) {
+      expect(d).toBeLessThanOrEqual(2100); // never exceeds its own gap
+      expect(d).toBeGreaterThanOrEqual(1200);
+    }
+  });
+
+  it("never lets an auto-fixed sticker's duration exceed a genuinely SMALL gap", () => {
+    const result = applyNoDeadScreenFixes([{ startMs: 0, endMs: 1600, durationMs: 1600 }], [], createEmptyVarietyLedger());
+    if (result.stickers.length > 0) {
+      expect(result.stickers[0].endMs - result.stickers[0].startMs).toBeLessThanOrEqual(1600);
+    }
+  });
 });

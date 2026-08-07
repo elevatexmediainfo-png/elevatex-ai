@@ -142,6 +142,41 @@ describe("pickBestStockResult", () => {
     const picked = pickBestStockResult(outcomes, "VIDEO", "automatic water pump");
     expect(picked?.result.externalId).toBe("first");
   });
+
+  // Polish pass (2026-08-07, "reject low-quality stock footage").
+  it("prefers an equally-relevant HIGHER-resolution result over a low-resolution one", () => {
+    const outcomes: StockSearchProviderOutcome[] = [
+      {
+        providerId: "pexels",
+        results: [
+          stockResult({ externalId: "lowres", kind: "VIDEO", title: "office team meeting", widthPx: 320, heightPx: 180 }),
+          stockResult({ externalId: "hires", kind: "VIDEO", title: "office team meeting", widthPx: 1920, heightPx: 1080 }),
+        ],
+      },
+    ];
+    const picked = pickBestStockResult(outcomes, "VIDEO", "office team meeting");
+    expect(picked?.result.externalId).toBe("hires");
+  });
+
+  it("does NOT penalize resolution when dimensions are simply unknown (never punishes what can't be measured)", () => {
+    const outcomes: StockSearchProviderOutcome[] = [{ providerId: "pexels", results: [stockResult({ externalId: "unknown-dims", kind: "VIDEO", title: "office team meeting" })] }];
+    const picked = pickBestStockResult(outcomes, "VIDEO", "office team meeting");
+    expect(picked?.result.externalId).toBe("unknown-dims"); // still resolves, no crash/false-rejection
+  });
+
+  it("still picks a low-resolution result over an IRRELEVANT high-resolution one — relevance stays dominant", () => {
+    const outcomes: StockSearchProviderOutcome[] = [
+      {
+        providerId: "pexels",
+        results: [
+          stockResult({ externalId: "lowres-relevant", kind: "VIDEO", title: "doctor patient consultation", widthPx: 320, heightPx: 180 }),
+          stockResult({ externalId: "hires-irrelevant", kind: "VIDEO", title: "unrelated__scene__content", widthPx: 1920, heightPx: 1080 }),
+        ],
+      },
+    ];
+    const picked = pickBestStockResult(outcomes, "VIDEO", "doctor patient consultation");
+    expect(picked?.result.externalId).toBe("lowres-relevant");
+  });
 });
 
 // stockOnly: false — these tests exercise the pre-existing, GPT-judgment-

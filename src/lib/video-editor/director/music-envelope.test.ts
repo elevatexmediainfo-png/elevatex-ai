@@ -49,4 +49,35 @@ describe("buildMusicVolumeEnvelope", () => {
     const envelope = buildMusicVolumeEnvelope(beats, 10_000);
     expect(envelope[0].atFraction).toBe(0); // hook (earliest) sorted first
   });
+
+  // Polish pass (2026-08-07, "build, release, pause, rise again — never
+  // remain flat") — the real dynamic contour, not a monotonic staircase.
+  it("pattern_interrupt is a genuine PAUSE (a real drop), not a continued climb", () => {
+    const beats = [beat("value", 0, 3000), beat("pattern_interrupt", 3000, 4000), beat("visual_reward", 4000, 6000)];
+    const envelope = buildMusicVolumeEnvelope(beats, 6000);
+    const [valueLevel, interruptLevel, rewardLevel] = envelope.map((p) => p.volumeLevel);
+    expect(interruptLevel).toBeLessThan(valueLevel); // a real drop, not a plateau or climb
+    expect(rewardLevel).toBeGreaterThan(interruptLevel); // rises back out of the pause
+  });
+
+  it("proof settles back down (a release) rather than staying at the pre-proof energy", () => {
+    const beats = [beat("visual_reward", 0, 3000), beat("proof", 3000, 5000)];
+    const envelope = buildMusicVolumeEnvelope(beats, 5000);
+    expect(envelope[1].volumeLevel).toBeLessThan(envelope[0].volumeLevel);
+  });
+
+  it("never remains flat across several repeated beats of the SAME kind", () => {
+    const beats = [beat("value", 0, 2000), beat("value", 2000, 4000), beat("value", 4000, 6000), beat("value", 6000, 8000)];
+    const envelope = buildMusicVolumeEnvelope(beats, 8000);
+    const levels = envelope.slice(0, 4).map((p) => p.volumeLevel);
+    // Not every consecutive pair is identical — genuine movement within the run.
+    const hasMovement = levels.some((level, i) => i > 0 && level !== levels[i - 1]);
+    expect(hasMovement).toBe(true);
+    // But it never contradicts the "value" beat's own character by spiking
+    // to something reading as a different beat kind entirely.
+    for (const level of levels) {
+      expect(level).toBeGreaterThanOrEqual(50);
+      expect(level).toBeLessThanOrEqual(70);
+    }
+  });
 });
