@@ -763,20 +763,37 @@ function translateMusic(
     duckingVoiceTrackIds: voiceTrackIds,
   };
   // TASK 7 (2026-08-07, "music should evolve") — music.volumeEnvelope's
-  // fractional (atFraction, volumeLevel) points (director/music-envelope.ts)
-  // become real volume keyframes on the clip itself, same Keyframeable<number>
-  // mechanism translateZoom already uses for ClipTransform.scale — just on
-  // ClipContent.volume instead. atFraction * project.durationMs converts
-  // proportional position into this clip's own clip-relative ms (the clip
-  // always starts at 0 and spans the whole project, so clip-relative and
-  // timeline-absolute are the same value here). Absent/empty envelope
-  // (legacy plans, or a Director run with no story beats) means no
-  // "volume" key at all — the clip falls back to its own default (100%,
-  // unchanging), today's pre-existing behavior, unchanged.
+  // fractional (atFraction, volumeLevel) points (director/music-envelope.ts,
+  // and — 2026-08-07 quality-calibration pass — now also proposed directly
+  // by the legacy single-call prompt) become real volume keyframes on the
+  // clip itself, same Keyframeable<number> mechanism translateZoom already
+  // uses for ClipTransform.scale — just on ClipContent.volume instead.
+  // atFraction * project.durationMs converts proportional position into
+  // this clip's own clip-relative ms (the clip always starts at 0 and
+  // spans the whole project, so clip-relative and timeline-absolute are
+  // the same value here). Absent/empty envelope means no "volume" key at
+  // all — the clip falls back to its own default (100%, unchanging),
+  // today's pre-existing behavior, unchanged.
+  //
+  // Real bug found + fixed via live pipeline verification (2026-08-07) —
+  // aiMusicVolumePointSchema.volumeLevel is 0-100 (a percentage, 100 =
+  // normal volume — the scale every AI-facing prompt/schema for this
+  // field uses), but ClipContent.volume's real stored range is 0-2 (see
+  // lib/video-editor/audio.ts: "100 = unity gain in the UI's 0-200%
+  // slider; stored 0..2 here"). This line used to pass volumeLevel
+  // straight through with NO conversion — every keyframe value (60, 40,
+  // 70, 80...) was 30-40x out of the field's real [0,2] range, so the
+  // server-side Zod validation on the addClip request rejected EVERY
+  // music apply outright the moment volumeEnvelope was ever non-empty.
+  // This was latent since Task B/C first introduced volumeEnvelope (the
+  // Director pipeline's own deterministic builder produces the exact same
+  // 0-100 scale) but never live-verified end-to-end — a real live run was
+  // what finally caught it. /100 converts the percentage scale to the
+  // real stored unity-gain scale.
   const volumeKeyframes = (music.volumeEnvelope ?? []).map((point, i) => ({
     id: `ai-music-volume-${i}`,
     timeMs: Math.round(point.atFraction * project.durationMs),
-    value: point.volumeLevel,
+    value: point.volumeLevel / 100,
     easing: DEFAULT_KEYFRAME_EASING,
   }));
   const clipInput: Omit<AddClipPatch, "trackId"> = {

@@ -5,21 +5,31 @@ import type { ReasoningPlanRequest, ReasoningReeditRequest } from "./types";
 
 // TASK 1 (2026-08-07 — "heavy density should visually change the video
 // every few seconds").
+//
+// Short-form floor (2026-08-07, live human-editor review calibration) —
+// a real 38.4s run at MEDIUM density produced only 2 b-roll slots,
+// undershooting the founder's own explicit "30-40s -> 4-7 meaningful
+// b-rolls" target: the pure per-minute rate rounds a short video down
+// hard. shortFormFloor* below only ever RAISES the range for videos under
+// ~1 minute — the assertions below for 60s videos changed accordingly
+// (60s is short enough for the floor to still apply); the 180s/HEAVY
+// case is unchanged since the pure per-minute math already exceeds the
+// floor there, proving longer-video behavior is untouched.
 describe("computeBrollTargetRange", () => {
-  it("scales HEAVY (6-12/min) proportionally for a 60s video", () => {
+  it("HEAVY at 60s hits the short-form floor (5-9), same as the pure per-minute rate here", () => {
     expect(computeBrollTargetRange(60_000, "HEAVY")).toEqual({ min: 6, max: 12 });
   });
 
-  it("scales HEAVY proportionally for a 30s video, not the full per-minute rate", () => {
-    expect(computeBrollTargetRange(30_000, "HEAVY")).toEqual({ min: 3, max: 6 });
+  it("HEAVY at 30s is raised to the short-form floor (5-9), not the unfloored 3-6 a pure per-minute rate would give", () => {
+    expect(computeBrollTargetRange(30_000, "HEAVY")).toEqual({ min: 5, max: 9 });
   });
 
-  it("scales MEDIUM (BALANCED, 3-6/min) proportionally for a 60s video", () => {
-    expect(computeBrollTargetRange(60_000, "BALANCED")).toEqual({ min: 3, max: 6 });
+  it("MEDIUM (BALANCED) at 60s is raised to the short-form floor (4-7), matching the '30-40s -> 4-7' target", () => {
+    expect(computeBrollTargetRange(60_000, "BALANCED")).toEqual({ min: 4, max: 7 });
   });
 
-  it("scales LIGHT (MINIMAL, 1-3/min) proportionally for a 60s video", () => {
-    expect(computeBrollTargetRange(60_000, "MINIMAL")).toEqual({ min: 1, max: 3 });
+  it("MINIMAL at 60s is raised to the short-form floor (2-4)", () => {
+    expect(computeBrollTargetRange(60_000, "MINIMAL")).toEqual({ min: 2, max: 4 });
   });
 
   it("never returns a range below 1-1, even for a very short video", () => {
@@ -28,12 +38,18 @@ describe("computeBrollTargetRange", () => {
     expect(max).toBeGreaterThanOrEqual(min);
   });
 
-  it("defaults to the MEDIUM/BALANCED rate when density is undefined", () => {
-    expect(computeBrollTargetRange(60_000, undefined)).toEqual({ min: 3, max: 6 });
+  it("defaults to the MEDIUM/BALANCED rate (and its short-form floor) when density is undefined", () => {
+    expect(computeBrollTargetRange(60_000, undefined)).toEqual({ min: 4, max: 7 });
   });
 
-  it("scales up for a longer, multi-minute video", () => {
+  it("scales up for a longer, multi-minute video — the short-form floor has NO effect once the video is long enough for the pure per-minute rate to exceed it", () => {
     expect(computeBrollTargetRange(180_000, "HEAVY")).toEqual({ min: 18, max: 36 });
+  });
+
+  it("hits the founder's own explicit target for a 30-40s talking head at MEDIUM density: 4-7 b-rolls", () => {
+    expect(computeBrollTargetRange(30_000, "BALANCED")).toEqual({ min: 4, max: 7 });
+    expect(computeBrollTargetRange(38_400, "BALANCED")).toEqual({ min: 4, max: 7 });
+    expect(computeBrollTargetRange(40_000, "BALANCED")).toEqual({ min: 4, max: 7 });
   });
 });
 

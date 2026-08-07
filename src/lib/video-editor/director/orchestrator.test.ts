@@ -56,7 +56,25 @@ const STORY_RESULT = {
   costUsd: 0.01,
 };
 const CAPTIONS_RESULT = { captions: [{ text: "hi there", startMs: 0, endMs: 20_000 }], costUsd: 0.01 };
-const VISUALS_RESULT = { zoom: [], broll: [{ startMs: 0, endMs: 4000, trackHint: "broll", source: "stock", searchQuery: "x" }], stickers: [], transitions: [], costUsd: 0.01 };
+// 4 items (not 1) — computeBrollTargetRange's short-form floor
+// (2026-08-07 quality-calibration pass, gpt5.provider.ts) now targets
+// 4-7 b-roll slots for a 20s video at the default density, up from the
+// old unfloored 1-2; keeping this fixture at just 1 item would score
+// deterministic broll as "weak" and trigger an unwanted extra retry
+// round in the "no retry needed" tests below, which aren't testing
+// broll-density calibration at all — just the orchestration control flow.
+const VISUALS_RESULT = {
+  zoom: [],
+  broll: [
+    { startMs: 0, endMs: 4000, trackHint: "broll", source: "stock", searchQuery: "x" },
+    { startMs: 5000, endMs: 8000, trackHint: "broll", source: "stock", searchQuery: "x" },
+    { startMs: 10000, endMs: 13000, trackHint: "broll", source: "stock", searchQuery: "x" },
+    { startMs: 15000, endMs: 18000, trackHint: "broll", source: "stock", searchQuery: "x" },
+  ],
+  stickers: [],
+  transitions: [],
+  costUsd: 0.01,
+};
 const AUDIO_RESULT = { sfx: [], costUsd: 0.01 };
 
 function reviewResult(overallLikeScores: Partial<{ hookScore: number; retentionScore: number; storyScore: number; weakCategories: string[] }>) {

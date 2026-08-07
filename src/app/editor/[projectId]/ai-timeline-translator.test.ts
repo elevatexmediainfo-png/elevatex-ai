@@ -913,7 +913,17 @@ describe("translateAITimelinePlan", () => {
 
   // TASK 7 (2026-08-07, "music should evolve") — volumeEnvelope's
   // fractional points become real content.volume keyframes on the clip.
-  it("music with a volumeEnvelope gets real content.volume keyframes, mapped from fraction to real ms", async () => {
+  //
+  // Real bug found + fixed via live pipeline verification (2026-08-07) —
+  // aiMusicVolumePointSchema.volumeLevel is 0-100 (a percentage) but
+  // ClipContent.volume's real stored range is 0-2 (100% = 1.0 — see
+  // lib/video-editor/audio.ts). This test used to assert the RAW,
+  // unconverted percentage value (40/65/85) landed directly as `value` —
+  // that was asserting the BUG, not the contract: a real addClip call
+  // with content.volume.value=85 gets rejected outright by the server's
+  // own `z.number().min(0).max(2)` validation. Fixed to assert the real
+  // /100-converted values (0.4/0.65/0.85) translateMusic now produces.
+  it("music with a volumeEnvelope gets real content.volume keyframes, mapped from fraction to real ms AND from 0-100 percentage to the real 0-2 stored scale", async () => {
     const project = baseProject({ tracks: [], durationMs: 20_000 });
     const plan = emptyPlan({
       music: {
@@ -934,11 +944,11 @@ describe("translateAITimelinePlan", () => {
       expect.objectContaining({
         content: {
           volume: {
-            value: 40,
+            value: 0.4,
             keyframes: [
-              expect.objectContaining({ timeMs: 0, value: 40 }),
-              expect.objectContaining({ timeMs: 10_000, value: 65 }),
-              expect.objectContaining({ timeMs: 18_000, value: 85 }),
+              expect.objectContaining({ timeMs: 0, value: 0.4 }),
+              expect.objectContaining({ timeMs: 10_000, value: 0.65 }),
+              expect.objectContaining({ timeMs: 18_000, value: 0.85 }),
             ],
           },
         },

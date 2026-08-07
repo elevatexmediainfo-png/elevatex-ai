@@ -21,20 +21,25 @@ function words(text: string, msPerWord = 400, gapMs = 0) {
 
 describe("scenario: Talking Head (short, ~30s, single speaker, HEAVY density Reel)", () => {
   it("produces a real, non-trivial b-roll target and a well-formed 30s plan scores well", () => {
+    // Short-form floor (2026-08-07 quality-calibration pass) — a 30s HEAVY
+    // video now targets 5-9 (was the unfloored 3-6), part of the same fix
+    // that raised MEDIUM's short-form floor to hit the founder's own
+    // "30-40s -> 4-7 b-rolls" target — see computeBrollTargetRange's own
+    // doc comment (gpt5.provider.ts).
     const range = computeBrollTargetRange(30_000, "HEAVY");
-    expect(range).toEqual({ min: 3, max: 6 });
+    expect(range).toEqual({ min: 5, max: 9 });
 
     const captions: AICaption[] = [
       { text: "STOP scrolling", startMs: 0, endMs: 2000, highlightWords: [{ word: "STOP", color: "#FF3B30" }] },
       { text: "This one habit changed everything", startMs: 2000, endMs: 6000 },
       { text: "Follow For More", startMs: 27000, endMs: 30000 },
     ];
-    const broll: AIBroll[] = Array.from({ length: 4 }, (_, i) => ({ startMs: i * 7000, endMs: i * 7000 + 1500, trackHint: "broll", source: "stock", resolvedAssetId: `a${i}` }));
+    const broll: AIBroll[] = Array.from({ length: 6 }, (_, i) => ({ startMs: i * 5000, endMs: i * 5000 + 1500, trackHint: "broll", source: "stock", resolvedAssetId: `a${i}` }));
     const scores = scoreAiTimelinePlan(
       { sceneRemoval: [{ startMs: 6000, endMs: 6900, reason: "silence" }], captions, zoom: [], broll, stickers: [] },
       { sourceDurationMs: 30_000, brollDensity: "HEAVY", captionsInScope: true, visualInScope: true, pacingInScope: true }
     );
-    expect(scores.visualScore).toBeGreaterThanOrEqual(80); // 4 clips inside the [3,6] target
+    expect(scores.visualScore).toBeGreaterThanOrEqual(80); // 6 clips inside the [5,9] target
   });
 });
 

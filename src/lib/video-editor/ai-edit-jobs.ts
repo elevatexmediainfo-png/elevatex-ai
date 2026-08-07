@@ -20,6 +20,8 @@ import { getOwnedProject } from "./projects";
 import { mergeSceneRemovalCandidates, proposeSceneRemovals } from "./ai-scene-removal-proposer";
 import { scoreAiTimelinePlan, AI_EDIT_QUALITY_RETRY_THRESHOLD } from "./ai-edit-quality-scoring";
 import { runDirectorPipeline } from "./director/orchestrator";
+import { applyNoDeadScreenFixes, computeSourceSurvivingWindows, computeVisualCoverage, findDeadScreenGaps } from "./director/visual-coverage";
+import { createEmptyVarietyLedger } from "./director/variety-ledger";
 import {
   aiTimelinePlanSchema,
   AI_TIMELINE_SCHEMA_VERSION,
@@ -598,6 +600,38 @@ export async function processAiEditJob(jobId: string): Promise<void> {
         transitions = best.transitions;
         reasoningCostUsd = best.reasoningCostUsd;
         attemptScores = best.scores;
+
+        // Quality-calibration pass (2026-08-07, live human-editor review) —
+        // this deterministic "no dead screen" gap-fixer (visual-coverage.ts)
+        // was built for the Director pipeline's own scoring loop
+        // (runDirectorPipeline above) but, since
+        // AI_EDIT_DIRECTOR_PIPELINE_ENABLED defaults off, was never
+        // actually reachable in production — the legacy path (this one,
+        // the one real users hit) never ran it at all. It costs nothing
+        // extra to run here: zero LLM calls, pure post-processing over
+        // data this scope already has. A real live pipeline run + rendered-
+        // video review confirmed the gap directly: a 38.4s talking-head
+        // video with only 2 zoom/broll items across its surviving timeline
+        // left multi-second stretches with no visual treatment at all.
+        try {
+          const survivingWindows = computeSourceSurvivingWindows(sourceDurationMs, normalizeSceneRemovalWindows(sceneRemoval.map((r) => ({ startMs: r.startMs, endMs: r.endMs }))));
+          const coverage = computeVisualCoverage({ broll: brollProposals, zoom, stickers, captions });
+          const gapThresholdMs = await getConfig("AI_EDIT_NO_DEAD_SCREEN_GAP_THRESHOLD_MS");
+          const gaps = findDeadScreenGaps(coverage, survivingWindows, gapThresholdMs);
+          if (gaps.length > 0) {
+            const fixes = applyNoDeadScreenFixes(gaps, captions, createEmptyVarietyLedger());
+            brollProposals = [...brollProposals, ...fixes.broll];
+            zoom = [...zoom, ...fixes.zoom.map((z) => ({ ...z, clipId: AI_ZOOM_SOURCE_CLIP_PLACEHOLDER }))];
+            stickers = [...stickers, ...fixes.stickers];
+            logger.info({ jobId, gapsFixed: gaps.length }, "[ai edit job] no-dead-screen pass filled uncovered talking-head stretches");
+          }
+        } catch (err) {
+          // Best-effort only — never fails the whole job over a purely
+          // additive polish pass; the plan without these extra fixes is
+          // still fully valid and usable.
+          logger.warn({ err, jobId }, "[ai edit job] no-dead-screen pass failed — continuing without it");
+        }
+
         if (best.warnings && best.warnings.length > 0) {
           planningError = `Some items in the AI's plan were invalid and were skipped, everything else still applied: ${best.warnings.join(" ")}`;
           logger.warn({ jobId, warnings: best.warnings }, "[ai edit job] timeline planning partially degraded — some items dropped, continuing with the rest");

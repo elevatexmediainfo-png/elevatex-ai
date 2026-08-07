@@ -224,7 +224,10 @@ export function detectSilenceGapsAdaptive(words: TimedWord[], options: AdaptiveS
 //  - "filler_word": a word that IS a filler ("um", "uh", "erm", "hmm" and
 //    their stretched spellings — "ummm", "uhhh"; also elongated vowel
 //    fillers "aaa"/"ah"/"aah", added 2026-08-07 — see FILLER_WORD_RE's own
-//    doc comment for why a bare single "a" is deliberately excluded).
+//    doc comment for why a bare single "a" is deliberately excluded; and
+//    Hindi/Hinglish discourse-marker fillers "matlab"/"toh", added
+//    2026-08-07 — live human-editor review of a real Hinglish-content
+//    account surfaced these by name).
 //  - "repeated_word": the same word said twice in a row (a stumble/restart
 //    — "the the meeting", "and, and now") — the FIRST occurrence is the
 //    one flagged for removal, the second is the one that was actually
@@ -258,7 +261,21 @@ export interface DisfluencyMatch {
 // vowel-filler sound — deliberately NOT a bare single "a" alone, which is
 // the real English indefinite article ("a dog," "a moment") and must
 // never be treated as a disfluency.
-const FILLER_WORD_RE = /^(u+m+|u+h+|e+r+m*|h+m+|a{2,}|a+h+)$/i;
+//
+// "matlab" (2026-08-07, live human-editor review of a real Hinglish
+// account) — a near-universal Hindi/Hinglish discourse-filler ("matlab...
+// jo hai woh...", the way an English speaker says "like" or "I mean"
+// mid-thought), added as an exact standalone-word match, same risk
+// profile as "um"/"uh" (occasionally a real word, but overwhelmingly
+// filler in casual spoken use). Deliberately does NOT include "toh" (also
+// user-requested) — unlike "matlab," "toh" is extremely commonly a real
+// grammatical connector ("so"/"then": "agar aap ye karte ho, toh aapko
+// fayda hoga"), and this module's own standing rule is "a wrong guess
+// here risks cutting real, meaningful words, which is a worse outcome
+// than leaving a rare filler in" — a bare word-level regex can't tell
+// filler "toh" from connector "toh" without real sentence-context
+// understanding, so it's left alone rather than guessed at.
+const FILLER_WORD_RE = /^(u+m+|u+h+|e+r+m*|h+m+|a{2,}|a+h+|matlab)$/i;
 
 // Exported (2026-08-07, "cinematic editing" quality upgrade) — reused by
 // detectDuplicatePhrases below rather than a second normalization rule.

@@ -94,11 +94,11 @@ const PROMPT = `You are analyzing raw, unedited footage for a video editor decid
 - flaggedSegments: segments a professional editor would CUT. Use exactly one of these five reasons for each:
   - "bad_take": the speaker visibly stumbles, misspeaks, or explicitly restarts what they're saying (e.g. "let me start over", "wait, that's wrong"), even if the words alone might sound fine out of context. Flag the STUMBLED portion, not the eventual clean delivery.
   - "duplicate_take": the SAME content/message is delivered more than once (a redo). Flag the WORSE of the two deliveries (the one to remove), not the better one that should be kept.
-  - "quality_issue": visible blur, bad framing (subject cut off / off-center), or lighting problems severe enough to be distracting.
+  - "quality_issue": visible blur, bad framing (subject cut off / off-center), lighting problems severe enough to be distracting, OR a static branding/logo/intro/bumper card (a title card, watermark screen, or company logo with no talking-head content and nothing new being shown) — especially if it repeats more than once in the footage. Raw multi-take footage sometimes has this bumper card spliced in before every take; a real editor cuts every recurrence down to at most the ONE that opens the final edit, not every instance.
   - "camera_adjustment": the camera/phone is visibly being repositioned, refocused, or the shot is being reframed mid-recording — dead time with nothing to watch.
   - "dead_reaction": the speaker pauses with a blank/neutral expression and no meaningful reaction, gesture, or delivery — a genuinely empty beat, not a natural thinking pause mid-sentence (that's a transcript-timing concern, not a visual one).
 
-Only flag segments you can actually observe evidence for — do not invent flagged segments if the footage is clean. Be precise with timestamps; they will be used to cut the video.`;
+Only flag segments you can actually observe evidence for — do not invent flagged segments if the footage is clean. Be precise with timestamps; they will be used to cut the video. If the SAME static card/bumper/logo screen appears multiple times, flag EVERY recurrence except the very first one — do not stop after flagging it once.`;
 
 interface GeminiFileResource {
   name: string;
