@@ -197,7 +197,11 @@ function applyNoDeadScreenPass(ctx: DirectorContext, gapThresholdMs: number): Di
   const gaps = findDeadScreenGaps(coverage, survivingWindows, gapThresholdMs);
   if (gaps.length === 0) return ctx;
 
-  const fixes = applyNoDeadScreenFixes(gaps, ctx.captions, ctx.varietyLedger);
+  const fixes = applyNoDeadScreenFixes(gaps, ctx.captions, ctx.varietyLedger, {
+    words: ctx.speech.words,
+    visualContext: ctx.videoAnalysis?.visualContext,
+    existingBroll: ctx.broll,
+  });
   return {
     ...ctx,
     broll: [...ctx.broll, ...fixes.broll],

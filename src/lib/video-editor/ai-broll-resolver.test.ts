@@ -177,6 +177,45 @@ describe("pickBestStockResult", () => {
     const picked = pickBestStockResult(outcomes, "VIDEO", "doctor patient consultation");
     expect(picked?.result.externalId).toBe("lowres-relevant");
   });
+
+  // Semantic upgrade (2026-08-08, rule 7 — "instead of exact token
+  // overlap, use semantic similarity") — a query token with no literal
+  // match can still win via the curated synonym table, deterministic, no
+  // embeddings/API call.
+  describe("semantic (synonym) relevance — additive, never disturbs exact-match scoring", () => {
+    it("a synonym-only match beats a literal irrelevant one (query 'money' vs title 'finance investment tips')", () => {
+      const outcomes: StockSearchProviderOutcome[] = [
+        { providerId: "pexels", results: [stockResult({ externalId: "synonym-match", kind: "VIDEO", title: "finance investment tips" })] },
+      ];
+      const picked = pickBestStockResult(outcomes, "VIDEO", "money");
+      expect(picked?.result.externalId).toBe("synonym-match");
+      expect(picked!.relevanceScore).toBeGreaterThan(0);
+      expect(picked!.relevanceScore).toBeLessThan(1); // soft match only, never full confidence
+    });
+
+    it("a literal exact match still outranks a synonym-only match when both are candidates", () => {
+      const outcomes: StockSearchProviderOutcome[] = [
+        { providerId: "pexels", results: [stockResult({ externalId: "exact", kind: "VIDEO", title: "money stack closeup" }), stockResult({ externalId: "synonym-only", kind: "VIDEO", title: "finance investment tips" })] },
+      ];
+      const picked = pickBestStockResult(outcomes, "VIDEO", "money");
+      expect(picked?.result.externalId).toBe("exact");
+    });
+
+    it("real production example — 'house construction' finds a real-estate-tagged title via the home/building synonym group", () => {
+      const outcomes: StockSearchProviderOutcome[] = [
+        { providerId: "pixabay", results: [stockResult({ externalId: "home-real-estate", kind: "VIDEO", title: "real estate residence for sale" })] },
+      ];
+      const picked = pickBestStockResult(outcomes, "VIDEO", "house construction");
+      expect(picked?.result.externalId).toBe("home-real-estate");
+      expect(picked!.relevanceScore).toBeGreaterThan(0);
+    });
+
+    it("does NOT invent a synonym match for genuinely unrelated words (the water pump / synonym scope stays narrow)", () => {
+      const outcomes: StockSearchProviderOutcome[] = [{ providerId: "pexels", results: [stockResult({ externalId: "unrelated", kind: "VIDEO", title: "orca whale ocean spray" })] }];
+      const picked = pickBestStockResult(outcomes, "VIDEO", "automatic water pump");
+      expect(picked!.relevanceScore).toBe(0);
+    });
+  });
 });
 
 // stockOnly: false — these tests exercise the pre-existing, GPT-judgment-

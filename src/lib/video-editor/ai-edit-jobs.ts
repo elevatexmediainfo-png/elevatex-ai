@@ -669,7 +669,16 @@ export async function processAiEditJob(jobId: string): Promise<void> {
           const gapThresholdMs = await getConfig("AI_EDIT_NO_DEAD_SCREEN_GAP_THRESHOLD_MS");
           const gaps = findDeadScreenGaps(coverage, survivingWindows, gapThresholdMs);
           if (gaps.length > 0) {
-            const fixes = applyNoDeadScreenFixes(gaps, captions, createEmptyVarietyLedger());
+            // Production fix (2026-08-08) — real visual-concept signals for
+            // the auto-fixer's own query builder (see deriveFixSearchQuery's
+            // own doc comment in visual-coverage.ts): GPT-5's real b-roll
+            // proposals, Gemini's real scene descriptions, and the real
+            // transcript words, all already in scope here, zero new calls.
+            const fixes = applyNoDeadScreenFixes(gaps, captions, createEmptyVarietyLedger(), {
+              words: transcript.words,
+              visualContext: videoAnalysis?.visualContext,
+              existingBroll: brollProposals,
+            });
             brollProposals = [...brollProposals, ...fixes.broll];
             zoom = [...zoom, ...fixes.zoom.map((z) => ({ ...z, clipId: AI_ZOOM_SOURCE_CLIP_PLACEHOLDER }))];
             stickers = [...stickers, ...fixes.stickers];

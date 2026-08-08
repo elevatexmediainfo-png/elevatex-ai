@@ -103,15 +103,127 @@ describe("decideFixForGap", () => {
   });
 });
 
+// Production fix (2026-08-08) — root cause of "B-roll often missing
+// completely," traced against a real production job: this function used
+// to return the nearest caption's own LITERAL TEXT (real Hinglish caption
+// "Aapke Ghar Tak" sent straight to a stock search, scored 0.33 relevance,
+// rejected). It now derives an actual VISUAL CONCEPT via a priority chain
+// of real signals, never the raw spoken/caption text.
 describe("deriveFixSearchQuery", () => {
-  it("derives a query from the nearest caption's text", () => {
-    const gap = { startMs: 4000, endMs: 6000, durationMs: 2000 };
-    const captions = [caption("A quick chat about diabetes care", 3000, 4000), caption("far away caption", 50_000, 51_000)];
-    expect(deriveFixSearchQuery(gap, captions)).toBe("A quick chat about");
+  const gap = { startMs: 4000, endMs: 6000, durationMs: 2000 };
+
+  it("NEVER returns the raw caption text — the real production regression case", () => {
+    // The exact real caption from the traced production job.
+    const captions = [caption("Aapke Ghar Tak", 3000, 6500)];
+    const result = deriveFixSearchQuery(gap, captions);
+    expect(result.primary).not.toBe("Aapke Ghar Tak");
+    expect(result.primary.toLowerCase()).not.toContain("aapke");
   });
 
-  it("falls back to a generic phrase when there are no captions", () => {
-    expect(deriveFixSearchQuery({ startMs: 0, endMs: 2000, durationMs: 2000 }, [])).toBe("b-roll footage");
+  it("rule 5 — prefers GPT-5's own nearby real (non-auto-inserted) b-roll searchQuery over everything else", () => {
+    const captions = [caption("Paise Bachao", 3000, 6500)]; // would otherwise map to MONEY_CONCEPTS
+    const existingBroll = [
+      { startMs: 5000, endMs: 5500, trackHint: "broll", source: "stock" as const, searchQuery: "office team meeting", searchQueries: ["startup culture"] },
+    ];
+    const result = deriveFixSearchQuery(gap, captions, { existingBroll });
+    expect(result.primary).toBe("office team meeting");
+    expect(result.alternatives).toEqual(["startup culture"]);
+  });
+
+  it("rule 5 — ignores an existing broll item that's itself auto-inserted (not a real GPT proposal)", () => {
+    const captions = [caption("Paise Bachao", 3000, 6500)];
+    const existingBroll = [
+      { startMs: 5000, endMs: 5500, trackHint: "broll", source: "stock" as const, searchQuery: "should be ignored", autoInserted: true },
+    ];
+    const result = deriveFixSearchQuery(gap, captions, { existingBroll });
+    expect(result.primary).not.toBe("should be ignored");
+  });
+
+  it("rule 5 — ignores an existing broll item too far away in time", () => {
+    const captions = [caption("Paise Bachao", 3000, 6500)];
+    const existingBroll = [{ startMs: 500_000, endMs: 500_500, trackHint: "broll", source: "stock" as const, searchQuery: "totally different topic" }];
+    const result = deriveFixSearchQuery(gap, captions, { existingBroll });
+    expect(result.primary).not.toBe("totally different topic");
+  });
+
+  it("rule 4 — prefers Gemini's own nearby real scene description over the caption-derived guess", () => {
+    const captions = [caption("Paise Bachao", 3000, 6500)];
+    const visualContext = [{ startMs: 4500, endMs: 5500, description: "A man sits at a wooden desk reviewing paperwork." }];
+    const result = deriveFixSearchQuery(gap, captions, { visualContext });
+    expect(result.primary.toLowerCase()).toContain("wooden");
+  });
+
+  it("rule 3 — prefers literal English words spoken inline near the gap (Devanagari transcript, Latin-script token)", () => {
+    const captions = [caption("Aapke Ghar Tak", 3000, 6500)]; // would otherwise map to HOME_CONCEPTS
+    const words = [
+      { word: "हम", startMs: 4200, endMs: 4400 },
+      { word: "interior", startMs: 4400, endMs: 4900 },
+      { word: "design", startMs: 4900, endMs: 5300 },
+    ];
+    const result = deriveFixSearchQuery(gap, captions, { words });
+    expect(result.primary).toBe("interior design");
+  });
+
+  it("rule 3 — ignores common English function words even if pure-Latin-script", () => {
+    const captions: ReturnType<typeof caption>[] = [];
+    const words = [
+      { word: "the", startMs: 4200, endMs: 4400 },
+      { word: "and", startMs: 4400, endMs: 4600 },
+      { word: "with", startMs: 4600, endMs: 4800 },
+    ];
+    const result = deriveFixSearchQuery(gap, captions, { words });
+    // No real content word found -> falls all the way through to the generic fallback.
+    expect(["office work", "business people", "healthcare", "education", "technology", "finance", "construction", "nature", "city", "family"]).toContain(result.primary);
+  });
+
+  it("rule 2 — infers a visual concept from Hinglish caption text, exactly the real production example", () => {
+    const captions = [caption("Aapke Ghar Tak", 3000, 6500)];
+    const result = deriveFixSearchQuery(gap, captions);
+    expect(result.primary).toBe("house construction");
+    expect(result.alternatives).toEqual(["home interior", "family home", "construction worker", "new house"]);
+  });
+
+  it("rule 2 — 'Paise Bachao' maps to money/finance concepts, never the literal words", () => {
+    const captions = [caption("Paise Bachao", 3000, 6500)];
+    const result = deriveFixSearchQuery(gap, captions);
+    expect(result.primary).toBe("money");
+    expect(result.alternatives).toContain("investment");
+    expect(result.primary.toLowerCase()).not.toContain("paise");
+    expect(result.primary.toLowerCase()).not.toContain("bachao");
+  });
+
+  it("rule 2 — 'Healthy Rahna' maps to health concepts", () => {
+    const captions = [caption("Healthy Rahna", 3000, 6500)];
+    const result = deriveFixSearchQuery(gap, captions);
+    expect(result.primary).toBe("doctor");
+    expect(result.alternatives).toContain("hospital");
+  });
+
+  it("rule 2 — 'Business Grow' maps to business/office concepts", () => {
+    const captions = [caption("Business Grow", 3000, 6500)];
+    const result = deriveFixSearchQuery(gap, captions);
+    expect(result.primary).toBe("office");
+    expect(result.alternatives).toContain("teamwork");
+  });
+
+  it("rule 6 — falls back to a deterministic generic editorial query when nothing maps, never the literal words", () => {
+    const captions = [caption("Zindagi mein khushiyan dhoondo", 3000, 6500)];
+    // None of these tokens are in the curated concept map — should fall through.
+    const result = deriveFixSearchQuery(gap, captions);
+    const generic = ["office work", "business people", "healthcare", "education", "technology", "finance", "construction", "nature", "city", "family"];
+    expect(generic).toContain(result.primary);
+    expect(result.primary.toLowerCase()).not.toContain("zindagi");
+  });
+
+  it("rule 6 — the SAME gap always produces the SAME generic fallback (deterministic, not random)", () => {
+    const a = deriveFixSearchQuery({ startMs: 42_000, endMs: 44_000, durationMs: 2000 }, []);
+    const b = deriveFixSearchQuery({ startMs: 42_000, endMs: 44_000, durationMs: 2000 }, []);
+    expect(a.primary).toBe(b.primary);
+  });
+
+  it("falls back to a generic phrase when there are no captions and no other context", () => {
+    const result = deriveFixSearchQuery({ startMs: 0, endMs: 2000, durationMs: 2000 }, []);
+    expect(["office work", "business people", "healthcare", "education", "technology", "finance", "construction", "nature", "city", "family"]).toContain(result.primary);
   });
 });
 
@@ -126,6 +238,23 @@ describe("applyNoDeadScreenFixes", () => {
     expect(result.broll[0].reason).toContain("no-dead-screen rule");
     expect(result.broll[0].searchQuery).toBeTruthy();
     expect(result.ledger.brollStyles.length).toBeGreaterThan(0);
+  });
+
+  it("threads context through end-to-end: a Hinglish caption gap gets a real visual concept, plus searchQueries alternatives (rule 8 plumbing)", () => {
+    const gaps = [{ startMs: 0, endMs: 5000, durationMs: 5000 }]; // large gap -> broll
+    const result = applyNoDeadScreenFixes(gaps, [caption("Aapke Ghar Tak", 0, 1000)], createEmptyVarietyLedger(), {});
+
+    expect(result.broll[0].searchQuery).toBe("house construction");
+    expect(result.broll[0].searchQuery).not.toBe("Aapke Ghar Tak");
+    expect(result.broll[0].searchQueries).toEqual(["home interior", "family home", "construction worker", "new house"]);
+  });
+
+  it("threads real GPT-proposed b-roll context through — reuses it over the caption-derived guess", () => {
+    const gaps = [{ startMs: 0, endMs: 5000, durationMs: 5000 }];
+    const existingBroll = [{ startMs: 500, endMs: 900, trackHint: "broll", source: "stock" as const, searchQuery: "doctor consultation" }];
+    const result = applyNoDeadScreenFixes(gaps, [caption("Aapke Ghar Tak", 0, 1000)], createEmptyVarietyLedger(), { existingBroll });
+
+    expect(result.broll[0].searchQuery).toBe("doctor consultation");
   });
 
   it("produces zero items when there are zero gaps", () => {

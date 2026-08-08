@@ -105,16 +105,68 @@ function tokenize(text: string): string[] {
     .filter((token) => token.length > 1 && !STOPWORDS.has(token));
 }
 
-// Fraction (0..1) of the query's own meaningful tokens that literally
-// appear in the candidate's title/tag text — deliberately simple (no
-// external NLP/embedding dependency) since these titles are themselves
-// just keyword lists, not sentences a semantic model would help with.
+// Semantic upgrade (2026-08-08, "instead of exact token overlap, use
+// semantic similarity") — a small, curated, deterministic synonym table
+// (no embeddings/API call, per this fix's own "no new AI calls" rule): a
+// query token with no LITERAL match can still be a genuine conceptual
+// match against the candidate's title via a same-topic synonym. Weighted
+// at half an exact match (see relevanceScore below) so it can meaningfully
+// lift a real near-miss without ever letting synonym-only overlap alone
+// outscore a genuinely literal match — deliberately scoped to the same
+// real-world topic areas the Hinglish visual-concept map in
+// director/visual-coverage.ts covers (home, finance, health, business,
+// education, food, travel, wedding, career, fashion, tech, auto, family),
+// not an attempt at a general thesaurus.
+const SEMANTIC_SYNONYM_GROUPS: string[][] = [
+  ["house", "home", "building", "construction", "residence"],
+  ["money", "finance", "cash", "investment", "banking", "savings"],
+  ["doctor", "medical", "healthcare", "hospital", "clinic", "physician"],
+  ["office", "business", "workplace", "corporate", "company"],
+  ["team", "teamwork", "collaboration", "colleagues"],
+  ["meeting", "discussion", "conference"],
+  ["school", "education", "classroom", "student", "learning"],
+  ["food", "cooking", "kitchen", "meal", "cuisine"],
+  ["travel", "tourism", "vacation", "trip", "journey"],
+  ["wedding", "marriage", "bride", "groom", "ceremony"],
+  ["technology", "digital", "tech", "gadget", "device"],
+  ["car", "vehicle", "automobile", "driving"],
+  ["family", "parents", "children"],
+  ["fitness", "exercise", "workout", "gym", "health"],
+  ["fashion", "clothing", "style", "outfit"],
+];
+const SYNONYM_LOOKUP = new Map<string, Set<string>>();
+for (const group of SEMANTIC_SYNONYM_GROUPS) {
+  const set = new Set(group);
+  for (const word of group) SYNONYM_LOOKUP.set(word, set);
+}
+
+// 0..1: the query's own meaningful tokens, matched against the
+// candidate's title/tag text either LITERALLY (full weight) or via the
+// synonym table above (half weight) — deliberately simple, no external
+// NLP/embedding dependency, since these titles are themselves just
+// keyword lists, not sentences a semantic model would help with.
 function relevanceScore(query: string, title: string): number {
   const queryTokens = tokenize(query);
   if (queryTokens.length === 0) return 0;
   const titleTokens = new Set(tokenize(title));
-  const matched = queryTokens.filter((token) => titleTokens.has(token)).length;
-  return matched / queryTokens.length;
+
+  let exactMatches = 0;
+  let softMatches = 0;
+  for (const token of queryTokens) {
+    if (titleTokens.has(token)) {
+      exactMatches += 1;
+      continue;
+    }
+    const synonyms = SYNONYM_LOOKUP.get(token);
+    if (!synonyms) continue;
+    for (const titleToken of titleTokens) {
+      if (synonyms.has(titleToken)) {
+        softMatches += 1;
+        break;
+      }
+    }
+  }
+  return Math.min(1, (exactMatches + softMatches * 0.5) / queryTokens.length);
 }
 
 // `relevanceScore` (2026-07-23) — the winning candidate's own 0..1 token-
@@ -322,12 +374,26 @@ async function resolveStockBroll(
 
   if (!picked) {
     const wasBroadened = buildBroadenedQueries(query).length > 1 || (item.searchQueries?.length ?? 0) > 0;
+    // Rule 9 (2026-08-08) — every rejected query, logged with what was
+    // actually tried, so a real production gap like the one this fix was
+    // traced from ("Aapke Ghar Tak" -> zero usable stock results) is
+    // observable going forward instead of only visible after the fact via
+    // resolutionNote on the persisted plan.
+    logger.warn({ query, alternativesTried: item.searchQueries ?? [], wasBroadened }, "[ai broll resolver] no stock results found for any candidate query — b-roll slot will be unresolved");
     return {
       ...item,
       resolutionNote: `No stock results found for "${query}"${wasBroadened ? ", even after trying related queries and broader phrasings" : ""}.`,
     };
   }
   if (minRelevanceScore != null && picked.relevanceScore < minRelevanceScore) {
+    // Rule 9 — same observability for the "found something, but too weak
+    // to trust" rejection path (this is the exact path the real production
+    // "Aapke Ghar Tak" b-roll loss went through: a 0.33-relevance match
+    // rejected below the 0.5 threshold).
+    logger.warn(
+      { query: searchedWith, bestTitle: picked.result.title, relevanceScore: picked.relevanceScore, threshold: minRelevanceScore },
+      "[ai broll resolver] best stock match scored below the relevance confidence threshold — rejecting rather than using a poor match"
+    );
     return {
       ...item,
       resolutionNote: `Best stock match ("${picked.result.title}") scored ${picked.relevanceScore.toFixed(2)} relevance for "${searchedWith}", below the ${minRelevanceScore} confidence threshold.`,
