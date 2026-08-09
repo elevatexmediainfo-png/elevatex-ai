@@ -312,37 +312,48 @@ async function resolveStockBroll(
   let searchedWith = query;
 
   // Query expansion (2026-08-07, extended 2026-08-07 "TASK 3 — rank them,
-  // choose the highest quality result") — semantic/synonym/category
-  // variants of the primary query (item.searchQueries, aiBrollSchema's own
-  // doc comment), the AI's own ranked (best-to-worst) list. A TOP SLICE of
-  // them (EXPANSION_PARALLEL_SEARCH_COUNT, ranked-best-first) is searched
-  // IN PARALLEL and the single highest-SCORING candidate across the whole
-  // slice wins — not just whichever query happened to return something
-  // first. This is a genuine "rank, then choose best" step, not a
-  // sequential "first success wins" one: a lower-ranked query occasionally
-  // surfaces a more relevant/higher-quality (portrait/video-kind-bonused)
-  // match than a higher-ranked one whose own stock coverage happens to be
-  // thin, and this now catches that instead of settling for whichever
-  // query was tried first. Bounded to a small slice (not all 10) to keep
-  // real vendor-API load proportionate — this is stock-search cost, not
-  // LLM cost, but an unbounded fan-out per b-roll item is still real
-  // infrastructure load this app pays for. The full ranked list remains
-  // available for the "found literally nothing" fallback loop below.
-  if ((!picked || (usedExternalIds && picked)) && item.searchQueries && item.searchQueries.length > 0) {
+  // choose the highest quality result"; fixed 2026-08-09 — "never discard a
+  // valid high-scoring primary merely because alternatives exist") —
+  // semantic/synonym/category variants of the primary query
+  // (item.searchQueries, aiBrollSchema's own doc comment), the AI's own
+  // ranked (best-to-worst) list. A TOP SLICE of them (EXPANSION_PARALLEL_SEARCH_COUNT,
+  // ranked-best-first) is searched IN PARALLEL, and the single highest-
+  // SCORING candidate across the WHOLE pool — the primary's own already-
+  // found result INCLUDED — wins. This is a genuine "rank every real
+  // candidate, choose the best" step, not a sequential "first success
+  // wins" one, and the primary is never excluded from that comparison:
+  // real production bug this fixes — deriveFixSearchQuery() (visual-
+  // coverage.ts) can hand an auto-inserted item a strong, specific primary
+  // (e.g. "house construction") plus several deliberately broader
+  // alternatives (e.g. "home interior", "new house"); the old version of
+  // this block compared ONLY the alternatives against each other and
+  // unconditionally overwrote `picked` with whichever of THEM scored
+  // highest, discarding the primary's own result even when it was the
+  // best (or only) usable candidate — silently turning an already-
+  // resolvable item into an unresolved one. Bounded to a small slice (not
+  // all 10) to keep real vendor-API load proportionate — this is stock-
+  // search cost, not LLM cost, but an unbounded fan-out per b-roll item is
+  // still real infrastructure load this app pays for. The full ranked list
+  // remains available for the "found literally nothing" fallback loop
+  // below.
+  if (item.searchQueries && item.searchQueries.length > 0) {
     const ranked = item.searchQueries.filter((q) => q.trim().toLowerCase() !== query.trim().toLowerCase());
     const parallelSlice = ranked.slice(0, EXPANSION_PARALLEL_SEARCH_COUNT);
     const results = await Promise.all(parallelSlice.map(async (expanded) => ({ expanded, candidate: await searchAndPick(expanded) })));
-    const scored = results.filter((r): r is { expanded: string; candidate: NonNullable<(typeof results)[number]["candidate"]> } => r.candidate !== null);
+    // The primary's own result is a candidate in this SAME pool — never
+    // excluded just because alternatives exist (see doc comment above).
+    const allCandidates = [{ expanded: query, candidate: picked }, ...results];
+    const scored = allCandidates.filter((r): r is { expanded: string; candidate: NonNullable<(typeof allCandidates)[number]["candidate"]> } => r.candidate !== null);
     if (scored.length > 0) {
       const best = scored.reduce((a, b) => (b.candidate.relevanceScore > a.candidate.relevanceScore ? b : a));
       picked = best.candidate;
       searchedWith = best.expanded;
     } else {
-      // Nothing in the top-ranked parallel slice found ANYTHING — fall
-      // back to the remaining, lower-ranked queries sequentially (same
-      // "keep trying until something works" coverage as before this
-      // parallel-ranking upgrade, just only reached when the best-ranked
-      // candidates genuinely came up empty).
+      // Nothing across the primary + the top-ranked parallel slice found
+      // ANYTHING — fall back to the remaining, lower-ranked queries
+      // sequentially (same "keep trying until something works" coverage as
+      // before this parallel-ranking upgrade, just only reached when the
+      // best-ranked candidates genuinely came up empty).
       for (const expanded of ranked.slice(EXPANSION_PARALLEL_SEARCH_COUNT)) {
         const candidate = await searchAndPick(expanded);
         if (candidate) {

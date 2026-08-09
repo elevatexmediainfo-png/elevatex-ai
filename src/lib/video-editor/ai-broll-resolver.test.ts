@@ -531,6 +531,61 @@ describe("resolveBrollItem — stock-only policy override (2026-07-18)", () => {
     expect(generateImageMock).toHaveBeenCalledTimes(1);
     expect(result.resolvedAssetId).toBe("gen-strict-threshold");
   });
+
+  // Real production regression (2026-08-09) — "Aapke Ghar Tak" was auto-
+  // inserted by the no-dead-screen fallback (visual-coverage.ts), correctly
+  // converted by deriveFixSearchQuery() into primary "house construction"
+  // plus alternatives ["home interior", "family home", "construction
+  // worker", "new house"] — but the B-roll still showed "Not resolved" in
+  // production. Root cause traced to THIS block: it used to compare only
+  // the alternatives against each other and unconditionally overwrite the
+  // primary's own result, discarding a valid, above-threshold primary
+  // match whenever every alternative happened to score lower. An auto-
+  // inserted item never carries a `.generation` block (matches the real
+  // item shape), so once discarded there was no fallback left at all.
+  it("never discards a valid high-scoring primary just because alternatives exist (real production regression — 'house construction')", async () => {
+    searchStockMediaMock.mockImplementation(async (_category: string, q: string) => {
+      if (q === "house construction") {
+        return { outcomes: [{ providerId: "pexels", results: [stockResult({ externalId: "primary-strong", kind: "VIDEO", title: "house construction site building crew" })] }] };
+      }
+      // Every alternative finds SOMETHING, but each is genuinely a weaker
+      // match against the ORIGINAL query "house construction" than the
+      // primary's own title.
+      if (q === "home interior") return { outcomes: [{ providerId: "pexels", results: [stockResult({ externalId: "alt-1", kind: "VIDEO", title: "cozy living room sofa" })] }] };
+      if (q === "family home") return { outcomes: [{ providerId: "pexels", results: [stockResult({ externalId: "alt-2", kind: "VIDEO", title: "family playing in the garden" })] }] };
+      return { outcomes: [{ providerId: "pexels", results: [] }] };
+    });
+    materializeStockAssetMock.mockResolvedValue({ id: "asset-primary", url: "https://cdn/primary.mp4", thumbnailUrl: null });
+
+    // No `.generation` block — the exact shape an auto-inserted item has.
+    const item = brollStock({ searchQuery: "house construction", searchQueries: ["home interior", "family home", "construction worker", "new house"] });
+    const result = await resolveBrollItem(item, STOCK_ONLY_CTX);
+
+    expect(materializeStockAssetMock).toHaveBeenCalledWith("user-1", "pexels", "STOCK_MEDIA", expect.objectContaining({ externalId: "primary-strong" }));
+    expect(result.resolvedAssetId).toBe("asset-primary");
+    expect(generateImageMock).not.toHaveBeenCalled(); // never needed — the primary alone clears the threshold
+  });
+
+  // The symmetric case — when an alternative genuinely IS the better
+  // candidate (the primary is weak on its own), it must still win. This is
+  // the behavior the query-expansion block was originally meant to provide
+  // and must keep providing after the fix above.
+  it("selects a genuinely higher-scoring alternative over a weak primary", async () => {
+    searchStockMediaMock.mockImplementation(async (_category: string, q: string) => {
+      // Weak: only a soft synonym match ("building" ~ "house"), scores 0.25 — below the 0.5 threshold on its own.
+      if (q === "house construction") return { outcomes: [{ providerId: "pexels", results: [stockResult({ externalId: "primary-weak", kind: "VIDEO", title: "office building exterior street" })] }] };
+      // Strong: both query tokens match literally — scores 1.0.
+      if (q === "new house") return { outcomes: [{ providerId: "pexels", results: [stockResult({ externalId: "alt-strong", kind: "VIDEO", title: "brand new house construction finished" })] }] };
+      return { outcomes: [{ providerId: "pexels", results: [] }] };
+    });
+    materializeStockAssetMock.mockResolvedValue({ id: "asset-alternative", url: "https://cdn/alt.mp4", thumbnailUrl: null });
+
+    const item = brollStock({ searchQuery: "house construction", searchQueries: ["home interior", "family home", "construction worker", "new house"] });
+    const result = await resolveBrollItem(item, STOCK_ONLY_CTX);
+
+    expect(materializeStockAssetMock).toHaveBeenCalledWith("user-1", "pexels", "STOCK_MEDIA", expect.objectContaining({ externalId: "alt-strong" }));
+    expect(result.resolvedAssetId).toBe("asset-alternative");
+  });
 });
 
 describe("resolveBrollItems", () => {
