@@ -154,6 +154,35 @@ describe("deriveFixSearchQuery", () => {
     expect(result.primary.toLowerCase()).toContain("wooden");
   });
 
+  // Real production regression (2026-08-10) — rule 4 used to return
+  // `alternatives: []` unconditionally. For a single-setting talking-head
+  // video, Gemini's own scene description repeats near-identically across
+  // many gaps (e.g. "Dentist seated at office desk wearing..."), so every
+  // one of those gaps had ZERO fallback the moment that literal, generic
+  // phrase scored below the resolver's relevance threshold — the resolver's
+  // own primary-vs-alternatives fix (ai-broll-resolver.ts, 2026-08-09) had
+  // nothing to compare against. Rule 4 must now hand back real, non-empty
+  // alternatives every time, without changing its own primary output.
+  it("rule 4 — now also returns non-empty, deterministic alternatives (previously always [])", () => {
+    const captions = [caption("Paise Bachao", 3000, 6500)];
+    const visualContext = [{ startMs: 4500, endMs: 5500, description: "A man sits at a wooden desk reviewing paperwork." }];
+    const result = deriveFixSearchQuery(gap, captions, { visualContext });
+
+    // Primary is completely unaffected — same value as the pre-existing test above.
+    expect(result.primary.toLowerCase()).toContain("wooden");
+    expect(result.alternatives.length).toBeGreaterThan(0);
+    expect(result.alternatives.length).toBeLessThanOrEqual(3);
+    // Drawn only from the existing generic editorial fallback vocabulary — no new concept invented.
+    for (const alt of result.alternatives) {
+      expect(["office work", "business people", "healthcare", "education", "technology", "finance", "construction", "nature", "city", "family"]).toContain(alt);
+    }
+    // Never a duplicate of the primary itself.
+    expect(result.alternatives).not.toContain(result.primary);
+
+    const again = deriveFixSearchQuery(gap, captions, { visualContext });
+    expect(again.alternatives).toEqual(result.alternatives); // deterministic, not random
+  });
+
   it("rule 3 — prefers literal English words spoken inline near the gap (Devanagari transcript, Latin-script token)", () => {
     const captions = [caption("Aapke Ghar Tak", 3000, 6500)]; // would otherwise map to HOME_CONCEPTS
     const words = [
@@ -163,6 +192,26 @@ describe("deriveFixSearchQuery", () => {
     ];
     const result = deriveFixSearchQuery(gap, captions, { words });
     expect(result.primary).toBe("interior design");
+  });
+
+  // Same regression, rule 3 — a literal transcript snippet is just as
+  // incapable of offering a curated alternates list as rule 4's raw scene
+  // description, and used to return `alternatives: []` for the same reason.
+  it("rule 3 — now also returns non-empty, deterministic alternatives (previously always [])", () => {
+    const words = [
+      { word: "हम", startMs: 4200, endMs: 4400 },
+      { word: "interior", startMs: 4400, endMs: 4900 },
+      { word: "design", startMs: 4900, endMs: 5300 },
+    ];
+    const result = deriveFixSearchQuery(gap, [], { words });
+
+    expect(result.primary).toBe("interior design");
+    expect(result.alternatives.length).toBeGreaterThan(0);
+    expect(result.alternatives.length).toBeLessThanOrEqual(3);
+    for (const alt of result.alternatives) {
+      expect(["office work", "business people", "healthcare", "education", "technology", "finance", "construction", "nature", "city", "family"]).toContain(alt);
+    }
+    expect(result.alternatives).not.toContain(result.primary);
   });
 
   it("rule 3 — ignores common English function words even if pure-Latin-script", () => {
@@ -262,6 +311,24 @@ describe("applyNoDeadScreenFixes", () => {
     const result = applyNoDeadScreenFixes(gaps, [caption("Aapke Ghar Tak", 0, 1000)], createEmptyVarietyLedger(), { existingBroll, maxDwellMs: 6000 });
 
     expect(result.broll[0].searchQuery).toBe("doctor consultation");
+  });
+
+  // Real production regression (2026-08-10) — rule 4's alternatives used to
+  // be [], so an item resolving via a Gemini scene description reached
+  // ai-broll-resolver.ts with `searchQueries: undefined` and no second
+  // chance at all. Confirms the fix's alternatives genuinely flow all the
+  // way through to the persisted `searchQueries` field the resolver reads.
+  it("threads rule 4's now-non-empty alternatives through as searchQueries (previously always undefined)", () => {
+    const gaps = [{ startMs: 0, endMs: 5000, durationMs: 5000 }];
+    const visualContext = [{ startMs: 2000, endMs: 3000, description: "A man sits at a wooden desk reviewing paperwork." }];
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger(), { visualContext, maxDwellMs: 6000 });
+
+    expect(result.broll[0].searchQuery!.toLowerCase()).toContain("wooden");
+    expect(result.broll[0].searchQueries).toBeDefined();
+    expect(result.broll[0].searchQueries!.length).toBeGreaterThan(0);
+    for (const alt of result.broll[0].searchQueries!) {
+      expect(["office work", "business people", "healthcare", "education", "technology", "finance", "construction", "nature", "city", "family"]).toContain(alt);
+    }
   });
 
   it("produces zero items when there are zero gaps", () => {

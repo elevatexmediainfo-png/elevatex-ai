@@ -421,6 +421,30 @@ function pickGenericFallback(seed: number): string {
   return GENERIC_EDITORIAL_FALLBACKS[idx];
 }
 
+// Rules 3/4 (2026-08-10) — neither rule can offer a curated, topic-specific
+// alternates list the way Rule 2's Hinglish concept map or Rule 5's real
+// GPT proposals can: a literal transcript snippet (rule 3) or a raw Gemini
+// scene description (rule 4) isn't tied to one of the app's known content
+// verticals. They used to return `alternatives: []`, which meant
+// ai-broll-resolver.ts's primary-vs-alternatives comparison (see that
+// file's own 2026-08-09 fix) never had anything to compare against —
+// real production impact: for a single-setting talking-head video, rule 4
+// can hand the SAME generic, verb-heavy sentence fragment (e.g. "Dentist
+// seated at office desk wearing...") to several different gaps, each with
+// zero fallback the moment that literal phrase scores too low. A
+// deterministic, seed-rotated slice of the SAME generic editorial
+// fallbacks rule 6 already uses gives these rules a genuine second (and
+// third, fourth) chance through the resolver's own comparison, without
+// inventing any new concept vocabulary — reuses pickGenericFallback's own
+// seed to choose where the rotation starts, so two gaps at different
+// positions get a genuinely different alternates set even when their own
+// primary text happens to collide.
+function genericAlternates(seed: number, exclude: string): string[] {
+  const startIdx = GENERIC_EDITORIAL_FALLBACKS.indexOf(pickGenericFallback(seed));
+  const rotated = [...GENERIC_EDITORIAL_FALLBACKS.slice(startIdx), ...GENERIC_EDITORIAL_FALLBACKS.slice(0, startIdx)];
+  return rotated.filter((f) => f !== exclude).slice(0, 3);
+}
+
 export function deriveFixSearchQuery(gap: DeadScreenGap, captions: AICaption[], context: VisualQueryContext = {}): VisualQueryCandidates {
   const midMs = (gap.startMs + gap.endMs) / 2;
 
@@ -439,7 +463,10 @@ export function deriveFixSearchQuery(gap: DeadScreenGap, captions: AICaption[], 
       .split(/\s+/)
       .filter(Boolean)
       .slice(0, 6);
-    if (words.length > 0) return { primary: words.join(" "), alternatives: [] };
+    if (words.length > 0) {
+      const primary = words.join(" ");
+      return { primary, alternatives: genericAlternates(gap.startMs, primary) };
+    }
   }
 
   // Rule 3 — literal English words spoken inline near the gap.
@@ -449,7 +476,8 @@ export function deriveFixSearchQuery(gap: DeadScreenGap, captions: AICaption[], 
     .filter(isLikelyEnglishWord);
   if (nearbyEnglishWords.length > 0) {
     const unique = Array.from(new Set(nearbyEnglishWords.map((w) => w.toLowerCase()))).slice(0, 5);
-    return { primary: unique.join(" "), alternatives: [] };
+    const primary = unique.join(" ");
+    return { primary, alternatives: genericAlternates(gap.startMs, primary) };
   }
 
   // Rule 2 — infer the VISUAL CONCEPT of the nearest caption's text via
