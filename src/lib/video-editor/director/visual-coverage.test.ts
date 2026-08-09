@@ -7,6 +7,7 @@ import {
   decideFixForGap,
   deriveFixSearchQuery,
   findDeadScreenGaps,
+  subdivideGap,
 } from "./visual-coverage";
 
 function caption(text: string, startMs: number, endMs: number) {
@@ -228,9 +229,15 @@ describe("deriveFixSearchQuery", () => {
 });
 
 describe("applyNoDeadScreenFixes", () => {
+  // Visual-pacing upgrade (2026-08-09) — these 3 tests predate subdivideGap
+  // and are specifically about PER-ITEM tagging/query-derivation behavior,
+  // not about gap sizing. Since the default maxDwellMs (2500ms) would now
+  // genuinely subdivide a 5000ms gap into multiple items, they explicitly
+  // pass a larger maxDwellMs here to keep testing exactly what they always
+  // tested — subdivision itself gets its own dedicated tests below.
   it("produces one tagged, autoInserted item per gap and updates the ledger", () => {
     const gaps = [{ startMs: 0, endMs: 5000, durationMs: 5000 }]; // large gap -> broll
-    const result = applyNoDeadScreenFixes(gaps, [caption("a doctor talking about diabetes", 0, 1000)], createEmptyVarietyLedger());
+    const result = applyNoDeadScreenFixes(gaps, [caption("a doctor talking about diabetes", 0, 1000)], createEmptyVarietyLedger(), { maxDwellMs: 6000 });
 
     expect(result.gapsFixed).toBe(1);
     expect(result.broll).toHaveLength(1);
@@ -242,7 +249,7 @@ describe("applyNoDeadScreenFixes", () => {
 
   it("threads context through end-to-end: a Hinglish caption gap gets a real visual concept, plus searchQueries alternatives (rule 8 plumbing)", () => {
     const gaps = [{ startMs: 0, endMs: 5000, durationMs: 5000 }]; // large gap -> broll
-    const result = applyNoDeadScreenFixes(gaps, [caption("Aapke Ghar Tak", 0, 1000)], createEmptyVarietyLedger(), {});
+    const result = applyNoDeadScreenFixes(gaps, [caption("Aapke Ghar Tak", 0, 1000)], createEmptyVarietyLedger(), { maxDwellMs: 6000 });
 
     expect(result.broll[0].searchQuery).toBe("house construction");
     expect(result.broll[0].searchQuery).not.toBe("Aapke Ghar Tak");
@@ -252,7 +259,7 @@ describe("applyNoDeadScreenFixes", () => {
   it("threads real GPT-proposed b-roll context through — reuses it over the caption-derived guess", () => {
     const gaps = [{ startMs: 0, endMs: 5000, durationMs: 5000 }];
     const existingBroll = [{ startMs: 500, endMs: 900, trackHint: "broll", source: "stock" as const, searchQuery: "doctor consultation" }];
-    const result = applyNoDeadScreenFixes(gaps, [caption("Aapke Ghar Tak", 0, 1000)], createEmptyVarietyLedger(), { existingBroll });
+    const result = applyNoDeadScreenFixes(gaps, [caption("Aapke Ghar Tak", 0, 1000)], createEmptyVarietyLedger(), { existingBroll, maxDwellMs: 6000 });
 
     expect(result.broll[0].searchQuery).toBe("doctor consultation");
   });
@@ -272,7 +279,10 @@ describe("applyNoDeadScreenFixes", () => {
       { startMs: 12_000, endMs: 17_000, durationMs: 5000 },
       { startMs: 18_000, endMs: 23_000, durationMs: 5000 },
     ];
-    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger());
+    // maxDwellMs: 6000 — larger than every gap here, so none subdivide;
+    // this test is specifically about alternation across separate GAPS,
+    // not about subdivision (which has its own dedicated tests below).
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger(), { maxDwellMs: 6000 });
     // No two ADJACENT gaps may produce the exact same kind.
     const kindOf = (startMs: number): string => {
       if (result.zoom.some((z) => z.startMs === startMs)) return "zoom";
@@ -338,5 +348,140 @@ describe("applyNoDeadScreenFixes", () => {
     if (result.stickers.length > 0) {
       expect(result.stickers[0].endMs - result.stickers[0].startMs).toBeLessThanOrEqual(1600);
     }
+  });
+});
+
+// Visual-pacing upgrade (2026-08-09) — the real product requirement was
+// never "insert 2 b-roll clips when planning fails," it's "maintain a
+// ~2-3 second maximum visual dwell time" (~10-15 meaningful visual changes
+// across a 30-40s video). subdivideGap is the fix: a long dead-screen gap
+// is split into several shorter sub-gaps, each within the configured
+// ceiling, BEFORE the existing per-gap fix/rotation loop ever runs.
+describe("subdivideGap", () => {
+  // Test 1
+  it("a 10-second gap subdivides into multiple sub-gaps, each <= the configured max dwell", () => {
+    const gap = { startMs: 0, endMs: 10_000, durationMs: 10_000 };
+    const subGaps = subdivideGap(gap, 2500);
+
+    expect(subGaps.length).toBeGreaterThan(1);
+    for (const g of subGaps) {
+      expect(g.durationMs).toBeLessThanOrEqual(2500);
+      expect(g.endMs - g.startMs).toBe(g.durationMs);
+    }
+    // Contiguous, no overlap/holes, and covers the whole original gap.
+    expect(subGaps[0].startMs).toBe(0);
+    expect(subGaps[subGaps.length - 1].endMs).toBe(10_000);
+    for (let i = 1; i < subGaps.length; i++) {
+      expect(subGaps[i].startMs).toBe(subGaps[i - 1].endMs);
+    }
+  });
+
+  // Test 2
+  it("a 2-second gap remains a single fix and is not unnecessarily subdivided", () => {
+    const gap = { startMs: 0, endMs: 2000, durationMs: 2000 };
+    expect(subdivideGap(gap, 2500)).toEqual([gap]);
+  });
+
+  it("a gap exactly at the max dwell is left unsubdivided", () => {
+    const gap = { startMs: 0, endMs: 2500, durationMs: 2500 };
+    expect(subdivideGap(gap, 2500)).toEqual([gap]);
+  });
+});
+
+describe("applyNoDeadScreenFixes — subdivision integration (Tests 3, 4, 7)", () => {
+  function kindOfFactory(result: ReturnType<typeof applyNoDeadScreenFixes>) {
+    return (startMs: number): string => {
+      if (result.zoom.some((z) => z.startMs === startMs)) return "zoom";
+      if (result.stickers.some((s) => s.startMs === startMs)) return "sticker";
+      const b = result.broll.find((item) => item.startMs === startMs);
+      return b?.contentKind === "motion_graphic" ? "motion_graphic" : "broll";
+    };
+  }
+
+  // Test 3
+  it("a 7-10 second gap produces multiple visual fixes, alternating kinds via the existing rotation logic", () => {
+    const gaps = [{ startMs: 0, endMs: 8000, durationMs: 8000 }];
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger(), { maxDwellMs: 2500 });
+
+    const totalFixes = result.broll.length + result.zoom.length + result.stickers.length;
+    expect(totalFixes).toBeGreaterThan(1);
+
+    const kindOf = kindOfFactory(result);
+    const allStarts = [...result.broll, ...result.zoom, ...result.stickers].map((item) => item.startMs).sort((a, b) => a - b);
+    const sequence = allStarts.map(kindOf);
+    for (let i = 1; i < sequence.length; i++) {
+      expect(sequence[i]).not.toBe(sequence[i - 1]); // existing FIX_ALTERNATION_WINDOW logic, untouched
+    }
+  });
+
+  // Test 4 (unit-level companion to the pipeline-level version in
+  // ai-edit-jobs.test.ts) — a single, very long uncovered gap (the shape a
+  // total planning failure produces: nothing generated at all) must yield
+  // several visual interventions, never just 1-2.
+  it("a single very long uncovered gap (as a total planning failure would produce) yields many visual interventions, not just 1-2", () => {
+    const gaps = [{ startMs: 0, endMs: 35_000, durationMs: 35_000 }]; // ~30-40s talking-head video, zero coverage
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger(), { maxDwellMs: 2500 });
+
+    const totalFixes = result.broll.length + result.zoom.length + result.stickers.length;
+    expect(totalFixes).toBeGreaterThan(2);
+    expect(totalFixes).toBeGreaterThanOrEqual(10); // ~35000/2500 = 14, well within the "10-15 visual changes" target
+  });
+
+  // Test 7
+  it("no generated visual event exceeds the configured max dwell because of the subdivision logic", () => {
+    const gaps = [
+      { startMs: 0, endMs: 10_000, durationMs: 10_000 },
+      { startMs: 20_000, endMs: 27_000, durationMs: 7000 },
+      { startMs: 30_000, endMs: 32_200, durationMs: 2200 }, // below the ceiling — must survive unsplit
+    ];
+    const maxDwellMs = 2500;
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger(), { maxDwellMs });
+
+    for (const b of result.broll) expect(b.endMs - b.startMs).toBeLessThanOrEqual(maxDwellMs);
+    for (const z of result.zoom) expect(z.endMs - z.startMs).toBeLessThanOrEqual(maxDwellMs);
+    for (const s of result.stickers) expect(s.endMs - s.startMs).toBeLessThanOrEqual(maxDwellMs);
+  });
+
+  it("gapsFixed still reports the ORIGINAL gap count, not the subdivided event count", () => {
+    const gaps = [{ startMs: 0, endMs: 10_000, durationMs: 10_000 }];
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger(), { maxDwellMs: 2500 });
+    expect(result.gapsFixed).toBe(1);
+    expect(result.broll.length + result.zoom.length + result.stickers.length).toBeGreaterThan(1);
+  });
+});
+
+// Test 5 — Option B, conservative: a caption's own coverage credit is
+// capped so a single long caption can't suppress dead-screen detection for
+// its entire span, without touching the caption's own real timing/render.
+describe("computeVisualCoverage — caption coverage cap (Option B)", () => {
+  it("a long caption interval does not fully suppress dead-screen detection for its whole duration when capped", () => {
+    const longCaption = caption("this caption spans a very long stretch of unchanging talking-head footage", 0, 20_000);
+
+    // Legacy/uncapped default (no opts) — completely unchanged behavior,
+    // e.g. editing-density.ts's computeActualDensities, which deliberately
+    // does not opt into this cap.
+    const uncapped = computeVisualCoverage({ broll: [], zoom: [], stickers: [], captions: [longCaption] });
+    expect(findDeadScreenGaps(uncapped, [{ startMs: 0, endMs: 20_000 }], 1750)).toEqual([]);
+
+    // Capped, as the no-dead-screen pass now opts into.
+    const capped = computeVisualCoverage({ broll: [], zoom: [], stickers: [], captions: [longCaption] }, { maxCaptionCreditMs: 2500 });
+    const gaps = findDeadScreenGaps(capped, [{ startMs: 0, endMs: 20_000 }], 1750);
+    expect(gaps.length).toBeGreaterThan(0);
+    expect(gaps[0].startMs).toBe(2500); // only the first 2500ms of the caption counts as coverage
+  });
+
+  it("does not cap a caption shorter than the configured max dwell — no spurious gap introduced", () => {
+    const shortCaption = caption("short", 0, 2000);
+    const coverage = computeVisualCoverage({ broll: [], zoom: [], stickers: [], captions: [shortCaption] }, { maxCaptionCreditMs: 2500 });
+    expect(coverage).toEqual([{ startMs: 0, endMs: 2000, kind: "caption" }]);
+    expect(findDeadScreenGaps(coverage, [{ startMs: 0, endMs: 2000 }], 1750)).toEqual([]);
+  });
+
+  it("does not cap broll/zoom/sticker intervals — only captions are subject to the credit cap", () => {
+    const coverage = computeVisualCoverage(
+      { broll: [{ startMs: 0, endMs: 10_000, trackHint: "broll", source: "stock", searchQuery: "x" }], zoom: [], stickers: [], captions: [] },
+      { maxCaptionCreditMs: 2500 }
+    );
+    expect(coverage).toEqual([{ startMs: 0, endMs: 10_000, kind: "broll" }]);
   });
 });

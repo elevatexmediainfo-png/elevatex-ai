@@ -56,6 +56,24 @@ export interface CoverageInput {
   captions: AICaption[];
 }
 
+export interface VisualCoverageOptions {
+  // 2026-08-09 visual-pacing upgrade ("2-3 second maximum visual dwell")
+  // — Option B, conservative: a caption's ENTIRE span used to count as
+  // full coverage no matter how long it ran, which meant one long caption
+  // over an unchanging talking-head shot could suppress dead-screen
+  // detection indefinitely even though nothing visual had actually
+  // changed. When set, this caps how much CONTINUOUS coverage CREDIT any
+  // single caption interval can contribute — the caption's own real
+  // startMs/endMs (rendering/timing) are never touched, only this
+  // function's internal, gap-detection-only representation of it. Left
+  // undefined (the default) preserves the exact legacy uncapped
+  // behavior — e.g. editing-density.ts's computeActualDensities, an
+  // unrelated post-hoc scoring consumer of this same function, is
+  // deliberately left uncapped rather than risk changing its retention
+  // scoring for a concern (real-time dead-screen fixing) it doesn't have.
+  maxCaptionCreditMs?: number;
+}
+
 // Real-world note: this runs BEFORE asset resolution (same point in the
 // pipeline ai-edit-quality-scoring.ts's own scoreVisuals runs — see that
 // file's own flagged bug for why "wait for resolvedAssetId" would be
@@ -63,12 +81,19 @@ export interface CoverageInput {
 // not just ones that later resolve to a real asset. A proposal that
 // later fails to resolve is a resolution-layer concern, not a coverage
 // gap this pass should try to re-fill.
-export function computeVisualCoverage(input: CoverageInput): CoverageInterval[] {
+export function computeVisualCoverage(input: CoverageInput, opts: VisualCoverageOptions = {}): CoverageInterval[] {
+  const captionInterval = (c: AICaption): CoverageInterval => {
+    const capMs = opts.maxCaptionCreditMs;
+    if (capMs != null && c.endMs - c.startMs > capMs) {
+      return { startMs: c.startMs, endMs: c.startMs + capMs, kind: "caption" as const };
+    }
+    return { startMs: c.startMs, endMs: c.endMs, kind: "caption" as const };
+  };
   const intervals: CoverageInterval[] = [
     ...input.broll.map((b) => ({ startMs: b.startMs, endMs: b.endMs, kind: "broll" as const })),
     ...input.zoom.map((z) => ({ startMs: z.startMs, endMs: z.endMs, kind: "zoom" as const })),
     ...input.stickers.map((s) => ({ startMs: s.startMs, endMs: s.endMs, kind: "sticker" as const })),
-    ...input.captions.map((c) => ({ startMs: c.startMs, endMs: c.endMs, kind: "caption" as const })),
+    ...input.captions.map(captionInterval),
   ];
   return intervals.slice().sort((a, b) => a.startMs - b.startMs);
 }
@@ -158,6 +183,39 @@ export function decideFixForGap(recentKinds: VisualCoverageFixKind[], durationMs
   return candidates[0]; // every candidate was recently used — fall back to the size-appropriate default anyway
 }
 
+// 2026-08-09 visual-pacing upgrade — the founder's real product
+// requirement was never "insert 2 b-roll clips when planning fails," it's
+// "maintain a ~2-3 second maximum visual dwell time." The bug this fixes:
+// findDeadScreenGaps returns ONE DeadScreenGap per contiguous uncovered
+// stretch however long it runs, and applyNoDeadScreenFixes used to create
+// exactly one fix spanning that gap's FULL duration — a real 5s gap
+// became one b-roll clip visibly on screen for the entire 5 seconds
+// (live-verified in production). This splits a long gap into several
+// sub-gaps, each capped at maxDwellMs, BEFORE the existing per-gap fix
+// loop ever runs — decideFixForGap's own rotation/alternation logic is
+// untouched, it simply now sees more, shorter gaps to alternate across.
+// Deterministic, pure, no LLM cost. Sub-gaps are sized evenly (not
+// jittered here) — pseudoVariance already varies each resulting fix's OWN
+// style/duration downstream (seeded on the sub-gap's own distinct
+// startMs), so consecutive slices still don't read as robotically
+// identical without risking a jittered slice ever exceeding maxDwellMs.
+export function subdivideGap(gap: DeadScreenGap, maxDwellMs: number): DeadScreenGap[] {
+  if (gap.durationMs <= maxDwellMs) return [gap];
+
+  const sliceCount = Math.ceil(gap.durationMs / maxDwellMs);
+  const subGaps: DeadScreenGap[] = [];
+  let cursor = gap.startMs;
+  for (let i = 1; i <= sliceCount; i++) {
+    // Cumulative rounding (not a fixed per-slice size) so rounding error
+    // never accumulates into drift — the last slice always lands exactly
+    // on the gap's real endMs.
+    const boundary = i === sliceCount ? gap.endMs : gap.startMs + Math.round((gap.durationMs * i) / sliceCount);
+    subGaps.push({ startMs: cursor, endMs: boundary, durationMs: boundary - cursor });
+    cursor = boundary;
+  }
+  return subGaps;
+}
+
 // TASK 5 — the auto-fixer's own zoom fix always uses the smallest, most
 // unobtrusive named style ("micro") — an automatic safety-net insert
 // should never be as visually loud as a deliberate, story-motivated zoom
@@ -226,7 +284,22 @@ export interface VisualQueryContext {
   visualContext?: { startMs: number; endMs: number; description: string }[];
   /** GPT-5's own REAL (non-auto-inserted) b-roll proposals elsewhere in this same plan. */
   existingBroll?: AIBroll[];
+  /**
+   * 2026-08-09 visual-pacing upgrade — the maximum continuous duration any
+   * ONE auto-inserted fix may span. A gap longer than this is subdivided
+   * (see subdivideGap) into several shorter fixes before this function's
+   * own per-fix loop runs, instead of one fix spanning the gap's entire
+   * duration. Defaults to DEFAULT_MAX_DWELL_MS when omitted.
+   */
+  maxDwellMs?: number;
 }
+
+// Admin-configurable via AI_EDIT_MAX_VISUAL_DWELL_MS (config.ts) — this is
+// only the FALLBACK used when a caller doesn't thread the real configured
+// value through (e.g. a test that isn't exercising this specific
+// behavior). Real callers (ai-edit-jobs.ts, director/orchestrator.ts)
+// always pass the actual configured value explicitly.
+export const DEFAULT_MAX_DWELL_MS = 2500;
 
 export interface VisualQueryCandidates {
   primary: string;
@@ -423,7 +496,15 @@ export function applyNoDeadScreenFixes(
   // deliberately separate from nextLedger's whole-job per-VALUE dedup.
   const recentKinds: VisualCoverageFixKind[] = [];
 
-  for (const gap of gaps) {
+  // 2026-08-09 — split any gap longer than maxDwellMs into several
+  // shorter sub-gaps BEFORE deciding fixes. `gapsFixed` below still
+  // reports the ORIGINAL gap count (how many dead-screen violations were
+  // addressed) — the total number of inserted events is broll.length +
+  // zoom.length + stickers.length, a different, already-derivable metric.
+  const maxDwellMs = context.maxDwellMs ?? DEFAULT_MAX_DWELL_MS;
+  const subdividedGaps = gaps.flatMap((gap) => subdivideGap(gap, maxDwellMs));
+
+  for (const gap of subdividedGaps) {
     const kind = decideFixForGap(recentKinds, gap.durationMs);
     recentKinds.push(kind);
     const reason = `Auto-inserted: ${(gap.durationMs / 1000).toFixed(1)}s of talking-head footage had no visual treatment (no-dead-screen rule).`;

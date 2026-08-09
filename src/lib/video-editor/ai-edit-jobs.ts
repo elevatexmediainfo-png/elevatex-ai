@@ -22,7 +22,15 @@ import { scoreAiTimelinePlan, AI_EDIT_QUALITY_RETRY_THRESHOLD } from "./ai-edit-
 import { runDirectorPipeline } from "./director/orchestrator";
 import { applyNoDeadScreenFixes, computeSourceSurvivingWindows, computeVisualCoverage, findDeadScreenGaps } from "./director/visual-coverage";
 import { createEmptyVarietyLedger } from "./director/variety-ledger";
-import { computeSpeechCharacteristics, computeFootageCharacteristics, computeAdaptiveDensityTargets, describeDensityGuidanceForPrompt, computeActualDensities, scoreDensityAlignment } from "./editing-density";
+import {
+  computeSpeechCharacteristics,
+  computeFootageCharacteristics,
+  computeAdaptiveDensityTargets,
+  computeDensityAwareMaxDwellMs,
+  describeDensityGuidanceForPrompt,
+  computeActualDensities,
+  scoreDensityAlignment,
+} from "./editing-density";
 import {
   aiTimelinePlanSchema,
   AI_TIMELINE_SCHEMA_VERSION,
@@ -694,8 +702,20 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     // free, zero-cost visual-coverage safety net every other job already
     // relies on.
     try {
+      // Visual-pacing upgrade (2026-08-09) — AI_EDIT_MAX_VISUAL_DWELL_MS is
+      // the admin-configured ceiling on how long any ONE auto-inserted fix
+      // may span (subdivideGap splits a longer gap into several shorter
+      // ones instead); computeDensityAwareMaxDwellMs may tighten it
+      // further for THIS specific video using the same adaptive
+      // editing-density targets already computed above, but never loosen
+      // it past the configured ceiling. The SAME value also caps how much
+      // continuous coverage CREDIT a single long caption can contribute
+      // (Option B, conservative) — a caption longer than this no longer
+      // fully suppresses dead-screen detection for its whole span.
+      const configuredMaxDwellMs = await getConfig("AI_EDIT_MAX_VISUAL_DWELL_MS");
+      const maxDwellMs = computeDensityAwareMaxDwellMs(adaptiveDensityTargets, configuredMaxDwellMs);
       const survivingWindows = computeSourceSurvivingWindows(sourceDurationMs, normalizeSceneRemovalWindows(sceneRemoval.map((r) => ({ startMs: r.startMs, endMs: r.endMs }))));
-      const coverage = computeVisualCoverage({ broll: brollProposals, zoom, stickers, captions });
+      const coverage = computeVisualCoverage({ broll: brollProposals, zoom, stickers, captions }, { maxCaptionCreditMs: maxDwellMs });
       const gapThresholdMs = await getConfig("AI_EDIT_NO_DEAD_SCREEN_GAP_THRESHOLD_MS");
       const gaps = findDeadScreenGaps(coverage, survivingWindows, gapThresholdMs);
       if (gaps.length > 0) {
@@ -708,11 +728,16 @@ export async function processAiEditJob(jobId: string): Promise<void> {
           words: transcript.words,
           visualContext: videoAnalysis?.visualContext,
           existingBroll: brollProposals,
+          maxDwellMs,
         });
         brollProposals = [...brollProposals, ...fixes.broll];
         zoom = [...zoom, ...fixes.zoom.map((z) => ({ ...z, clipId: AI_ZOOM_SOURCE_CLIP_PLACEHOLDER }))];
         stickers = [...stickers, ...fixes.stickers];
-        logger.info({ jobId, gapsFixed: gaps.length, hadPlanningError: planningError != null }, "[ai edit job] no-dead-screen pass filled uncovered talking-head stretches");
+        const insertedCount = fixes.broll.length + fixes.zoom.length + fixes.stickers.length;
+        logger.info(
+          { jobId, gapsFixed: gaps.length, visualEventsInserted: insertedCount, maxDwellMs, hadPlanningError: planningError != null },
+          "[ai edit job] no-dead-screen pass filled uncovered talking-head stretches"
+        );
       }
     } catch (err) {
       // Best-effort only — never fails the whole job over a purely

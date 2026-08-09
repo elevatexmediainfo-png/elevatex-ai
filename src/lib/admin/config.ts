@@ -1064,6 +1064,24 @@ export const CONFIG_REGISTRY = {
   // possible visual treatment") — tightened from 2000 to 1750 (the
   // midpoint of that exact 1.5-2s window) for genuinely tighter,
   // "micro-edited" pacing.
+  // Visual-pacing upgrade (2026-08-09) — the real product requirement is
+  // not "insert a couple of b-roll clips when planning fails," it's
+  // "maintain a ~2-3 second maximum visual dwell time" (~10-15 meaningful
+  // visual changes across a 30-40s video). This is the hard CEILING
+  // subdivideGap() (visual-coverage.ts) enforces on any single auto-
+  // inserted fix — a gap longer than this is split into several shorter
+  // fixes rather than one fix spanning the whole gap. Bounded so admin
+  // misconfiguration can't create an absurd result: below 1000ms would
+  // spam a new visual every second (nothing reads as intentional editing
+  // at that rate); above 5000ms stops meaningfully differing from
+  // AI_EDIT_NO_DEAD_SCREEN_GAP_THRESHOLD_MS's own upper bound.
+  AI_EDIT_MAX_VISUAL_DWELL_MS: {
+    schema: z.number().int().min(1000).max(5000),
+    default: 2500,
+    label: "Maximum visual dwell time (ms)",
+    description: "The longest any single auto-inserted b-roll/zoom/sticker/motion-graphic fix may span. A dead-screen gap longer than this is subdivided into several shorter fixes (alternating kind via the existing rotation logic) instead of one fix covering the whole gap — this is what actually achieves a ~2-3 second maximum visual dwell / ~10-15 visual changes per 30-40s video, rather than one long uncovered stretch getting a single oversized b-roll clip. May be further tightened (never loosened) per-video by the adaptive editing-density targets (editing-density.ts) — this value always remains the hard ceiling.",
+    category: "video_editor_policy",
+  },
   AI_EDIT_NO_DEAD_SCREEN_GAP_THRESHOLD_MS: {
     schema: z.number().int().min(500).max(10_000),
     default: 1750,

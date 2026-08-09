@@ -362,6 +362,24 @@ function rangeFit(value: number, range: DensityRange): number {
   return Math.max(0, 1 - (value - range.max) / Math.max(1, range.max));
 }
 
+// ===========================================================================
+// Step 6 — 2026-08-09 visual-pacing upgrade ("maintain a ~2-3 second
+// maximum visual dwell time"). AI_EDIT_MAX_VISUAL_DWELL_MS (config.ts) is
+// the admin-configured CEILING — visual-coverage.ts's subdivideGap() will
+// never let a generated event exceed it, full stop. This function only
+// ever TIGHTENS that ceiling further using this video's own adaptive
+// visual-density target (a slow/static video that already wants MORE
+// frequent visuals per describeDensityGuidanceForPrompt's own "genuine
+// visual every N seconds" language should also get a tighter, not looser,
+// dwell cap) — it can never loosen it, so the configured value always
+// remains the real upper bound regardless of this video's characteristics.
+// ===========================================================================
+
+export function computeDensityAwareMaxDwellMs(targets: AdaptiveDensityTargets, configuredMaxDwellMs: number): number {
+  const densityImpliedMs = Math.round(60_000 / Math.max(1, targets.adapted.visualPerMin.max));
+  return Math.min(configuredMaxDwellMs, densityImpliedMs);
+}
+
 export function scoreDensityAlignment(actual: ActualDensities, targets: AdaptiveDensityTargets): DensityAlignmentResult {
   const { adapted } = targets;
   const misalignments: string[] = [];

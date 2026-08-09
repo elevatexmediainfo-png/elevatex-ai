@@ -188,12 +188,12 @@ async function runAgentsInOrder(ctx: DirectorContext, agents: DirectorAgentId[])
 // Deterministic — no LLM call, safe to run after every regeneration that
 // touched broll/zoom/stickers/captions. See visual-coverage.ts for the
 // Phase-1-scope explanation (5 in-scope visual types only).
-function applyNoDeadScreenPass(ctx: DirectorContext, gapThresholdMs: number): DirectorContext {
+function applyNoDeadScreenPass(ctx: DirectorContext, gapThresholdMs: number, maxDwellMs: number): DirectorContext {
   const survivingWindows = computeSourceSurvivingWindows(
     ctx.speech.sourceDurationMs,
     normalizeSceneRemovalWindows(ctx.speech.sceneRemoval.map((r) => ({ startMs: r.startMs, endMs: r.endMs })))
   );
-  const coverage = computeVisualCoverage({ broll: ctx.broll, zoom: ctx.zoom, stickers: ctx.stickers, captions: ctx.captions });
+  const coverage = computeVisualCoverage({ broll: ctx.broll, zoom: ctx.zoom, stickers: ctx.stickers, captions: ctx.captions }, { maxCaptionCreditMs: maxDwellMs });
   const gaps = findDeadScreenGaps(coverage, survivingWindows, gapThresholdMs);
   if (gaps.length === 0) return ctx;
 
@@ -201,6 +201,7 @@ function applyNoDeadScreenPass(ctx: DirectorContext, gapThresholdMs: number): Di
     words: ctx.speech.words,
     visualContext: ctx.videoAnalysis?.visualContext,
     existingBroll: ctx.broll,
+    maxDwellMs,
   });
   return {
     ...ctx,
@@ -293,10 +294,21 @@ export interface RunDirectorPipelineInput {
 // BEST-SCORING attempt seen is kept and thresholdMet is stamped false —
 // never silently pretends to have hit the bar it didn't hit.
 export async function runDirectorPipeline(input: RunDirectorPipelineInput): Promise<DirectorPipelineResult> {
-  const [targetScore, maxIterations, gapThresholdMs, weights, sfxMaxPer10s] = await Promise.all([
+  const [targetScore, maxIterations, gapThresholdMs, maxDwellMs, weights, sfxMaxPer10s] = await Promise.all([
     getConfig("AI_EDIT_QUALITY_TARGET_SCORE"),
     getConfig("AI_EDIT_DIRECTOR_MAX_QUALITY_ITERATIONS"),
     getConfig("AI_EDIT_NO_DEAD_SCREEN_GAP_THRESHOLD_MS"),
+    // Visual-pacing upgrade (2026-08-09) — same configured ceiling the
+    // legacy path uses (see ai-edit-jobs.ts's own call site comment).
+    // Deliberately NOT density-tightened here the way the legacy path is
+    // — DirectorJobMeta only carries a precomputed prompt-guidance STRING
+    // (densityGuidance), not the full AdaptiveDensityTargets object, and
+    // adding that plumbing to this still-feature-flagged-OFF pipeline
+    // wasn't justified as part of this change's "smallest safe change"
+    // scope. The configured value alone is still a fully correct,
+    // real fix — a future pass can thread the adaptive numbers through if
+    // the Director pipeline is enabled for real use.
+    getConfig("AI_EDIT_MAX_VISUAL_DWELL_MS"),
     getConfig("AI_EDIT_QUALITY_CATEGORY_WEIGHTS"),
     getConfig("AI_EDIT_SFX_MAX_PER_10S"),
   ]);
@@ -325,7 +337,7 @@ export async function runDirectorPipeline(input: RunDirectorPipelineInput): Prom
   // same as a legacy planTimeline() failure) — there's no partial result
   // worth keeping when even the first pass never completed.
   ctx = await runAgentsInOrder(ctx, ["story", "captions", "visuals", "audio"]);
-  ctx = applyNoDeadScreenPass(ctx, gapThresholdMs);
+  ctx = applyNoDeadScreenPass(ctx, gapThresholdMs, maxDwellMs);
 
   const firstScoreOutcome = await scoreDirectorPlan(ctx, { targetScore, weights, sfxMaxPer10s, iterations: 1 });
   ctx = {
@@ -348,7 +360,7 @@ export async function runDirectorPipeline(input: RunDirectorPipelineInput): Prom
 
     try {
       ctx = await runAgentsInOrder(ctx, agentsToRerun);
-      ctx = applyNoDeadScreenPass(ctx, gapThresholdMs);
+      ctx = applyNoDeadScreenPass(ctx, gapThresholdMs, maxDwellMs);
       iteration++;
       const outcome = await scoreDirectorPlan(ctx, { targetScore, weights, sfxMaxPer10s, iterations: iteration });
       ctx = {

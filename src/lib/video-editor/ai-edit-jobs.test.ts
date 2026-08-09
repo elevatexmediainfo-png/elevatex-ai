@@ -96,17 +96,31 @@ const BASE_JOB = {
   script: null,
 };
 
-// TASK 12 (2026-08-07) — the caption here deliberately spans most of the
-// mocked asset's 10s duration (editorAssetFindFirstMock's durationSeconds:
-// 10 below), not just a token 500ms — scoreAiTimelinePlan's caption-
-// coverage heuristic would otherwise score this mock plan low enough to
-// trip the new quality-triggered retry (ai-edit-jobs.ts calling
-// planTimeline a SECOND time), which is real, correct, intentional
-// behavior for a genuinely thin plan but not what these module-selection
-// tests are about — they need planTimeline to be called exactly once.
+// TASK 12 (2026-08-07) — the captions here deliberately span nearly all of
+// the mocked asset's 10s duration (editorAssetFindFirstMock's
+// durationSeconds: 10 below), not just a token 500ms — scoreAiTimelinePlan's
+// caption-coverage heuristic would otherwise score this mock plan low
+// enough to trip the quality-triggered retry (ai-edit-jobs.ts calling
+// planTimeline a SECOND time), which is real, correct, intentional behavior
+// for a genuinely thin plan but not what these module-selection tests are
+// about — they need planTimeline to be called exactly once.
+//
+// Visual-pacing upgrade (2026-08-09) — deliberately 4 SHORT contiguous
+// captions (each <= the real AI_EDIT_MAX_VISUAL_DWELL_MS default of
+// 2500ms) rather than one long ~9500ms caption: Option B now caps how
+// much continuous coverage CREDIT any single long caption can provide, so
+// one giant caption would itself get flagged as a dead-screen gap past
+// its cap point — a real, intentional behavior change these tests aren't
+// about. Several short, individually-uncapped captions still add up to
+// the same full coverage these tests actually need.
 function mockFullPlanResult() {
   planTimelineMock.mockResolvedValue({
-    captions: [{ text: "hi there this is a great test", startMs: 0, endMs: 9500 }],
+    captions: [
+      { text: "hi there this is a great test", startMs: 0, endMs: 2375 },
+      { text: "hi there this is a great test", startMs: 2375, endMs: 4750 },
+      { text: "hi there this is a great test", startMs: 4750, endMs: 7125 },
+      { text: "hi there this is a great test", startMs: 7125, endMs: 9500 },
+    ],
     zoom: [{ startMs: 0, endMs: 500, scaleFrom: 100, scaleTo: 120 }],
     broll: [{ startMs: 0, endMs: 500, trackHint: "broll", source: "stock", searchQuery: "office" }],
     stickers: [{ startMs: 0, endMs: 500, assetQuery: "smile" }],
@@ -130,7 +144,24 @@ beforeEach(() => {
   // Director pipeline instead. Every OTHER config key keeps the
   // pre-existing blanket 700 default — none of these tests care about
   // its exact value beyond "some plausible number."
-  getConfigMock.mockImplementation((key: string) => Promise.resolve(key === "AI_EDIT_DIRECTOR_PIPELINE_ENABLED" ? false : 700));
+  //
+  // Visual-pacing upgrade (2026-08-09) — the 2 dwell-related keys are
+  // pinned to their REAL admin-config defaults (not the blanket 700)
+  // specifically because 700ms is smaller than any realistic caption
+  // chunk used by these fixtures, which would trigger caption-coverage
+  // capping (Option B) far more aggressively than real production ever
+  // would and break fixtures that have nothing to do with this behavior.
+  getConfigMock.mockImplementation((key: string) =>
+    Promise.resolve(
+      key === "AI_EDIT_DIRECTOR_PIPELINE_ENABLED"
+        ? false
+        : key === "AI_EDIT_NO_DEAD_SCREEN_GAP_THRESHOLD_MS"
+          ? 1750
+          : key === "AI_EDIT_MAX_VISUAL_DWELL_MS"
+            ? 2500
+            : 700
+    )
+  );
   proposeSceneRemovalsMock.mockReturnValue([{ startMs: 0, endMs: 200, reason: "silence" }]);
   mergeSceneRemovalCandidatesMock.mockReturnValue([{ startMs: 0, endMs: 200, reason: "silence" }]);
   resolveTimelinePlanAssetsMock.mockResolvedValue({ stickers: [], music: undefined, sfx: [] });
@@ -162,8 +193,8 @@ describe("processAiEditJob — module selection", () => {
     expect(resolveTimelinePlanAssetsMock).toHaveBeenCalledTimes(1);
     const savedPlan = aiEditJobUpdateMock.mock.calls[0][0].data.timelinePlan;
     expect(savedPlan.sceneRemoval).toHaveLength(1);
-    expect(savedPlan.captions).toHaveLength(1);
-    expect(savedPlan.zoom).toHaveLength(1);
+    expect(savedPlan.captions).toHaveLength(4); // mockFullPlanResult's 4 short contiguous captions (see its own doc comment)
+    expect(savedPlan.zoom).toHaveLength(1); // fully covered by captions — no dead-screen gap, no auto-fix added
     expect(savedPlan.transitions).toHaveLength(1);
   });
 
@@ -184,7 +215,7 @@ describe("processAiEditJob — module selection", () => {
 
     const savedPlan = aiEditJobUpdateMock.mock.calls[0][0].data.timelinePlan;
     expect(savedPlan.sceneRemoval).toEqual([]);
-    expect(savedPlan.captions).toHaveLength(1);
+    expect(savedPlan.captions).toHaveLength(4); // mockFullPlanResult's 4 short contiguous captions (see its own doc comment)
     expect(savedPlan.zoom).toEqual([]);
     expect(savedPlan.broll).toEqual([]);
     expect(savedPlan.stickers).toEqual([]);
@@ -312,13 +343,75 @@ describe("processAiEditJob — quality-triggered retry", () => {
     expect(savedData.planningError).toContain("ANY creative timeline content");
     expect(savedData.planningError).toContain("Timed out after 60000ms");
 
+    // Test 4 (visual-pacing upgrade, 2026-08-09) — a total planning
+    // failure must produce MULTIPLE visual interventions (subdivideGap
+    // splits the one huge uncovered stretch into several sub-gaps), never
+    // just the old 1-2-clip fallback.
     const autoInsertedCount = savedPlan.broll.length + savedPlan.zoom.length + savedPlan.stickers.length;
-    expect(autoInsertedCount).toBeGreaterThan(0);
+    expect(autoInsertedCount).toBeGreaterThan(2);
     const anyAutoInserted =
       savedPlan.broll.some((b: { autoInserted?: boolean }) => b.autoInserted) ||
       savedPlan.zoom.some((z: { reason?: string }) => z.reason?.includes("no-dead-screen")) ||
       savedPlan.stickers.some((s: { reason?: string }) => s.reason?.includes("no-dead-screen"));
     expect(anyAutoInserted).toBe(true);
+  });
+
+  // Test 6 (visual-pacing upgrade, 2026-08-09) — a genuinely successful
+  // GPT plan (2 real, SHORT captions bookending one clean internal gap)
+  // must get that gap cleanly subdivided WITHOUT disturbing GPT's own
+  // real content, and without spamming excessive/duplicate fixes on top
+  // of what GPT already covered. Both captions are deliberately <= the
+  // real AI_EDIT_MAX_VISUAL_DWELL_MS default (2500ms) so neither is
+  // itself subject to Option B's caption-coverage cap — that behavior has
+  // its own dedicated tests in visual-coverage.test.ts; this test isolates
+  // subdivision specifically.
+  it("a normal successful GPT plan with one real internal gap gets clean subdivided fill-in, without disturbing GPT's own real items", async () => {
+    aiEditJobFindUniqueMock.mockResolvedValue({ ...BASE_JOB, selectedModules: null });
+    editorAssetFindFirstMock.mockResolvedValue({ id: "asset_1", status: "READY", kind: "AUDIO", durationSeconds: 20, storageKey: "k" });
+    planTimelineMock.mockResolvedValue({
+      captions: [
+        { text: "a solid opening line", startMs: 0, endMs: 2000 },
+        { text: "a solid closing line", startMs: 18_000, endMs: 20_000 }, // real 16s internal gap: 2000-18000
+      ],
+      zoom: [],
+      broll: [],
+      stickers: [],
+      sfx: [],
+      transitions: [],
+      costUsd: 0.03,
+    });
+    resolveBrollItemsMock.mockImplementation((items: unknown[]) => Promise.resolve(items));
+    // Override the file-wide "always resolves empty stickers" default —
+    // otherwise any auto-fixed STICKER events would be silently dropped
+    // before this test could count them, undercounting the real
+    // subdivision output for a reason unrelated to what's under test here.
+    resolveTimelinePlanAssetsMock.mockImplementation((plan: { stickers: unknown[]; music: unknown; sfx: unknown[] }) => Promise.resolve(plan));
+
+    await processAiEditJob("job_1");
+
+    const savedPlan = aiEditJobUpdateMock.mock.calls[0][0].data.timelinePlan;
+    // GPT's own 2 real captions are completely untouched.
+    expect(savedPlan.captions).toHaveLength(2);
+    expect(savedPlan.captions[0].text).toBe("a solid opening line");
+    expect(savedPlan.captions[1].text).toBe("a solid closing line");
+
+    // The real 16s internal gap gets filled with MULTIPLE subdivided
+    // auto-fixes (max dwell 2500ms -> ceil(16000/2500) = 7 slices), not
+    // one giant fix spanning the whole stretch.
+    const autoInsertedBroll = savedPlan.broll.filter((b: { autoInserted?: boolean }) => b.autoInserted);
+    const autoInsertedZoom = savedPlan.zoom.filter((z: { reason?: string }) => z.reason?.includes("no-dead-screen"));
+    const autoInsertedStickers = savedPlan.stickers.filter((s: { reason?: string }) => s.reason?.includes("no-dead-screen"));
+    const totalAutoInserted = autoInsertedBroll.length + autoInsertedZoom.length + autoInsertedStickers.length;
+    expect(totalAutoInserted).toBe(7);
+
+    // No auto-fix overlaps the real GPT-covered spans (0-2000, 18000-20000),
+    // and none exceeds the configured max dwell (2500ms).
+    const allAutoFixed = [...autoInsertedBroll, ...autoInsertedZoom, ...autoInsertedStickers] as { startMs: number; endMs: number }[];
+    for (const fix of allAutoFixed) {
+      const overlapsRealCoverage = fix.startMs < 2000 || fix.endMs > 18_000;
+      expect(overlapsRealCoverage).toBe(false);
+      expect(fix.endMs - fix.startMs).toBeLessThanOrEqual(2500);
+    }
   });
 });
 
@@ -399,8 +492,11 @@ describe("processAiEditJob — AI Video Director pipeline (flag on)", () => {
 
     const savedPlan = aiEditJobUpdateMock.mock.calls[0][0].data.timelinePlan;
     expect(savedPlan.captions).toEqual([]); // genuinely no captions — GPT never ran
+    // Test 4 (visual-pacing upgrade, 2026-08-09) — same requirement as the
+    // legacy path's own version of this test: multiple visual
+    // interventions, never just the old 1-2-clip fallback.
     const autoInsertedCount = savedPlan.broll.length + savedPlan.zoom.length + savedPlan.stickers.length;
-    expect(autoInsertedCount).toBeGreaterThan(0);
+    expect(autoInsertedCount).toBeGreaterThan(2);
     const anyAutoInserted =
       savedPlan.broll.some((b: { autoInserted?: boolean }) => b.autoInserted) ||
       savedPlan.zoom.some((z: { reason?: string }) => z.reason?.includes("no-dead-screen")) ||
