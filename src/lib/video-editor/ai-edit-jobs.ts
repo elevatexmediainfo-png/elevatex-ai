@@ -514,8 +514,12 @@ export async function processAiEditJob(jobId: string): Promise<void> {
             "[ai edit job] director pipeline planning complete"
           );
         } catch (err) {
-          planningError = err instanceof Error ? err.message : "AI Video Director timeline planning failed.";
-          logger.error({ err, jobId }, "[ai edit job] director pipeline planning failed — continuing with sceneRemoval only");
+          // Production fix (2026-08-08) — same clarity fix as the legacy
+          // path's own catch below: distinguishes a TOTAL failure (nothing
+          // creative generated at all) from the partial-degradation
+          // message above (some items dropped, most still applied).
+          planningError = `The AI Video Director failed to generate ANY creative timeline content (captions, b-roll, zoom, stickers, music, sfx, transitions) for this video: ${err instanceof Error ? err.message : "unknown error"}. Only scene removal (computed independently, before this step) succeeded.`;
+          logger.error({ err, jobId }, "[ai edit job] director pipeline planning failed completely — continuing with sceneRemoval only, no creative content generated");
         }
       } else {
       const repairMaxAttempts = await getConfig("AI_EDIT_REASONING_REPAIR_MAX_ATTEMPTS");
@@ -651,55 +655,70 @@ export async function processAiEditJob(jobId: string): Promise<void> {
           "[ai edit job] final selected plan's editing-density alignment"
         );
 
-        // Quality-calibration pass (2026-08-07, live human-editor review) —
-        // this deterministic "no dead screen" gap-fixer (visual-coverage.ts)
-        // was built for the Director pipeline's own scoring loop
-        // (runDirectorPipeline above) but, since
-        // AI_EDIT_DIRECTOR_PIPELINE_ENABLED defaults off, was never
-        // actually reachable in production — the legacy path (this one,
-        // the one real users hit) never ran it at all. It costs nothing
-        // extra to run here: zero LLM calls, pure post-processing over
-        // data this scope already has. A real live pipeline run + rendered-
-        // video review confirmed the gap directly: a 38.4s talking-head
-        // video with only 2 zoom/broll items across its surviving timeline
-        // left multi-second stretches with no visual treatment at all.
-        try {
-          const survivingWindows = computeSourceSurvivingWindows(sourceDurationMs, normalizeSceneRemovalWindows(sceneRemoval.map((r) => ({ startMs: r.startMs, endMs: r.endMs }))));
-          const coverage = computeVisualCoverage({ broll: brollProposals, zoom, stickers, captions });
-          const gapThresholdMs = await getConfig("AI_EDIT_NO_DEAD_SCREEN_GAP_THRESHOLD_MS");
-          const gaps = findDeadScreenGaps(coverage, survivingWindows, gapThresholdMs);
-          if (gaps.length > 0) {
-            // Production fix (2026-08-08) — real visual-concept signals for
-            // the auto-fixer's own query builder (see deriveFixSearchQuery's
-            // own doc comment in visual-coverage.ts): GPT-5's real b-roll
-            // proposals, Gemini's real scene descriptions, and the real
-            // transcript words, all already in scope here, zero new calls.
-            const fixes = applyNoDeadScreenFixes(gaps, captions, createEmptyVarietyLedger(), {
-              words: transcript.words,
-              visualContext: videoAnalysis?.visualContext,
-              existingBroll: brollProposals,
-            });
-            brollProposals = [...brollProposals, ...fixes.broll];
-            zoom = [...zoom, ...fixes.zoom.map((z) => ({ ...z, clipId: AI_ZOOM_SOURCE_CLIP_PLACEHOLDER }))];
-            stickers = [...stickers, ...fixes.stickers];
-            logger.info({ jobId, gapsFixed: gaps.length }, "[ai edit job] no-dead-screen pass filled uncovered talking-head stretches");
-          }
-        } catch (err) {
-          // Best-effort only — never fails the whole job over a purely
-          // additive polish pass; the plan without these extra fixes is
-          // still fully valid and usable.
-          logger.warn({ err, jobId }, "[ai edit job] no-dead-screen pass failed — continuing without it");
-        }
-
         if (best.warnings && best.warnings.length > 0) {
           planningError = `Some items in the AI's plan were invalid and were skipped, everything else still applied: ${best.warnings.join(" ")}`;
           logger.warn({ jobId, warnings: best.warnings }, "[ai edit job] timeline planning partially degraded — some items dropped, continuing with the rest");
         }
       } catch (err) {
-        planningError = err instanceof Error ? err.message : "Timeline planning (captions/zoom/broll/stickers/music/sfx/transitions) failed.";
-        logger.error({ err, jobId }, "[ai edit job] timeline planning failed — continuing with sceneRemoval only");
+        // Production fix (2026-08-08) — "B-roll still not appearing" traced
+        // to exactly this catch: when plan_timeline fails ENTIRELY (e.g.
+        // every configured REASONING provider times out, with no fallback
+        // provider configured), captions/zoom/brollProposals/stickers/
+        // music/sfx/transitions all stay at their empty defaults — real
+        // evidence from a live-reproduced job confirmed timelinePlan.broll
+        // === 0, not degraded, literally zero. The message now says so
+        // explicitly (distinct from the partial-degradation message above,
+        // which lists SOME valid items alongside the dropped ones) so the
+        // UI's "AI planning note" doesn't read as just "some items were
+        // skipped" when actually NOTHING creative was ever generated.
+        planningError = `GPT-5 failed to generate ANY creative timeline content (captions, b-roll, zoom, stickers, music, sfx, transitions) for this video: ${err instanceof Error ? err.message : "unknown error"}. Only scene removal (computed independently, before this step) succeeded.`;
+        logger.error({ err, jobId }, "[ai edit job] timeline planning failed completely — continuing with sceneRemoval only, no creative content generated");
       }
       }
+    }
+
+    // Quality-calibration pass (2026-08-07, live human-editor review;
+    // moved outside the try/catch above 2026-08-08 — see that catch's own
+    // comment) — this deterministic "no dead screen" gap-fixer
+    // (visual-coverage.ts) must run regardless of whether plan_timeline
+    // (Director or legacy) succeeded, partially degraded, or failed
+    // entirely: it costs zero LLM calls and operates on whatever
+    // captions/zoom/broll/stickers actually exist at this point, even if
+    // that's nothing at all. Real production bug this fixes: a total
+    // plan_timeline failure used to skip this pass along with everything
+    // else (it lived inside the same try block that threw), silently
+    // leaving a fully-empty creative plan with no fallback b-roll
+    // whatsoever — live-reproduced and confirmed via a real job's
+    // persisted timelinePlan.broll === 0 (not degraded, zero). Placing it
+    // here means even a hard reasoning-provider failure still gets the
+    // free, zero-cost visual-coverage safety net every other job already
+    // relies on.
+    try {
+      const survivingWindows = computeSourceSurvivingWindows(sourceDurationMs, normalizeSceneRemovalWindows(sceneRemoval.map((r) => ({ startMs: r.startMs, endMs: r.endMs }))));
+      const coverage = computeVisualCoverage({ broll: brollProposals, zoom, stickers, captions });
+      const gapThresholdMs = await getConfig("AI_EDIT_NO_DEAD_SCREEN_GAP_THRESHOLD_MS");
+      const gaps = findDeadScreenGaps(coverage, survivingWindows, gapThresholdMs);
+      if (gaps.length > 0) {
+        // Production fix (2026-08-08) — real visual-concept signals for
+        // the auto-fixer's own query builder (see deriveFixSearchQuery's
+        // own doc comment in visual-coverage.ts): GPT-5's real b-roll
+        // proposals, Gemini's real scene descriptions, and the real
+        // transcript words, all already in scope here, zero new calls.
+        const fixes = applyNoDeadScreenFixes(gaps, captions, createEmptyVarietyLedger(), {
+          words: transcript.words,
+          visualContext: videoAnalysis?.visualContext,
+          existingBroll: brollProposals,
+        });
+        brollProposals = [...brollProposals, ...fixes.broll];
+        zoom = [...zoom, ...fixes.zoom.map((z) => ({ ...z, clipId: AI_ZOOM_SOURCE_CLIP_PLACEHOLDER }))];
+        stickers = [...stickers, ...fixes.stickers];
+        logger.info({ jobId, gapsFixed: gaps.length, hadPlanningError: planningError != null }, "[ai edit job] no-dead-screen pass filled uncovered talking-head stretches");
+      }
+    } catch (err) {
+      // Best-effort only — never fails the whole job over a purely
+      // additive polish pass; the plan without these extra fixes is
+      // still fully valid and usable.
+      logger.warn({ err, jobId }, "[ai edit job] no-dead-screen pass failed — continuing without it");
     }
 
     // Phase 12 Module 5/6 — resolve every proposed asset-needing slot

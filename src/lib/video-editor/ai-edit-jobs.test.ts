@@ -280,6 +280,46 @@ describe("processAiEditJob — quality-triggered retry", () => {
     // fatal to an already-successful first attempt.
     expect(aiEditJobUpdateMock).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "READY_FOR_REVIEW" }) }));
   });
+
+  // Production fix (2026-08-08, "B-roll still not appearing") — the real
+  // production case this whole investigation traced: planTimeline fails
+  // COMPLETELY (e.g. every configured REASONING provider times out, no
+  // fallback provider) — not a low-score retry, the very first attempt
+  // itself throws. Live-reproduced and confirmed via a real job's
+  // persisted timelinePlan.broll === 0 (not degraded — literally zero,
+  // and the no-dead-screen fallback never ran either, since it used to
+  // live inside the same try block that threw). This proves both halves
+  // of the fix: (1) the job still reaches READY_FOR_REVIEW with an
+  // unambiguous "generated ZERO creative content" planningError rather
+  // than a generic one, and (2) the no-dead-screen pass now runs anyway
+  // and fills in real fallback b-roll/zoom/stickers despite zero GPT
+  // output.
+  it("a TOTAL planTimeline failure (both attempts) still gets the no-dead-screen fallback, with an unambiguous planningError", async () => {
+    aiEditJobFindUniqueMock.mockResolvedValue({ ...BASE_JOB, selectedModules: null });
+    planTimelineMock.mockRejectedValue(new Error('All REASONING providers failed for "plan_timeline": gpt5 (2 attempt(s): Timed out after 60000ms)'));
+    // Override the file-wide "always resolves empty" default just for this
+    // test — the auto-fixer's own OUTPUT is what's under test here, not
+    // stock resolution (which has its own dedicated test suite).
+    resolveBrollItemsMock.mockImplementation((items: unknown[]) => Promise.resolve(items));
+
+    await processAiEditJob("job_1");
+
+    expect(aiEditJobUpdateMock).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "READY_FOR_REVIEW" }) }));
+    const savedData = aiEditJobUpdateMock.mock.calls[0][0].data;
+    const savedPlan = savedData.timelinePlan;
+
+    expect(savedPlan.captions).toEqual([]); // genuinely no captions — GPT never returned
+    expect(savedData.planningError).toContain("ANY creative timeline content");
+    expect(savedData.planningError).toContain("Timed out after 60000ms");
+
+    const autoInsertedCount = savedPlan.broll.length + savedPlan.zoom.length + savedPlan.stickers.length;
+    expect(autoInsertedCount).toBeGreaterThan(0);
+    const anyAutoInserted =
+      savedPlan.broll.some((b: { autoInserted?: boolean }) => b.autoInserted) ||
+      savedPlan.zoom.some((z: { reason?: string }) => z.reason?.includes("no-dead-screen")) ||
+      savedPlan.stickers.some((s: { reason?: string }) => s.reason?.includes("no-dead-screen"));
+    expect(anyAutoInserted).toBe(true);
+  });
 });
 
 // AI Video Director (2026-08-07) — the integration point itself: does
@@ -341,5 +381,30 @@ describe("processAiEditJob — AI Video Director pipeline (flag on)", () => {
     expect(aiEditJobUpdateMock).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "READY_FOR_REVIEW" }) }));
     const savedPlan = aiEditJobUpdateMock.mock.calls[0][0].data.timelinePlan;
     expect(savedPlan.captions).toEqual([]);
+  });
+
+  // Production fix (2026-08-08, "B-roll still not appearing") — real bug,
+  // live-reproduced: a TOTAL Director pipeline failure used to skip the
+  // deterministic no-dead-screen auto-fixer entirely (it lived inside the
+  // same try block that threw), leaving timelinePlan.broll/zoom/stickers
+  // all genuinely empty with zero fallback. It's now moved to run
+  // unconditionally after the Director/legacy branch, regardless of
+  // success or failure.
+  it("a TOTAL Director pipeline failure still gets the no-dead-screen fallback — b-roll is not silently zero", async () => {
+    aiEditJobFindUniqueMock.mockResolvedValue({ ...BASE_JOB, selectedModules: null });
+    runDirectorPipelineMock.mockRejectedValue(new Error("director pipeline blew up"));
+    resolveBrollItemsMock.mockImplementation((items: unknown[]) => Promise.resolve(items));
+
+    await processAiEditJob("job_1");
+
+    const savedPlan = aiEditJobUpdateMock.mock.calls[0][0].data.timelinePlan;
+    expect(savedPlan.captions).toEqual([]); // genuinely no captions — GPT never ran
+    const autoInsertedCount = savedPlan.broll.length + savedPlan.zoom.length + savedPlan.stickers.length;
+    expect(autoInsertedCount).toBeGreaterThan(0);
+    const anyAutoInserted =
+      savedPlan.broll.some((b: { autoInserted?: boolean }) => b.autoInserted) ||
+      savedPlan.zoom.some((z: { reason?: string }) => z.reason?.includes("no-dead-screen")) ||
+      savedPlan.stickers.some((s: { reason?: string }) => s.reason?.includes("no-dead-screen"));
+    expect(anyAutoInserted).toBe(true);
   });
 });
