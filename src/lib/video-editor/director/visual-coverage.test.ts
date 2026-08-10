@@ -183,6 +183,30 @@ describe("deriveFixSearchQuery", () => {
     expect(again.alternatives).toEqual(result.alternatives); // deterministic, not random
   });
 
+  // Candidate 1 (2026-08-11) — real production regression: "Doctor seated
+  // at clinic desk speaking" (rule 4) only ever had genericAlternates()'s
+  // cross-topic vocabulary available, whose single closest word
+  // ("healthcare") scored 0.4 against a real stock candidate — below the
+  // 0.5 confidence threshold. Rule 4 now checks its own (untruncated)
+  // description text against the SAME HINGLISH_VISUAL_CONCEPT_MAP rule 2
+  // already uses, and prefers a confidently-detected domain's own richer
+  // vocabulary over the generic rotation. The PRIMARY is untouched — this
+  // is Tests 1 and 2 together, since both facts come from the same call.
+  it("rule 4 — a medical scene keeps its primary unchanged and prefers HEALTH-specific alternatives over the generic list", () => {
+    const captions = [caption("Paise Bachao", 3000, 6500)]; // irrelevant — would otherwise map to MONEY_CONCEPTS via rule 2
+    const visualContext = [{ startMs: 4500, endMs: 5500, description: "Doctor seated at clinic desk speaking to a patient calmly." }];
+    const result = deriveFixSearchQuery(gap, captions, { visualContext });
+
+    // Test 1 — primary is EXACTLY the same literal 6-word truncation as before this fix.
+    expect(result.primary).toBe("Doctor seated at clinic desk speaking");
+    // Test 2 — alternatives now come from HEALTH_CONCEPTS, never the generic list.
+    expect(result.alternatives.length).toBeGreaterThan(0);
+    for (const alt of result.alternatives) {
+      expect(["doctor", "healthy lifestyle", "exercise", "hospital", "medical"]).toContain(alt);
+    }
+    expect(result.alternatives).not.toContain(result.primary);
+  });
+
   it("rule 3 — prefers literal English words spoken inline near the gap (Devanagari transcript, Latin-script token)", () => {
     const captions = [caption("Aapke Ghar Tak", 3000, 6500)]; // would otherwise map to HOME_CONCEPTS
     const words = [
@@ -214,6 +238,38 @@ describe("deriveFixSearchQuery", () => {
     expect(result.alternatives).not.toContain(result.primary);
   });
 
+  // Candidate 1, Test 3 — rule 3's own literal transcript snippet gets the
+  // same domain-classification treatment as rule 4, using its own source
+  // text (the nearby English words, not just the 5-word primary slice).
+  it("rule 3 — receives domain-specific alternatives when its own source text clearly names a domain", () => {
+    const words = [
+      { word: "हम", startMs: 4200, endMs: 4400 },
+      { word: "house", startMs: 4400, endMs: 4900 },
+      { word: "construction", startMs: 4900, endMs: 5300 },
+    ];
+    const result = deriveFixSearchQuery(gap, [], { words });
+
+    expect(result.primary).toBe("house construction");
+    expect(result.alternatives.length).toBeGreaterThan(0);
+    for (const alt of result.alternatives) {
+      expect(["house construction", "home interior", "family home", "construction worker", "new house"]).toContain(alt);
+    }
+    expect(result.alternatives).not.toContain(result.primary);
+  });
+
+  // Candidate 1, Test 4 — a scene with no detectable domain keyword must
+  // still fall back to the existing genericAlternates() behavior exactly
+  // as before this fix (not fail, not return an empty list).
+  it("rule 4 — a scene with no detectable domain still falls back to genericAlternates()", () => {
+    const visualContext = [{ startMs: 4500, endMs: 5500, description: "A man sits at a wooden desk reviewing paperwork." }];
+    const result = deriveFixSearchQuery(gap, [], { visualContext });
+
+    expect(result.primary.toLowerCase()).toContain("wooden");
+    for (const alt of result.alternatives) {
+      expect(["office work", "business people", "healthcare", "education", "technology", "finance", "construction", "nature", "city", "family"]).toContain(alt);
+    }
+  });
+
   it("rule 3 — ignores common English function words even if pure-Latin-script", () => {
     const captions: ReturnType<typeof caption>[] = [];
     const words = [
@@ -224,6 +280,31 @@ describe("deriveFixSearchQuery", () => {
     const result = deriveFixSearchQuery(gap, captions, { words });
     // No real content word found -> falls all the way through to the generic fallback.
     expect(["office work", "business people", "healthcare", "education", "technology", "finance", "construction", "nature", "city", "family"]).toContain(result.primary);
+  });
+
+  // Review finding (2026-08-11) — extending HINGLISH_VISUAL_CONCEPT_MAP for
+  // rules 3/4 (Candidate 1) also changes rule 2's OWN output for any
+  // caption whose nearest text contains one of the newly-added English
+  // keys, since rule 2 reads the exact same map. A real, pre-existing test
+  // ("produces one tagged, autoInserted item per gap...", below in the
+  // applyNoDeadScreenFixes suite) already uses the caption "a doctor
+  // talking about diabetes" — before this fix, "doctor" matched nothing,
+  // so it fell through to rule 6's generic fallback (deterministically
+  // "office work" for that test's gap.startMs=0); after this fix, "doctor"
+  // now matches HEALTH_CONCEPTS via rule 2, same as any other caption
+  // keyword. That existing test's own assertions are loose (`toBeTruthy()`)
+  // and don't pin the literal value, so it kept passing without ever
+  // proving which behavior was actually in effect. This is an intentional,
+  // correct consequence of Candidate 1 (a caption naming "doctor" SHOULD
+  // resolve to a real health concept instead of a random generic word) —
+  // not a regression — but it was previously unverified. Locking it in
+  // explicitly here.
+  it("rule 2 — a caption containing one of the newly-added English domain keywords now matches instead of falling through to rule 6", () => {
+    const captions = [caption("a doctor talking about diabetes", 0, 1000)];
+    const result = deriveFixSearchQuery({ startMs: 0, endMs: 5000, durationMs: 5000 }, captions);
+
+    expect(result.primary).toBe("doctor");
+    expect(result.alternatives).toEqual(["healthy lifestyle", "exercise", "hospital", "medical"]);
   });
 
   it("rule 2 — infers a visual concept from Hinglish caption text, exactly the real production example", () => {
@@ -254,6 +335,20 @@ describe("deriveFixSearchQuery", () => {
     const result = deriveFixSearchQuery(gap, captions);
     expect(result.primary).toBe("office");
     expect(result.alternatives).toContain("teamwork");
+  });
+
+  // Candidate 1, Test 5 — the new English keywords added to
+  // HINGLISH_VISUAL_CONCEPT_MAP for rules 3/4 must not change rule 2's own
+  // existing, already-tested behavior. Re-asserts the exact same known
+  // outputs as the four rule 2 tests above, unchanged.
+  it("rule 2 — existing behavior is byte-identical after extending the concept map for rules 3/4", () => {
+    expect(deriveFixSearchQuery(gap, [caption("Aapke Ghar Tak", 3000, 6500)])).toEqual({
+      primary: "house construction",
+      alternatives: ["home interior", "family home", "construction worker", "new house"],
+    });
+    expect(deriveFixSearchQuery(gap, [caption("Paise Bachao", 3000, 6500)]).primary).toBe("money");
+    expect(deriveFixSearchQuery(gap, [caption("Healthy Rahna", 3000, 6500)]).primary).toBe("doctor");
+    expect(deriveFixSearchQuery(gap, [caption("Business Grow", 3000, 6500)]).primary).toBe("office");
   });
 
   it("rule 6 — falls back to a deterministic generic editorial query when nothing maps, never the literal words", () => {
@@ -329,6 +424,78 @@ describe("applyNoDeadScreenFixes", () => {
     for (const alt of result.broll[0].searchQueries!) {
       expect(["office work", "business people", "healthcare", "education", "technology", "finance", "construction", "nature", "city", "family"]).toContain(alt);
     }
+  });
+
+  // Candidate 2 (2026-08-11) — real production regression: subdivideGap()
+  // correctly splits one long dead-screen stretch into several sub-gaps,
+  // but each sub-gap independently re-derives its own query from the same
+  // sparse signal — for a single-setting video, that meant every sub-gap
+  // showing the IDENTICAL literal "Doctor seated at clinic desk speaking"
+  // query. Tests 6, 7, and 9 together: the repeat is detected via the
+  // SAME ledger.brollStyles history this function already threads through
+  // the loop, and the second sub-gap is swapped to a genuinely unused,
+  // still-relevant HEALTH alternative rather than repeating the primary.
+  it("a repeated rule 4 query across two sub-gaps is detected via the ledger and swapped to an unused HEALTH alternative", () => {
+    const gaps = [
+      { startMs: 0, endMs: 5000, durationMs: 5000 },
+      { startMs: 6000, endMs: 11_000, durationMs: 5000 },
+    ];
+    const visualContext = [{ startMs: 0, endMs: 11_000, description: "Doctor seated at clinic desk speaking to a patient calmly." }];
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger(), { visualContext, maxDwellMs: 6000 });
+
+    expect(result.broll).toHaveLength(2);
+    // First sub-gap keeps the real derived primary — nothing to avoid yet.
+    expect(result.broll[0].searchQuery).toBe("Doctor seated at clinic desk speaking");
+    // Second sub-gap does NOT repeat it — a real, still-relevant HEALTH
+    // concept was available and unused, so it wins instead (Test 9: never
+    // select an already-used option while an unused valid one exists).
+    expect(result.broll[1].searchQuery).not.toBe(result.broll[0].searchQuery);
+    expect(["doctor", "healthy lifestyle", "exercise", "hospital", "medical"]).toContain(result.broll[1].searchQuery);
+    // Both choices are genuinely recorded in the ledger this same call threads through.
+    expect(result.ledger.brollStyles).toContain(result.broll[0].searchQuery);
+    expect(result.ledger.brollStyles).toContain(result.broll[1].searchQuery);
+  });
+
+  // The founder's own explicit "7 sub-gaps" example. Deliberately does NOT
+  // hardcode the exact kind-rotation sequence decideFixForGap produces
+  // (unrelated to this fix, and untouched by it) — instead asserts the
+  // property that actually matters: every broll-array query is drawn from
+  // the REAL known vocabulary (the derived primary + the real HEALTH_CONCEPTS
+  // words), no two repeat unnecessarily while an unused option remains, and
+  // once the real vocabulary (6 total: 1 primary + 5 concepts) is
+  // genuinely exhausted, a repeat is allowed rather than fabricating a
+  // 7th "fake" variant — "avoid unnecessary duplicates, don't manufacture
+  // fake variety" per the founder's own explicit instruction.
+  it("7 sub-gaps from one original dead-screen stretch get real variety, never manufacturing more than the real vocabulary supports", () => {
+    const gaps = Array.from({ length: 7 }, (_, i) => ({ startMs: i * 2500, endMs: i * 2500 + 2500, durationMs: 2500 }));
+    const visualContext = [{ startMs: 0, endMs: 17_500, description: "Doctor seated at clinic desk speaking to a patient calmly." }];
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger(), { visualContext, maxDwellMs: 6000 });
+
+    const queries = result.broll.map((b) => b.searchQuery!);
+    expect(queries.length).toBeGreaterThan(0);
+    const knownVocabulary = ["Doctor seated at clinic desk speaking", "doctor", "healthy lifestyle", "exercise", "hospital", "medical"];
+    for (const q of queries) expect(knownVocabulary).toContain(q); // never a fabricated string
+    // No more duplication than the real 6-word vocabulary forces once it's exhausted.
+    expect(new Set(queries).size).toBe(Math.min(queries.length, knownVocabulary.length));
+  });
+
+  // Candidate 2, Test 8 — the SAME repeat-avoidance must also work when no
+  // domain was detected at all (Candidate 1's generic fallback path),
+  // proving the two candidates compose correctly rather than only working
+  // together by coincidence.
+  it("also de-duplicates the generic fallback rotation when no domain is detected", () => {
+    const gaps = [
+      { startMs: 0, endMs: 5000, durationMs: 5000 },
+      { startMs: 6000, endMs: 11_000, durationMs: 5000 },
+    ];
+    const visualContext = [{ startMs: 0, endMs: 11_000, description: "A man sits at a wooden desk reviewing paperwork." }];
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger(), { visualContext, maxDwellMs: 6000 });
+
+    expect(result.broll).toHaveLength(2);
+    expect(result.broll[0].searchQuery!.toLowerCase()).toContain("wooden");
+    expect(result.broll[1].searchQuery).not.toBe(result.broll[0].searchQuery);
+    const generic = ["office work", "business people", "healthcare", "education", "technology", "finance", "construction", "nature", "city", "family"];
+    expect(generic).toContain(result.broll[1].searchQuery);
   });
 
   it("produces zero items when there are zero gaps", () => {

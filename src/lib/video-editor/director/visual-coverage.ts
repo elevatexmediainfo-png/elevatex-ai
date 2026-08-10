@@ -388,6 +388,30 @@ const HINGLISH_VISUAL_CONCEPT_MAP: Record<string, string[]> = {
   healthy: HEALTH_CONCEPTS, business: BUSINESS_CONCEPTS, grow: BUSINESS_CONCEPTS, family: FAMILY_CONCEPTS,
   school: EDUCATION_CONCEPTS, college: EDUCATION_CONCEPTS, career: JOB_CONCEPTS, fashion: FASHION_CONCEPTS,
   mobile: TECH_CONCEPTS, phone: TECH_CONCEPTS, digital: TECH_CONCEPTS, technology: TECH_CONCEPTS, car: AUTO_CONCEPTS,
+  // Production fix (2026-08-11) — real regression: rules 3/4 (a literal
+  // transcript snippet / a raw Gemini scene description) never checked
+  // this map at all before falling back to genericAlternates()'s generic,
+  // cross-topic vocabulary. Real evidence: "Doctor seated at clinic desk
+  // speaking" (rule 4) only had "healthcare" available as a fallback
+  // alternative, which scored 0.4 against a real stock candidate — below
+  // the 0.5 confidence threshold — while these same-domain words below
+  // would have given the resolver several more specific, more literally-
+  // matchable candidates to try. Minimal, targeted additions — one or two
+  // clearly domain-identifying English nouns per vertical this map didn't
+  // already cover in plain English, not an attempt at a full synonym set.
+  doctor: HEALTH_CONCEPTS, hospital: HEALTH_CONCEPTS, medical: HEALTH_CONCEPTS, clinic: HEALTH_CONCEPTS, dentist: HEALTH_CONCEPTS, patient: HEALTH_CONCEPTS, nurse: HEALTH_CONCEPTS,
+  house: HOME_CONCEPTS, home: HOME_CONCEPTS, construction: HOME_CONCEPTS, property: HOME_CONCEPTS,
+  money: MONEY_CONCEPTS, finance: MONEY_CONCEPTS, investment: MONEY_CONCEPTS, bank: MONEY_CONCEPTS,
+  office: BUSINESS_CONCEPTS, meeting: BUSINESS_CONCEPTS, startup: BUSINESS_CONCEPTS,
+  student: EDUCATION_CONCEPTS, classroom: EDUCATION_CONCEPTS, education: EDUCATION_CONCEPTS,
+  food: FOOD_CONCEPTS, restaurant: FOOD_CONCEPTS, cooking: FOOD_CONCEPTS, kitchen: FOOD_CONCEPTS,
+  travel: TRAVEL_CONCEPTS, vacation: TRAVEL_CONCEPTS, airport: TRAVEL_CONCEPTS, trip: TRAVEL_CONCEPTS,
+  vehicle: AUTO_CONCEPTS, driving: AUTO_CONCEPTS, automobile: AUTO_CONCEPTS,
+  wedding: WEDDING_CONCEPTS, marriage: WEDDING_CONCEPTS, bride: WEDDING_CONCEPTS, groom: WEDDING_CONCEPTS,
+  clothing: FASHION_CONCEPTS, outfit: FASHION_CONCEPTS,
+  job: JOB_CONCEPTS, interview: JOB_CONCEPTS, workplace: JOB_CONCEPTS,
+  parents: FAMILY_CONCEPTS, children: FAMILY_CONCEPTS,
+  computer: TECH_CONCEPTS, laptop: TECH_CONCEPTS,
 };
 
 function matchHinglishConcepts(text: string): string[] {
@@ -445,6 +469,24 @@ function genericAlternates(seed: number, exclude: string): string[] {
   return rotated.filter((f) => f !== exclude).slice(0, 3);
 }
 
+// Rules 3/4 domain classification (2026-08-11) — reuses the SAME
+// matchHinglishConcepts()/HINGLISH_VISUAL_CONCEPT_MAP architecture rule 2
+// already relies on, applied here to rule 3's own nearby-words text and
+// rule 4's own (untruncated) scene-description text instead of a caption.
+// The PRIMARY these rules already derived is never touched — only the
+// alternatives source changes: a confidently-detected domain's own
+// concept words (already curated, already used elsewhere in this file)
+// replace the generic, cross-topic GENERIC_EDITORIAL_FALLBACKS rotation
+// whenever the source text actually names a known vertical (e.g. "doctor"
+// -> HEALTH_CONCEPTS gives the resolver "healthy lifestyle", "exercise",
+// "hospital", "medical" to try, instead of "office work"/"city"/"family").
+// Falls back to the existing genericAlternates() when no domain can be
+// confidently detected, exactly as before this fix.
+function domainAlternatesOrGeneric(sourceText: string, primary: string, seed: number): string[] {
+  const domainConcepts = matchHinglishConcepts(sourceText).filter((c) => c.trim().toLowerCase() !== primary.trim().toLowerCase());
+  return domainConcepts.length > 0 ? domainConcepts : genericAlternates(seed, primary);
+}
+
 export function deriveFixSearchQuery(gap: DeadScreenGap, captions: AICaption[], context: VisualQueryContext = {}): VisualQueryCandidates {
   const midMs = (gap.startMs + gap.endMs) / 2;
 
@@ -465,7 +507,7 @@ export function deriveFixSearchQuery(gap: DeadScreenGap, captions: AICaption[], 
       .slice(0, 6);
     if (words.length > 0) {
       const primary = words.join(" ");
-      return { primary, alternatives: genericAlternates(gap.startMs, primary) };
+      return { primary, alternatives: domainAlternatesOrGeneric(nearbyScene.description, primary, gap.startMs) };
     }
   }
 
@@ -477,7 +519,7 @@ export function deriveFixSearchQuery(gap: DeadScreenGap, captions: AICaption[], 
   if (nearbyEnglishWords.length > 0) {
     const unique = Array.from(new Set(nearbyEnglishWords.map((w) => w.toLowerCase()))).slice(0, 5);
     const primary = unique.join(" ");
-    return { primary, alternatives: genericAlternates(gap.startMs, primary) };
+    return { primary, alternatives: domainAlternatesOrGeneric(nearbyEnglishWords.join(" "), primary, gap.startMs) };
   }
 
   // Rule 2 — infer the VISUAL CONCEPT of the nearest caption's text via
@@ -493,6 +535,35 @@ export function deriveFixSearchQuery(gap: DeadScreenGap, captions: AICaption[], 
   // Rule 6 — nothing above yielded a real concept; generic, never raw speech.
   const fallback = pickGenericFallback(gap.startMs);
   return { primary: fallback, alternatives: GENERIC_EDITORIAL_FALLBACKS.filter((f) => f !== fallback).slice(0, 3) };
+}
+
+// Candidate 2 (2026-08-11) — "avoid unnecessary duplicate queries across
+// subdivided sub-gaps of the same original dead-screen stretch." Real
+// cause: subdivideGap() correctly splits one long gap into several
+// shorter sub-gaps to hit the max-dwell target, but each sub-gap
+// independently re-derives its own query from the same sparse Gemini/
+// transcript signal (deriveFixSearchQuery has no memory of earlier
+// sub-gaps) — for a single-setting talking-head video that can mean many
+// sub-gaps landing on the identical literal rule 3/4 primary.
+// Deterministic, no new state: reuses the SAME `ledger.brollStyles`
+// history applyNoDeadScreenFixes already threads through this loop and
+// already records every query into. Prefers the first candidate (primary,
+// then each alternative IN ORDER — domain-specific ones from
+// domainAlternatesOrGeneric() when available, generic otherwise) not yet
+// present in that history. When every candidate has already been used in
+// this job, returns the primary unchanged rather than failing the
+// proposal — this deliberately does NOT manufacture fake variety beyond
+// what the real available vocabulary supports (per the founder's own
+// "do not promise seven unique clips if the vocabulary can't support
+// seven meaningful queries" instruction).
+function pickUnusedQuery(primary: string, alternatives: string[], usedQueries: string[]): VisualQueryCandidates {
+  const usedLower = new Set(usedQueries.map((q) => q.trim().toLowerCase()));
+  if (!usedLower.has(primary.trim().toLowerCase())) return { primary, alternatives };
+
+  const chosen = alternatives.find((a) => !usedLower.has(a.trim().toLowerCase()));
+  if (!chosen) return { primary, alternatives }; // every option already used — deterministic fallback, never fail the slot
+
+  return { primary: chosen, alternatives: [primary, ...alternatives.filter((a) => a !== chosen)] };
 }
 
 export interface NoDeadScreenFixResult {
@@ -559,7 +630,12 @@ export function applyNoDeadScreenFixes(
       // primary match automatically tries the next-best visual concept —
       // ai-broll-resolver.ts's resolveStockBroll already does this for
       // every other b-roll item, no resolver change needed (rule 8).
-      const { primary: query, alternatives } = deriveFixSearchQuery(gap, captions, context);
+      const derived = deriveFixSearchQuery(gap, captions, context);
+      // Candidate 2 — before persisting, check whether this exact query was
+      // already used by an EARLIER sub-gap in this same call (nextLedger's
+      // own running brollStyles history) and swap to an unused candidate
+      // when one exists (see pickUnusedQuery's own doc comment).
+      const { primary: query, alternatives } = pickUnusedQuery(derived.primary, derived.alternatives, nextLedger.brollStyles);
       broll.push({
         startMs: gap.startMs,
         endMs: gap.endMs,
