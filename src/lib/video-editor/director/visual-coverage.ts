@@ -509,6 +509,36 @@ const HINGLISH_VISUAL_CONCEPT_MAP: Record<string, string[]> = {
   computer: TECH_CONCEPTS, laptop: TECH_CONCEPTS,
 };
 
+// Fix (2026-08-13, real production error — "broll[N].searchQueries: too_big,
+// maximum 10") — this function had NO length cap: it accumulates every
+// concept from EVERY matched category with no limit, and its result flows
+// straight into AIBroll.searchQueries (rule 2 directly via `concepts.slice(1)`
+// below, and via domainAlternatesOrGeneric() for rules 3/4) — a field capped
+// at max(10) by aiBrollSchema (validations/ai-timeline.ts). A source text
+// naming words from 2+ different concept categories (e.g. a caption/scene
+// description mentioning both a health topic and a business topic near the
+// same gap) trivially produces 10-20+ concepts — confirmed possible with as
+// few as 3-4 matched category keywords (each category holds 4-6 concepts).
+// The auto-fixer's synthetic broll items push this straight into
+// `searchQueries` with no validation until the FINAL assembled-plan parse
+// (ai-edit-jobs.ts's `aiTimelinePlanSchema.parse(plan)`) — a hard parse that
+// throws and fails the WHOLE job, unlike GPT's own native broll proposals,
+// which are validated (and any single bad item safely dropped, never job-
+// ending) much earlier via parsePlanOutputLeniently. Capped HERE, at the
+// true unbounded source, so every downstream consumer (rule 2's own
+// `concepts.slice(1)`, and domainAlternatesOrGeneric() for rules 3/4)
+// automatically inherits a value that can never exceed the schema's own
+// limit — one fix, not three duplicated caps at each call site.
+// MAX_HINGLISH_CONCEPT_MATCHES mirrors aiBrollSchema's searchQueries.max(10)
+// (validations/ai-timeline.ts) verbatim — the schema's own existing ceiling,
+// not a new, arbitrary number. Preserves order and the primary: `matched[0]`
+// (rule 2's own primary) is decided by the FIRST matched token, well before
+// any realistic cap could be reached (the largest single category is 6
+// items), so the primary is untouched in every case. Only the TAIL of the
+// list — later-matched categories once the cap is already reached — is ever
+// truncated; nothing already in `matched` is ever removed or reordered.
+const MAX_HINGLISH_CONCEPT_MATCHES = 10;
+
 function matchHinglishConcepts(text: string): string[] {
   const tokens = text
     .toLowerCase()
@@ -517,9 +547,11 @@ function matchHinglishConcepts(text: string): string[] {
     .filter(Boolean);
   const matched: string[] = [];
   for (const token of tokens) {
+    if (matched.length >= MAX_HINGLISH_CONCEPT_MATCHES) break;
     const concepts = HINGLISH_VISUAL_CONCEPT_MAP[token];
     if (!concepts) continue;
     for (const c of concepts) {
+      if (matched.length >= MAX_HINGLISH_CONCEPT_MATCHES) break;
       if (!matched.includes(c)) matched.push(c);
     }
   }

@@ -314,6 +314,57 @@ describe("deriveFixSearchQuery", () => {
     expect(result.alternatives).toEqual(["home interior", "family home", "construction worker", "new house"]);
   });
 
+  // Fix (2026-08-13, real production regression) — "broll[N].searchQueries:
+  // too_big, maximum 10." A caption naming words from MULTIPLE concept
+  // categories (health + business here — 5 + 6 = 11 raw concepts,
+  // confirmed to exceed the schema's max(10) before this fix) used to
+  // produce an unbounded `alternatives` array. This is the exact real
+  // failure mode traced to matchHinglishConcepts()'s own doc comment.
+  it("rule 2 — a caption naming words from MULTIPLE concept categories no longer exceeds the schema's max(10) searchQueries (real production regression)", () => {
+    // "doctor" -> HEALTH_CONCEPTS (5 incl. itself); "business" -> BUSINESS_CONCEPTS
+    // (6) — 11 raw unique concepts combined, one over the schema's limit.
+    const captions = [caption("doctor business", 0, 1000)];
+    const result = deriveFixSearchQuery({ startMs: 0, endMs: 5000, durationMs: 5000 }, captions);
+
+    // Primary is completely unaffected — decided by the FIRST matched
+    // token, well before any cap is reached.
+    expect(result.primary).toBe("doctor");
+    // The schema's own limit: searchQueries max(10) (aiBrollSchema).
+    expect(result.alternatives.length).toBeLessThanOrEqual(10);
+    // Order-preserving truncation: the health category (matched first,
+    // via "doctor") survives in full; the business category's own tail
+    // gets truncated once the cap is reached — nothing is dropped from
+    // the middle, nothing is reordered.
+    expect(result.alternatives).toEqual(["healthy lifestyle", "exercise", "hospital", "medical", "office", "startup", "meeting", "teamwork", "sales"]);
+    expect(result.alternatives).not.toContain("marketing"); // the 11th raw concept — correctly truncated, not silently kept
+  });
+
+  // Same fix, rules 3/4 (domainAlternatesOrGeneric — a SEPARATE call site
+  // reusing the SAME now-capped matchHinglishConcepts()). Uses rule 4's
+  // own (untruncated) scene-description text as the multi-category
+  // source, proving the fix isn't scoped to rule 2 alone.
+  it("rule 4 — a scene description naming words from MULTIPLE concept categories keeps domainAlternatesOrGeneric's own alternatives within the schema's max(10)", () => {
+    const visualContext = [{ startMs: 4500, endMs: 5500, description: "A doctor discusses business finance investment banking money startup office at a busy clinic." }];
+    const result = deriveFixSearchQuery(gap, [], { visualContext });
+
+    // Primary is rule 4's own literal 6-word truncation — untouched by
+    // this fix (domainAlternatesOrGeneric only ever affects `alternatives`).
+    expect(result.primary).toBe("A doctor discusses business finance investment");
+    expect(result.alternatives.length).toBeGreaterThan(0);
+    expect(result.alternatives.length).toBeLessThanOrEqual(10);
+  });
+
+  // Normal (single-category, real production) cases must stay byte-for-
+  // byte unchanged — re-asserts the exact same pre-existing known outputs,
+  // all well under the cap, proving this fix has zero effect on them.
+  it("rule 2 — normal single-category cases remain byte-for-byte unchanged by the length cap (regression pin)", () => {
+    expect(deriveFixSearchQuery(gap, [caption("Aapke Ghar Tak", 3000, 6500)])).toEqual({
+      primary: "house construction",
+      alternatives: ["home interior", "family home", "construction worker", "new house"],
+    });
+    expect(deriveFixSearchQuery(gap, [caption("Paise Bachao", 3000, 6500)]).alternatives).toEqual(["investment", "finance", "saving", "calculator", "bank"]);
+  });
+
   it("rule 2 — 'Paise Bachao' maps to money/finance concepts, never the literal words", () => {
     const captions = [caption("Paise Bachao", 3000, 6500)];
     const result = deriveFixSearchQuery(gap, captions);
@@ -543,6 +594,26 @@ describe("applyNoDeadScreenFixes", () => {
     for (const alt of result.broll[0].searchQueries!) {
       expect(["office work", "business people", "healthcare", "education", "technology", "finance", "construction", "nature", "city", "family"]).toContain(alt);
     }
+  });
+
+  // Fix (2026-08-13, real production regression, end-to-end) — the ACTUAL
+  // failure shape: aiTimelinePlanSchema.parse(plan) rejecting
+  // broll[N].searchQueries with "too_big, maximum 10" once the plan is
+  // fully assembled (ai-edit-jobs.ts). Reproduces it at this function's own
+  // real output boundary — a multi-category caption feeding a real
+  // auto-inserted broll item — proving the field this codebase actually
+  // persists (AIBroll.searchQueries, not just deriveFixSearchQuery's
+  // internal `alternatives`) respects the schema's max(10) end to end.
+  it("an auto-inserted broll item's persisted searchQueries never exceeds the schema's max(10), even from a multi-category-matching caption (real production regression, end-to-end)", () => {
+    const gaps = [{ startMs: 0, endMs: 5000, durationMs: 5000 }];
+    const captions = [caption("doctor business", 0, 1000)];
+    const result = applyNoDeadScreenFixes(gaps, captions, createEmptyVarietyLedger(), { maxDwellMs: 6000 });
+
+    const brollItem = result.broll.find((b) => b.searchQueries);
+    expect(brollItem).toBeDefined();
+    // The exact schema constraint this bug violated in production
+    // (aiBrollSchema.searchQueries.max(10), validations/ai-timeline.ts).
+    expect(brollItem!.searchQueries!.length).toBeLessThanOrEqual(10);
   });
 
   // Candidate 2 (2026-08-11) — real production regression: subdivideGap()
