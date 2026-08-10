@@ -370,6 +370,125 @@ describe("deriveFixSearchQuery", () => {
     const result = deriveFixSearchQuery({ startMs: 0, endMs: 2000, durationMs: 2000 }, []);
     expect(["office work", "business people", "healthcare", "education", "technology", "finance", "construction", "nature", "city", "family"]).toContain(result.primary);
   });
+
+  // Fix (2026-08-12) — rule 3 used to accept ANY pure-Latin-script,
+  // non-function-word token as "genuine English" (see isLikelyEnglishWord's
+  // own doc comment, visual-coverage.ts, for the real regression this
+  // disproved: AssemblyAI's transcript for Hinglish speech is ITSELF
+  // romanized, e.g. "Ghar"/"Khaana"/"Shaadi"). Rule 3 now rejects the
+  // map's own original Hindi-romanization keys, so a gap surrounded only
+  // by those words correctly falls through to rule 2's real concept
+  // mapping instead of literally searching for the untranslated words.
+  it("rule 3 — rejects pure Hindi/Hinglish romanization words (the map's own keys), so rule 2 gets a real chance (real regression class: 'Aapke Ghar Tak')", () => {
+    const captions = [caption("Aapke Ghar Tak", 3000, 6500)]; // rule 2 -> house construction
+    const words = [
+      { word: "हम", startMs: 4200, endMs: 4400 },
+      { word: "Ghar", startMs: 4400, endMs: 4900 }, // a HINGLISH_VISUAL_CONCEPT_MAP key — no longer "English"
+      { word: "Khaana", startMs: 4900, endMs: 5300 }, // also a map key
+    ];
+    const result = deriveFixSearchQuery(gap, captions, { words });
+    // Rule 3 now yields nothing for this gap (both nearby words are
+    // rejected) — falls all the way through to rule 2's real mapping.
+    expect(result.primary).toBe("house construction");
+    expect(result.primary.toLowerCase()).not.toContain("ghar");
+    expect(result.primary.toLowerCase()).not.toContain("khaana");
+  });
+
+  // Fix (2026-08-12, follow-up) — the map-key rejection alone only
+  // catches "Ghar" (a concept word); it does nothing for "Aapke" or "Tak"
+  // (pure grammar — a pronoun+postposition, no visual concept). The new
+  // HINDI_FUNCTION_WORDS set closes that gap: this is the literal, exact,
+  // real production regression phrase, reproduced word-for-word as the
+  // nearby transcript words, and it must no longer become rule 3's
+  // primary at all.
+  it("rule 3 — the literal real regression phrase 'Aapke Ghar Tak' can no longer become the rule 3 primary (all three words now rejected: 'Ghar' via the map-key check, 'Aapke'/'Tak' via HINDI_FUNCTION_WORDS)", () => {
+    const captions = [caption("Aapke Ghar Tak", 3000, 6500)]; // rule 2 -> house construction
+    const words = [
+      { word: "हम", startMs: 4200, endMs: 4400 },
+      { word: "Aapke", startMs: 4400, endMs: 4700 },
+      { word: "Ghar", startMs: 4700, endMs: 4900 },
+      { word: "Tak", startMs: 4900, endMs: 5100 },
+    ];
+    const result = deriveFixSearchQuery(gap, captions, { words });
+    expect(result.primary).not.toBe("Aapke Ghar Tak");
+    expect(result.primary.toLowerCase()).not.toContain("aapke");
+    expect(result.primary.toLowerCase()).not.toContain("ghar");
+    expect(result.primary.toLowerCase()).not.toContain("tak");
+    // Falls all the way through to rule 2's real concept mapping.
+    expect(result.primary).toBe("house construction");
+  });
+
+  // Honest, documented KNOWN GAP (2026-08-12) — "Nakshe" ("blueprint/map")
+  // is a standalone Hindi CONTENT noun: not a HINGLISH_VISUAL_CONCEPT_MAP
+  // key (that would require expanding the map's vocabulary, explicitly
+  // out of scope for this fix) and not a grammatical function word either
+  // (so HINDI_FUNCTION_WORDS correctly doesn't cover it — it isn't a
+  // pronoun/postposition/particle). No reliable structural/phonetic
+  // heuristic exists that wouldn't ALSO misclassify genuine English (see
+  // isLikelyEnglishWord's own doc comment for the concrete English-word
+  // collisions this ruled out). This test documents — rather than hides —
+  // that "Nakshe" alone still currently passes as "English" and can still
+  // become a rule 3 primary. This is a known, accepted, explicitly
+  // reported limitation, not an oversight.
+  it("rule 3 — KNOWN GAP: 'Nakshe' (a standalone Hindi content noun, not a map key or a function word) is NOT rejected by this fix and can still become the rule 3 primary", () => {
+    const words = [
+      { word: "हम", startMs: 4200, endMs: 4400 },
+      { word: "Nakshe", startMs: 4400, endMs: 4900 },
+    ];
+    const result = deriveFixSearchQuery(gap, [], { words });
+    // Documents the CURRENT (still imperfect) behavior — "Nakshe" passes
+    // isLikelyEnglishWord and becomes the literal rule 3 primary (rule 3
+    // lowercases its own output — see its own `.toLowerCase()` call). If
+    // this assertion ever starts failing because "Nakshe" gets rejected,
+    // that means the gap was closed some other way — update this test's
+    // own comment/expectation to match, don't just delete it.
+    expect(result.primary).toBe("nakshe");
+  });
+
+  // Fix (2026-08-12, follow-up) — proves HINDI_FUNCTION_WORDS was
+  // deliberately kept small and specific: every one of these words is a
+  // real Hindi word too, but each is ALSO a real, plausible English word
+  // in this app's own content domains, and was deliberately left OUT of
+  // the rejection list for exactly that reason (see the list's own doc
+  // comment). Rule 3 must keep treating them as English.
+  it("rule 3 — genuine English words that are ALSO real Hindi words ('main', 'koi', 'tab', 'tera', 'fir') are deliberately NOT rejected — real English collisions were excluded from HINDI_FUNCTION_WORDS on purpose", () => {
+    for (const word of ["main", "koi", "tab", "tera", "fir"]) {
+      const words = [
+        { word: "हम", startMs: 4200, endMs: 4400 },
+        { word, startMs: 4400, endMs: 4900 },
+      ];
+      const result = deriveFixSearchQuery(gap, [], { words });
+      expect(result.primary).toBe(word);
+    }
+  });
+
+  // Preserves the pre-existing tests above ("interior design", "house
+  // construction" via rule 3) — re-asserted explicitly here as this fix's
+  // own regression pin: genuine English domain words that ALSO happen to
+  // be HINGLISH_VISUAL_CONCEPT_MAP keys (added later, for rule 2's own
+  // caption-catching purposes — see that map's "Plain-English topic
+  // words"/"Production fix" section comments) must NOT be rejected by this
+  // fix — only the map's ORIGINAL Hindi-transliteration keys are excluded.
+  it("rule 3 — genuine English domain words that also happen to be map keys ('house', 'construction') are still treated as English, unaffected by this fix", () => {
+    const words = [
+      { word: "हम", startMs: 4200, endMs: 4400 },
+      { word: "house", startMs: 4400, endMs: 4900 },
+      { word: "construction", startMs: 4900, endMs: 5300 },
+    ];
+    const result = deriveFixSearchQuery(gap, [], { words });
+    expect(result.primary).toBe("house construction");
+  });
+
+  // Rule 2 reads HINGLISH_VISUAL_CONCEPT_MAP/matchHinglishConcepts
+  // directly and never calls isLikelyEnglishWord at all — this fix cannot
+  // change its output. Re-asserts the exact same known outputs as the
+  // pre-existing "byte-identical" test above, unchanged.
+  it("rule 2 — output is completely unaffected by the isLikelyEnglishWord fix (rule 2 never calls it)", () => {
+    expect(deriveFixSearchQuery(gap, [caption("Aapke Ghar Tak", 3000, 6500)])).toEqual({
+      primary: "house construction",
+      alternatives: ["home interior", "family home", "construction worker", "new house"],
+    });
+  });
 });
 
 describe("applyNoDeadScreenFixes", () => {
@@ -581,6 +700,19 @@ describe("applyNoDeadScreenFixes", () => {
     const result = applyNoDeadScreenFixes([{ startMs: 0, endMs: 1600, durationMs: 1600 }], [], createEmptyVarietyLedger());
     if (result.stickers.length > 0) {
       expect(result.stickers[0].endMs - result.stickers[0].startMs).toBeLessThanOrEqual(1600);
+    }
+  });
+
+  // Fix (2026-08-12) — broll already tagged its own auto-inserted items
+  // `autoInserted: true`; stickers never did, despite aiStickerSchema
+  // already having the field. Purely additive metadata — asserts the
+  // field is now set without asserting anything about selection/content.
+  it("tags every auto-inserted sticker with autoInserted: true (aiStickerSchema already supports this field)", () => {
+    const gaps = Array.from({ length: 12 }, (_, i) => ({ startMs: i * 20_000, endMs: i * 20_000 + 2100, durationMs: 2100 }));
+    const result = applyNoDeadScreenFixes(gaps, [], createEmptyVarietyLedger());
+    expect(result.stickers.length).toBeGreaterThan(0);
+    for (const sticker of result.stickers) {
+      expect(sticker.autoInserted).toBe(true);
     }
   });
 });

@@ -216,6 +216,85 @@ describe("pickBestStockResult", () => {
       expect(picked!.relevanceScore).toBe(0);
     });
   });
+
+  // Fix (2026-08-12, re-validated 2026-08-12 follow-up) — token-presence-
+  // only scoring let a long SEO/tag-dump title score identically to a
+  // concise, genuinely on-topic one, purely because the query's tokens
+  // happened to appear somewhere in the dump too. Real production
+  // regression: query "connecting people" scored a full 1.0 against a
+  // 25-distinct-topic pixabay marketing-buzzword tag dump (the exact
+  // string below, taken from the real traced job).
+  //
+  // Re-validation (follow-up review) — TITLE_SPECIFICITY_TOKEN_CEILING=8
+  // is not "safe" merely because existing fixtures happen to be <= 8
+  // tokens; it's safe because of what the FORMULA does at the boundary
+  // and beyond it: `factor = ceiling / uniqueTitleTokenCount` is a smooth,
+  // continuous inverse curve, not a cliff — a title 1-4 tokens over the
+  // ceiling is only mildly dampened (9 tokens -> 0.89x, 12 tokens ->
+  // 0.67x), while a genuine tag-dump (20-45 tokens, the real range seen in
+  // production evidence) gets dampened much harder (25 tokens -> 0.32x,
+  // 45 tokens -> 0.18x). The four cases below are the actual computed
+  // scores (not just "greater/less than" assertions) proving this curve
+  // behaves correctly at both ends:
+  //   A. concise accurate title (4 tokens)              -> 1.00 (unchanged)
+  //   B. long tag-dump, SAME query tokens (25 tokens)    -> 0.32 (rejected, was 1.00)
+  //   C. genuinely accurate, longer sentence (9 tokens)  -> 0.89 (still comfortably accepted)
+  //   D. long irrelevant tag-dump (20 tokens, 0 matches) -> 0.00 (unaffected — 0 stays 0 at any length)
+  describe("title-specificity adjustment — a concise relevant title must not lose to a tag-dump merely because it has more matching tokens", () => {
+    const TAG_DUMP_TITLE =
+      "communication, distance, meeting, online, digital, marketing, chat, phone, teacher, business, world, earth, social, media, technology, future, science, blue, connecting, company, data, conferences, education, audience, people";
+
+    it("A. concise accurate title (4 unique tokens, well under the ceiling) — score stays exactly 1.0, completely unaffected", () => {
+      const outcomes: StockSearchProviderOutcome[] = [{ providerId: "pexels", results: [stockResult({ externalId: "concise", kind: "VIDEO", title: "Two people connecting warmly" })] }];
+      const picked = pickBestStockResult(outcomes, "VIDEO", "connecting people");
+      expect(picked!.relevanceScore).toBe(1);
+    });
+
+    it("B. long tag-dump, same query tokens (25 unique tokens, the real production title) — score drops from what would be 1.0 to exactly 0.32, below the 0.5 threshold", () => {
+      const outcomes: StockSearchProviderOutcome[] = [{ providerId: "pixabay", results: [stockResult({ externalId: "tag-dump", kind: "VIDEO", title: TAG_DUMP_TITLE })] }];
+      const picked = pickBestStockResult(outcomes, "VIDEO", "connecting people");
+      // Exact computed value: raw match = 2/2 = 1.0; specificity = 8/25 = 0.32; 1.0 * 0.32 = 0.32.
+      expect(picked!.relevanceScore).toBeCloseTo(0.32, 5);
+      expect(picked!.relevanceScore).toBeLessThan(0.5);
+    });
+
+    it("C. genuinely accurate, longer descriptive title (9 unique tokens, one over the ceiling) — mildly dampened to 0.89, NOT unfairly rejected", () => {
+      // A real natural-sentence-style title (the kind pexels/coverr use),
+      // not a comma-separated tag list — genuinely, specifically about the
+      // query, just phrased as a full descriptive sentence.
+      const title = "A carpenter carefully measuring wood for a custom home interior design project";
+      const outcomes: StockSearchProviderOutcome[] = [{ providerId: "pexels", results: [stockResult({ externalId: "accurate-long", kind: "VIDEO", title })] }];
+      const picked = pickBestStockResult(outcomes, "VIDEO", "home design");
+      // Exact computed value: raw match = 2/2 = 1.0 ("home","design" both
+      // present); unique title tokens = 9 (carpenter, carefully,
+      // measuring, wood, custom, home, interior, design, project —
+      // stopwords "a"/"for" removed); specificity = 8/9 = 0.8889; 1.0 *
+      // 0.8889 = 0.8889.
+      expect(picked!.relevanceScore).toBeCloseTo(8 / 9, 4);
+      expect(picked!.relevanceScore).toBeGreaterThanOrEqual(0.5); // still comfortably accepted
+    });
+
+    it("D. long irrelevant tag-dump (20 unique tokens, zero real matches) — stays exactly 0, proving the specificity adjustment never manufactures relevance out of length alone", () => {
+      const title = "cat, dog, bird, forest, mountain, river, lake, sunset, ocean, beach, desert, snow, rain, cloud, storm, wind, garden, flower, tree, grass";
+      const outcomes: StockSearchProviderOutcome[] = [{ providerId: "pexels", results: [stockResult({ externalId: "long-irrelevant", kind: "VIDEO", title })] }];
+      const picked = pickBestStockResult(outcomes, "VIDEO", "home design");
+      expect(picked!.relevanceScore).toBe(0);
+    });
+
+    it("head-to-head: the concise relevant title wins over the tag-dump when both are real candidates for the same query (the actual production bug)", () => {
+      const outcomes: StockSearchProviderOutcome[] = [
+        {
+          providerId: "pixabay",
+          results: [
+            stockResult({ externalId: "tag-dump", kind: "VIDEO", title: TAG_DUMP_TITLE }),
+            stockResult({ externalId: "concise", kind: "VIDEO", title: "Two people connecting warmly" }),
+          ],
+        },
+      ];
+      const picked = pickBestStockResult(outcomes, "VIDEO", "connecting people");
+      expect(picked?.result.externalId).toBe("concise");
+    });
+  });
 });
 
 // stockOnly: false — these tests exercise the pre-existing, GPT-judgment-

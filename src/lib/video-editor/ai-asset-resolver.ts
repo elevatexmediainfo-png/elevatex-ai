@@ -25,6 +25,19 @@ export interface TimelineAssetResolutionContext {
   aspectRatio: "RATIO_9_16" | "RATIO_1_1" | "RATIO_16_9";
 }
 
+// Fix (2026-08-12) — unlike ai-broll-resolver.ts's resolveStockBroll
+// (which rejects a candidate below BrollResolutionContext.relevanceFallbackThreshold
+// rather than materializing a poor match), resolveSticker below had no
+// relevance floor at all — whatever pickBestStockResult returned got
+// materialized regardless of how low its own relevanceScore was. Reuses
+// broll's own default threshold value verbatim (AiEditJob.
+// brollRelevanceFallbackThreshold's own `@default(0.5)`, prisma/schema.prisma)
+// rather than inventing a new number — stickers have no per-job
+// configurable override today (TimelineAssetResolutionContext carries no
+// such field), so this is the same fixed default broll itself falls back
+// to whenever a job doesn't override it.
+const STICKER_MIN_RELEVANCE_SCORE = 0.5;
+
 // Milestone 9's STOCK_ASSET_LIBRARY (Admin Panel, `lib/admin/config.ts`)
 // — "Media Library's Stock assets tab and the Video Editor's Sticker
 // layer both read this same curated list" per its own doc comment. Real,
@@ -61,6 +74,16 @@ async function resolveSticker(item: AISticker, ctx: TimelineAssetResolutionConte
     ]);
     const picked = pickBestStockResult([...iconOutcomes.outcomes, ...imageOutcomes.outcomes], "ICON", item.assetQuery);
     if (!picked) return { ...item, resolutionNote: `No curated sticker or stock icon/image match for "${item.assetQuery}".` };
+    if (picked.relevanceScore < STICKER_MIN_RELEVANCE_SCORE) {
+      logger.warn(
+        { assetQuery: item.assetQuery, bestTitle: picked.result.title, relevanceScore: picked.relevanceScore, threshold: STICKER_MIN_RELEVANCE_SCORE },
+        "[ai asset resolver] best sticker match scored below the relevance confidence threshold — rejecting rather than using a poor match"
+      );
+      return {
+        ...item,
+        resolutionNote: `Best stock match ("${picked.result.title}") scored ${picked.relevanceScore.toFixed(2)} relevance for "${item.assetQuery}", below the ${STICKER_MIN_RELEVANCE_SCORE} confidence threshold.`,
+      };
+    }
 
     const category = picked.result.kind === "ICON" ? "ICON" : "STOCK_MEDIA";
     const materialized = await materializeStockAsset(ctx.userId, picked.providerId, category, picked.result);

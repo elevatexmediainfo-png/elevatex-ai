@@ -338,8 +338,103 @@ function nearestWithinWindow<T extends { startMs: number; endMs: number }>(items
 const LATIN_WORD_RE = /^[A-Za-z][A-Za-z'-]{2,}$/;
 const ENGLISH_FUNCTION_WORDS = new Set(["the", "and", "for", "with", "this", "that", "have", "from", "your", "you", "are", "was", "were", "will", "can", "has", "not", "but"]);
 
+// Fix (2026-08-12) — the assumption above ("a Hindi transcript is written
+// in Devanagari, so a Latin-script token must be genuine English") turned
+// out to be false for real production content: AssemblyAI's transcript
+// for Hinglish speech is ITSELF romanized (e.g. "Ghar", "Khaana",
+// "Shaadi" spelled in Latin letters), so rule 3 was winning over rule 2's
+// correct concept mapping for these words — real regression: the caption
+// "Aapke Ghar Tak" had its own nearby transcript words include "Ghar",
+// which rule 3 accepted as "English" and sent to a stock search
+// literally, instead of falling through to rule 2's HOME_CONCEPTS
+// mapping. Smallest safe fix: reject a word here when it's one of
+// HINGLISH_VISUAL_CONCEPT_MAP's own ORIGINAL Hindi-romanization keys
+// (the literal strings below are copied from that map's own first
+// section, immediately after this function — no new vocabulary
+// introduced, map itself untouched). Deliberately excludes the map's
+// later "plain-English topic words" / "production fix" sections (e.g.
+// "business", "house", "construction", "doctor") — those are genuine
+// English words Rule 3 must keep treating as English (see this file's
+// own "house construction" rule 3 test) — only words that are ONLY ever
+// a Hindi/Hinglish romanization in this app's curated vocabulary are
+// excluded here.
+const HINGLISH_ROMANIZATION_ONLY_KEYS = new Set([
+  "ghar", "gharon", "makan", "ghara",
+  "paisa", "paise", "rupaye", "rupaya", "dhan",
+  "bachao", "bachat", "nivesh",
+  "sehat", "tandurust", "rahna", "rahiye",
+  "vyapaar", "vyapar", "dhandha",
+  "badhana", "badhao", "badho", "badhaye",
+  "padhai", "padho", "shiksha",
+  "khana", "khaana", "bhojan", "khaane",
+  "safar", "yatra", "ghumna", "ghumne",
+  "shaadi", "shadi", "vivah",
+  "naukri",
+  "kapde",
+  "gaadi", "gadi",
+  "parivaar", "parivar",
+]);
+
+// Fix (2026-08-12, follow-up — "fix the Hinglish issue completely") — the
+// map-key rejection above only catches Hindi/Hinglish words that also
+// happen to be CONCEPT words this app's curated vocabulary already knows
+// about (e.g. "ghar"). It does nothing for a Hinglish word that carries
+// no visual concept at all — grammatical words: pronouns, postpositions,
+// auxiliary verbs, particles (e.g. "Aapke," "Tak," "Hai," "Nahi"). Real
+// regression: the literal reported phrase "Aapke Ghar Tak" — "Ghar" is a
+// map key (already fixed above), but "Aapke" and "Tak" are pure grammar,
+// never a concept HINGLISH_VISUAL_CONCEPT_MAP could reasonably hold (that
+// map is topic-scoped by design — see its own doc comment — a
+// pronoun/postposition isn't a "visual concept" any topic bucket fits).
+// This is the SAME distinction ENGLISH_FUNCTION_WORDS above already draws
+// for English (grammatical words vs. content words) — HINDI_FUNCTION_WORDS
+// is the Hindi-romanization mirror of that same, already-established
+// pattern, not a new kind of list. Deliberately excludes any romanized
+// Hindi word that is ALSO a genuine, plausible English word in this app's
+// own real content domains (verified individually, not just assumed):
+// "main" (English "main road/street"), "koi" (English loanword, "koi
+// pond"), "tab" (English "browser tab"/"keep tab on"), "tera" (English SI
+// prefix, "terabyte" — plausible in this app's own TECH_CONCEPTS
+// domain), and "fir" (English "fir tree") are all real Hindi words too,
+// but are deliberately left OUT of this list — a genuine English use of
+// any of them must keep working, and this fix would rather under-catch a
+// few Hindi words than ever misclassify real English.
+//
+// A structural/phonetic heuristic (e.g. "words containing gh/kh/sh/dh/ksh
+// are probably Hindi") was considered and REJECTED — it is not reliable:
+// ordinary English words routinely contain those exact letter sequences
+// ("night," "light," "though," "enough," "laugh," "should," "think,"
+// "change," "workshop," "bookshelf" all contain gh/sh/ch/ksh), so this
+// would misclassify genuine English constantly, violating the explicit
+// requirement to never do that. No per-word language signal exists
+// upstream either — TranscriptionWord (providers/transcription/types.ts)
+// carries only `{word, startMs, endMs}`, no per-word language/confidence
+// field to lean on. A standalone Hindi CONTENT noun that is neither a
+// concept-map key nor a grammatical function word (e.g. "Nakshe" —
+// "blueprint/map," a real noun, not a pronoun/postposition) is therefore
+// a KNOWN, DOCUMENTED, UNRESOLVED gap: it cannot be reliably distinguished
+// from genuine English without either (a) expanding
+// HINGLISH_VISUAL_CONCEPT_MAP's vocabulary (explicitly out of scope this
+// change) or (b) an unreliable heuristic (rejected above). See this
+// file's own test suite for an explicit test documenting this gap rather
+// than silently leaving it unproven.
+const HINDI_FUNCTION_WORDS = new Set([
+  // Pronouns / possessives — grammatical, never a visual concept.
+  "aap", "aapka", "aapke", "aapki", "hum", "hamara", "tum", "tumhara",
+  "mera", "meri", "wo", "woh", "yeh", "unka", "iska", "uska", "khud", "apna", "apni",
+  // Postpositions (3+ letters only — shorter ones like "ka"/"ki"/"ko"/
+  // "se"/"me" never reach this function at all: LATIN_WORD_RE already
+  // requires a minimum of 3 letters).
+  "tak", "liye",
+  // Copulas / common auxiliary-verb forms.
+  "hai", "hain", "hoon", "tha", "thi", "raha", "rahi", "rahe",
+  // Common particles / interrogatives — grammatical, not topic words.
+  "nahi", "nahin", "haan", "kya", "kyun", "kaise", "kab", "kahan", "aur", "bhi", "toh", "sab", "jab", "agar", "phir",
+]);
+
 function isLikelyEnglishWord(word: string): boolean {
-  return LATIN_WORD_RE.test(word) && !ENGLISH_FUNCTION_WORDS.has(word.toLowerCase());
+  const lower = word.toLowerCase();
+  return LATIN_WORD_RE.test(word) && !ENGLISH_FUNCTION_WORDS.has(lower) && !HINGLISH_ROMANIZATION_ONLY_KEYS.has(lower) && !HINDI_FUNCTION_WORDS.has(lower);
 }
 
 // Rule 2/4 — a curated Hindi/Hinglish keyword -> English visual-concept
@@ -622,7 +717,16 @@ export function applyNoDeadScreenFixes(
       // Varies 1200-2000ms (and never longer than the gap itself) —
       // avoids every auto-fixed sticker reading as the identical duration.
       const stickerDurationMs = Math.min(gap.durationMs, Math.round(pseudoVariance(gap.startMs + 1, 1200, 2000)));
-      stickers.push({ assetQuery: query, startMs: gap.startMs, endMs: gap.startMs + stickerDurationMs, reason });
+      // Fix (2026-08-12) — broll already tags its own auto-inserted items
+      // `autoInserted: true` (see the "broll"/"motion_graphic" branch
+      // below); stickers never did, despite aiStickerSchema already
+      // having the field (validations/ai-timeline.ts). Purely additive —
+      // no existing consumer reads AISticker.autoInserted today (the one
+      // existing test that distinguishes auto-fixer stickers already does
+      // so via the `reason` string, unchanged here), so this cannot change
+      // selection/resolution/rendering behavior; it only makes the field
+      // consistent with broll for any future consumer that needs it.
+      stickers.push({ assetQuery: query, startMs: gap.startMs, endMs: gap.startMs + stickerDurationMs, reason, autoInserted: true });
       nextLedger = recordUsage(nextLedger, "stickerQueries", query);
     } else {
       // "broll" or "motion_graphic" — same renderable shape, different tag.

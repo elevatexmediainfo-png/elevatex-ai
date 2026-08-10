@@ -140,6 +140,31 @@ for (const group of SEMANTIC_SYNONYM_GROUPS) {
   for (const word of group) SYNONYM_LOOKUP.set(word, set);
 }
 
+// Fix (2026-08-12) — token-presence-only scoring let a long SEO/tag-dump
+// title (many DIFFERENT topics comma-stuffed into one string — common on
+// pixabay/openverse) score identically to a concise, genuinely on-topic
+// title, purely because the query's own tokens happened to appear
+// somewhere in the dump too (real regression: query "connecting people"
+// scored a full 1.0 against a 25-distinct-topic marketing-buzzword tag
+// dump, purely because both query words each independently appeared
+// somewhere in it). A title dominated by many topics unrelated to the
+// query is a genuinely weaker signal than a concise title where most/all
+// of its own words ARE the query. This multiplies the existing 0..1
+// score by a specificity factor that only engages once a title's own
+// UNIQUE token count exceeds TITLE_SPECIFICITY_TOKEN_CEILING — chosen
+// against this file's own real test fixtures (every existing title used
+// in ai-broll-resolver.test.ts is <= 8 unique tokens, so every existing
+// test's score is completely unaffected; factor stays exactly 1). Only
+// engages for genuinely tag-dump-shaped titles. Exact-match/synonym
+// counting, the 0.5 acceptance threshold, and every other scoring input
+// (kind bonus, portrait bonus, resolution penalty) are untouched.
+const TITLE_SPECIFICITY_TOKEN_CEILING = 8;
+
+function titleSpecificity(uniqueTitleTokenCount: number): number {
+  if (uniqueTitleTokenCount <= TITLE_SPECIFICITY_TOKEN_CEILING) return 1;
+  return TITLE_SPECIFICITY_TOKEN_CEILING / uniqueTitleTokenCount;
+}
+
 // 0..1: the query's own meaningful tokens, matched against the
 // candidate's title/tag text either LITERALLY (full weight) or via the
 // synonym table above (half weight) — deliberately simple, no external
@@ -166,7 +191,8 @@ function relevanceScore(query: string, title: string): number {
       }
     }
   }
-  return Math.min(1, (exactMatches + softMatches * 0.5) / queryTokens.length);
+  const raw = Math.min(1, (exactMatches + softMatches * 0.5) / queryTokens.length);
+  return raw * titleSpecificity(titleTokens.size);
 }
 
 // `relevanceScore` (2026-07-23) — the winning candidate's own 0..1 token-

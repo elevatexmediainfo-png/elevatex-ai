@@ -52,7 +52,7 @@ describe("resolveStickers", () => {
   it("falls back to real stock icon/image search when no curated entry matches", async () => {
     getConfigMock.mockResolvedValue([]); // empty curated library
     searchStockMediaMock.mockResolvedValue({ outcomes: [{ providerId: "iconscout", results: [{ externalId: "icon-1", title: "thumbs up", previewUrl: "p", downloadUrl: "d", kind: "ICON" }] }] });
-    pickBestStockResultMock.mockReturnValue({ providerId: "iconscout", result: { externalId: "icon-1", title: "thumbs up", previewUrl: "p", downloadUrl: "d", kind: "ICON" } });
+    pickBestStockResultMock.mockReturnValue({ providerId: "iconscout", result: { externalId: "icon-1", title: "thumbs up", previewUrl: "p", downloadUrl: "d", kind: "ICON" }, relevanceScore: 1 });
     materializeStockAssetMock.mockResolvedValue({ id: "asset-icon", url: "https://cdn/asset-icon.png", thumbnailUrl: null });
 
     const items: AISticker[] = [{ startMs: 0, endMs: 1000, assetQuery: "thumbs up" }];
@@ -60,6 +60,37 @@ describe("resolveStickers", () => {
 
     expect(result.assetId).toBe("asset-icon");
     expect(materializeStockAssetMock).toHaveBeenCalledWith("user-1", "iconscout", "ICON", expect.objectContaining({ externalId: "icon-1" }));
+  });
+
+  // Fix (2026-08-12) — resolveSticker used to have NO relevance floor at
+  // all (unlike ai-broll-resolver.ts's resolveStockBroll), so whatever
+  // pickBestStockResult returned got materialized regardless of score.
+  // Reuses broll's own default threshold (AiEditJob.brollRelevanceFallbackThreshold's
+  // @default(0.5), prisma/schema.prisma).
+  it("accepts a relevant sticker candidate (relevanceScore >= 0.5)", async () => {
+    getConfigMock.mockResolvedValue([]);
+    searchStockMediaMock.mockResolvedValue({ outcomes: [{ providerId: "iconscout", results: [{ externalId: "icon-relevant", title: "house icon", previewUrl: "p", downloadUrl: "d", kind: "ICON" }] }] });
+    pickBestStockResultMock.mockReturnValue({ providerId: "iconscout", result: { externalId: "icon-relevant", title: "house icon", previewUrl: "p", downloadUrl: "d", kind: "ICON" }, relevanceScore: 0.8 });
+    materializeStockAssetMock.mockResolvedValue({ id: "asset-relevant", url: "https://cdn/asset-relevant.png", thumbnailUrl: null });
+
+    const items: AISticker[] = [{ startMs: 0, endMs: 1000, assetQuery: "house icon" }];
+    const [result] = await resolveStickers(items, CTX);
+
+    expect(result.assetId).toBe("asset-relevant");
+    expect(materializeStockAssetMock).toHaveBeenCalled();
+  });
+
+  it("rejects an irrelevant low-score sticker candidate instead of forcing a bad asset (relevanceScore < 0.5)", async () => {
+    getConfigMock.mockResolvedValue([]);
+    searchStockMediaMock.mockResolvedValue({ outcomes: [{ providerId: "iconscout", results: [{ externalId: "icon-weak", title: "totally unrelated tag dump", previewUrl: "p", downloadUrl: "d", kind: "ICON" }] }] });
+    pickBestStockResultMock.mockReturnValue({ providerId: "iconscout", result: { externalId: "icon-weak", title: "totally unrelated tag dump", previewUrl: "p", downloadUrl: "d", kind: "ICON" }, relevanceScore: 0.2 });
+
+    const items: AISticker[] = [{ startMs: 0, endMs: 1000, assetQuery: "aapke ghar tak" }];
+    const [result] = await resolveStickers(items, CTX);
+
+    expect(result.assetId).toBeUndefined();
+    expect(result.resolutionNote).toContain("below the 0.5 confidence threshold");
+    expect(materializeStockAssetMock).not.toHaveBeenCalled();
   });
 
   it("flags with a resolutionNote (not silently dropped) when neither curated nor stock has a match", async () => {

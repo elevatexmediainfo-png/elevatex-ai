@@ -22,6 +22,7 @@ import { scoreAiTimelinePlan, AI_EDIT_QUALITY_RETRY_THRESHOLD } from "./ai-edit-
 import { runDirectorPipeline } from "./director/orchestrator";
 import { applyNoDeadScreenFixes, computeSourceSurvivingWindows, computeVisualCoverage, findDeadScreenGaps } from "./director/visual-coverage";
 import { createEmptyVarietyLedger } from "./director/variety-ledger";
+import { buildFallbackCaptionsFromWords } from "./caption-formatting";
 import {
   computeSpeechCharacteristics,
   computeFootageCharacteristics,
@@ -264,6 +265,35 @@ async function waitUntilFetchable(url: string, attempts = 5, initialDelayMs = 50
     }
   }
   throw new InvalidStateError(`Source asset's file isn't reachable yet at ${url} after ${attempts} attempts.`);
+}
+
+// Fix (2026-08-12) — GPT's own native TASK 4 sticker proposals (unlike
+// the no-dead-screen auto-fixer's own stickers, which already dedup
+// against ledger.stickerQueries — see visual-coverage.ts's
+// applyNoDeadScreenFixes) are never checked against anything at all: real
+// production evidence showed the SAME literal sticker query proposed
+// repeatedly for similar content (e.g. "house icon"). This is a small,
+// local, deterministic safety net — it never invents or removes a
+// GENUINELY distinct sticker, only collapses an EXACT (case-insensitive)
+// repeat of the same query within one job's own final combined sticker
+// list (native + auto-inserted, after both have already been merged)
+// down to its first occurrence. Applied once, right before resolution, so
+// a would-be duplicate never even costs a redundant vendor search.
+// Deliberately does NOT touch TASK 4's prompt, the GPT call itself, or
+// the auto-fixer's own stickerQueries ledger — broader native-proposal
+// variety (e.g. asking GPT itself for more varied stickers, or wiring the
+// ledger through the reasoning call) is a separate, out-of-scope change;
+// see this change's own investigation report.
+function dedupeStickersByQuery(items: AISticker[]): AISticker[] {
+  const seen = new Set<string>();
+  const kept: AISticker[] = [];
+  for (const item of items) {
+    const key = item.assetQuery?.trim().toLowerCase();
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    kept.push(item);
+  }
+  return kept;
 }
 
 export async function processAiEditJob(jobId: string): Promise<void> {
@@ -681,6 +711,25 @@ export async function processAiEditJob(jobId: string): Promise<void> {
         // skipped" when actually NOTHING creative was ever generated.
         planningError = `GPT-5 failed to generate ANY creative timeline content (captions, b-roll, zoom, stickers, music, sfx, transitions) for this video: ${err instanceof Error ? err.message : "unknown error"}. Only scene removal (computed independently, before this step) succeeded.`;
         logger.error({ err, jobId }, "[ai edit job] timeline planning failed completely — continuing with sceneRemoval only, no creative content generated");
+        // Fix (2026-08-12) — captions have a real deterministic fallback
+        // (buildFallbackCaptionsFromWords — the SAME chunker
+        // resolveCaptionTiming, gpt5.provider.ts, already falls back to
+        // when the model proposes zero usable captions), but that fallback
+        // only ever runs INSIDE a successful planTimeline() call. A total
+        // failure (this catch) never reached it, leaving captions at their
+        // empty default with no recovery — real evidence confirmed this:
+        // a job whose plan_timeline attempt(s) both timed out persisted
+        // captions:0 alongside sfx:0. planningError above is left exactly
+        // as before (still surfaced, the job is never made to look like it
+        // succeeded normally) — this only ensures a viewer isn't left with
+        // a fully blank caption track when real, already-transcribed
+        // words exist to caption from. Never overrides captions the model
+        // DID successfully produce — this branch only runs when the model
+        // produced nothing at all.
+        if (wantsModule("captions") && transcript.words.length > 0) {
+          captions = buildFallbackCaptionsFromWords(transcript.words).map((c) => ({ text: c.text, startMs: c.startMs, endMs: c.endMs }));
+          logger.info({ jobId, fallbackCaptionCount: captions.length }, "[ai edit job] used deterministic word-chunk fallback captions after total planning failure");
+        }
       }
       }
     }
@@ -762,6 +811,7 @@ export async function processAiEditJob(jobId: string): Promise<void> {
     let resolvedStickers: AISticker[] = [];
     let resolvedMusic: AIMusic | undefined;
     let resolvedSfx: AISfx[] = [];
+    stickers = dedupeStickersByQuery(stickers);
     if (brollProposals.length > 0 || stickers.length > 0 || sfx.length > 0 || music) {
       await setStatus(jobId, "RESOLVING_ASSETS", { progress: 75 });
       const resolutionCtx = {
