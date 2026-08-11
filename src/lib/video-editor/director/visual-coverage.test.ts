@@ -207,6 +207,92 @@ describe("deriveFixSearchQuery", () => {
     expect(result.alternatives).not.toContain(result.primary);
   });
 
+  // Fix (2026-08-14, real production regression) — a dental video's
+  // auto-inserted b-roll surfaced jogging/pushups footage. Root cause:
+  // "dentist" pointed at the SAME HEALTH_CONCEPTS array as "doctor" (which
+  // includes "exercise"/"healthy lifestyle") — real vendor evidence
+  // confirmed those two terms score a genuine 1.0 relevance against real
+  // fitness stock content, beating a weaker dental-specific primary.
+  // "dentist" now points at its own DENTAL_CONCEPTS array (reusing 3 of
+  // HEALTH_CONCEPTS' own existing values, no new vocabulary) that omits
+  // the two fitness-adjacent ones. HEALTH_CONCEPTS itself — and every
+  // OTHER key still pointing to it — is completely untouched.
+  describe("dental concept isolation (2026-08-14 fix)", () => {
+    // Test A (clean/isolated) — a description matching ONLY "dentist"
+    // (no other key present) pins the exact new alternatives array.
+    it("rule 4 — a dentist-only scene's alternatives are EXACTLY DENTAL_CONCEPTS, never exercise/healthy lifestyle", () => {
+      const visualContext = [{ startMs: 4500, endMs: 5500, description: "Dentist seated calmly explaining treatment options." }];
+      const result = deriveFixSearchQuery(gap, [], { visualContext });
+
+      expect(result.alternatives).toEqual(["doctor", "hospital", "medical"]);
+      expect(result.alternatives).not.toContain("exercise");
+      expect(result.alternatives).not.toContain("healthy lifestyle");
+    });
+
+    // Test A (real-world reproduction) — your exact literal phrase. "office"
+    // is also a matched key here (-> BUSINESS_CONCEPTS), which is expected
+    // and fine — the requirement is "never exercise/healthy lifestyle,"
+    // not "only dental terms."
+    it("rule 4 — the exact real production phrase ('Dentist seated at office desk explaining') never surfaces exercise/healthy lifestyle", () => {
+      const visualContext = [{ startMs: 4500, endMs: 5500, description: "Dentist seated at office desk explaining." }];
+      const result = deriveFixSearchQuery(gap, [], { visualContext });
+
+      expect(result.alternatives).not.toContain("exercise");
+      expect(result.alternatives).not.toContain("healthy lifestyle");
+      expect(result.alternatives.length).toBeLessThanOrEqual(10); // Test F (schema safety) for this exact real phrase
+    });
+
+    // Test B — general doctor/health behavior is byte-for-byte unchanged
+    // (HEALTH_CONCEPTS itself, and the "doctor" key's own target, were
+    // never touched — this is the EXACT same fixture/expectation as the
+    // pre-existing "a caption containing one of the newly-added English
+    // domain keywords" test above, re-pinned here explicitly as this
+    // fix's own regression proof).
+    it("rule 2 — general 'doctor' behavior is unchanged: still gets exercise/healthy lifestyle (contrast with dentist, above)", () => {
+      const captions = [caption("a doctor talking about diabetes", 0, 1000)];
+      const result = deriveFixSearchQuery({ startMs: 0, endMs: 5000, durationMs: 5000 }, captions);
+
+      expect(result.primary).toBe("doctor");
+      expect(result.alternatives).toEqual(["healthy lifestyle", "exercise", "hospital", "medical"]);
+    });
+
+    // Test C — mixed context: "dentist" AND an independently-matching
+    // "healthy" token in the SAME text. exercise/healthy lifestyle must
+    // NOT be globally suppressed — they still surface here, contributed
+    // by "healthy" (HEALTH_CONCEPTS, untouched), completely independent
+    // of "dentist" now pointing elsewhere.
+    it("rule 2 — mixed context ('Dentist explains healthy habits'): exercise/healthy lifestyle still appear, contributed independently by the 'healthy' token", () => {
+      const captions = [caption("Dentist explains healthy habits", 0, 1000)];
+      const result = deriveFixSearchQuery({ startMs: 0, endMs: 5000, durationMs: 5000 }, captions);
+
+      expect(result.alternatives).toContain("healthy lifestyle");
+      expect(result.alternatives).toContain("exercise");
+      // "dentist"'s own contribution (doctor/hospital/medical) is still present too.
+      expect(result.alternatives).toContain("hospital");
+      expect(result.alternatives).toContain("medical");
+    });
+
+    // Test D — explicit exercise context with "doctor" (not "dentist") —
+    // proves "doctor" was never accidentally narrowed by this fix.
+    it("rule 2 — 'Doctor discussing exercise and healthy lifestyle': both concepts remain fully available", () => {
+      const captions = [caption("Doctor discussing exercise and healthy lifestyle", 0, 1000)];
+      const result = deriveFixSearchQuery({ startMs: 0, endMs: 5000, durationMs: 5000 }, captions);
+
+      expect(result.alternatives).toContain("exercise");
+      expect(result.alternatives).toContain("healthy lifestyle");
+    });
+
+    // Test F — schema safety: a multi-category text involving "dentist"
+    // still respects the pre-existing searchQueries cap (MAX_HINGLISH_CONCEPT_MATCHES
+    // = 10, unchanged by this fix — see the 2026-08-13 fix just above this one).
+    it("rule 2 — a multi-category text involving 'dentist' still respects the schema's max(10) searchQueries cap", () => {
+      const captions = [caption("dentist business money finance", 0, 1000)];
+      const result = deriveFixSearchQuery({ startMs: 0, endMs: 5000, durationMs: 5000 }, captions);
+
+      expect(result.alternatives.length).toBeLessThanOrEqual(10);
+    });
+  });
+
   it("rule 3 — prefers literal English words spoken inline near the gap (Devanagari transcript, Latin-script token)", () => {
     const captions = [caption("Aapke Ghar Tak", 3000, 6500)]; // would otherwise map to HOME_CONCEPTS
     const words = [

@@ -450,6 +450,20 @@ function isLikelyEnglishWord(word: string): boolean {
 const HOME_CONCEPTS = ["house construction", "home interior", "family home", "construction worker", "new house"];
 const MONEY_CONCEPTS = ["money", "investment", "finance", "saving", "calculator", "bank"];
 const HEALTH_CONCEPTS = ["doctor", "healthy lifestyle", "exercise", "hospital", "medical"];
+// Fix (2026-08-14, real production regression — dental video got
+// running/jogging b-roll) — "dentist" used to point at the SAME
+// HEALTH_CONCEPTS array as "doctor"/"hospital"/"medical"/"clinic"/
+// "patient"/"nurse", so its own alternatives could include "exercise"/
+// "healthy lifestyle" — real vendor evidence confirmed these score a
+// genuine 1.0 relevance against real jogging/pushups stock footage,
+// winning over a weaker dental-specific primary. Reuses 3 of
+// HEALTH_CONCEPTS' own existing values (no new vocabulary) minus the two
+// fitness-adjacent ones that don't fit dental care specifically.
+// HEALTH_CONCEPTS itself, and every OTHER key still pointing to it, is
+// completely untouched — a text that independently matches "healthy" or
+// "doctor" still contributes "exercise"/"healthy lifestyle" via THOSE
+// keys' own (unchanged) HEALTH_CONCEPTS array, exactly as before.
+const DENTAL_CONCEPTS = ["doctor", "hospital", "medical"];
 const BUSINESS_CONCEPTS = ["office", "startup", "meeting", "teamwork", "sales", "marketing"];
 const EDUCATION_CONCEPTS = ["classroom", "student studying", "school", "books", "graduation"];
 const FOOD_CONCEPTS = ["indian food", "cooking", "kitchen", "restaurant", "healthy food"];
@@ -494,7 +508,7 @@ const HINGLISH_VISUAL_CONCEPT_MAP: Record<string, string[]> = {
   // matchable candidates to try. Minimal, targeted additions — one or two
   // clearly domain-identifying English nouns per vertical this map didn't
   // already cover in plain English, not an attempt at a full synonym set.
-  doctor: HEALTH_CONCEPTS, hospital: HEALTH_CONCEPTS, medical: HEALTH_CONCEPTS, clinic: HEALTH_CONCEPTS, dentist: HEALTH_CONCEPTS, patient: HEALTH_CONCEPTS, nurse: HEALTH_CONCEPTS,
+  doctor: HEALTH_CONCEPTS, hospital: HEALTH_CONCEPTS, medical: HEALTH_CONCEPTS, clinic: HEALTH_CONCEPTS, dentist: DENTAL_CONCEPTS, patient: HEALTH_CONCEPTS, nurse: HEALTH_CONCEPTS,
   house: HOME_CONCEPTS, home: HOME_CONCEPTS, construction: HOME_CONCEPTS, property: HOME_CONCEPTS,
   money: MONEY_CONCEPTS, finance: MONEY_CONCEPTS, investment: MONEY_CONCEPTS, bank: MONEY_CONCEPTS,
   office: BUSINESS_CONCEPTS, meeting: BUSINESS_CONCEPTS, startup: BUSINESS_CONCEPTS,
