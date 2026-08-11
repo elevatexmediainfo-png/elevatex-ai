@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { computeBrollTargetRange, GPT5ReasoningProvider, resolveCaptionTiming } from "./gpt5.provider";
 import type { ReasoningPlanRequest, ReasoningReeditRequest } from "./types";
+import { logger } from "@/lib/observability/logger";
 
 // TASK 1 (2026-08-07 — "heavy density should visually change the video
 // every few seconds").
@@ -338,6 +339,112 @@ describe("GPT5ReasoningProvider.plan", () => {
     const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
     await expect(provider.plan(BASE_REQUEST)).rejects.toThrow(/GPT-5 reasoning request failed \(500\)/);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // Diagnostic instrumentation (2026-08-15, "why is plan_timeline still
+  // timing out") — verifies the NEW logging is purely additive: never
+  // changes what plan() returns/throws, correctly numbers repair attempts,
+  // and never writes sensitive content (API key, full prompt, transcript
+  // text) to logs. Does not re-test repair/schema/error MECHANICS
+  // themselves — those are already covered by the tests above; this only
+  // covers the instrumentation layered on top of them.
+  describe("diagnostic instrumentation", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("does not alter the successful return value — logs are purely additive", async () => {
+      const infoSpy = vi.spyOn(logger, "info");
+      const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+      const result = await provider.plan(BASE_REQUEST);
+
+      // Exact same return value as the existing "happy path" test above —
+      // instrumentation changed nothing about it.
+      expect(result.captions).toEqual([{ text: "Hello world.", startMs: 0, endMs: 600 }]);
+      expect(result.providerRef).toBe("chatcmpl-test");
+
+      // The new logs actually fired, with the expected structured fields.
+      const sizeLog = infoSpy.mock.calls.find(([, msg]) => msg === "[gpt5 reasoning] plan_timeline request size");
+      expect(sizeLog?.[0]).toMatchObject({ operation: "plan_timeline", model: "gpt-5", transcriptWordCount: 2 });
+      const successLog = infoSpy.mock.calls.find(([, msg]) => msg === "[gpt5 reasoning] plan_timeline fetch attempt succeeded");
+      expect(successLog?.[0]).toMatchObject({ operation: "plan_timeline", repairAttempt: 0, outcome: "success", httpStatus: 200, usageTotalTokens: 42 });
+    });
+
+    it("does not alter timeout/abort error propagation — the SAME AbortError still throws, with timing/classification logged alongside it", async () => {
+      const warnSpy = vi.spyOn(logger, "warn");
+      const abortError = new DOMException("The operation was aborted.", "AbortError");
+      const fetchMock = vi.fn().mockRejectedValue(abortError);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+      // The exact same error instance/name still propagates — instrumentation
+      // only observes it (try/catch + rethrow), never swallows or wraps it.
+      await expect(provider.plan(BASE_REQUEST)).rejects.toBe(abortError);
+
+      const abortLog = warnSpy.mock.calls.find(([, msg]) => msg === "[gpt5 reasoning] plan_timeline fetch attempt failed (network error or aborted)");
+      expect(abortLog?.[0]).toMatchObject({ operation: "plan_timeline", repairAttempt: 0, outcome: "aborted", errorName: "AbortError" });
+      expect(typeof (abortLog?.[0] as { elapsedMs?: number })?.elapsedMs).toBe("number");
+    });
+
+    it("does not alter non-ok HTTP error propagation, and logs the http_error outcome with status", async () => {
+      const warnSpy = vi.spyOn(logger, "warn");
+      const fetchMock = vi.fn().mockResolvedValue(chatResponse("server error", false));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+      await expect(provider.plan(BASE_REQUEST)).rejects.toThrow(/GPT-5 reasoning request failed \(500\)/);
+
+      const httpErrorLog = warnSpy.mock.calls.find(([, msg]) => msg === "[gpt5 reasoning] plan_timeline fetch attempt returned a non-OK HTTP status");
+      expect(httpErrorLog?.[0]).toMatchObject({ operation: "plan_timeline", repairAttempt: 0, httpStatus: 500, ok: false, outcome: "http_error" });
+    });
+
+    it("repair attempt numbering is correct: 0 for the original request, 1 for the repair retry — matching the real production semantics (0 = original, 1 = repair)", async () => {
+      const infoSpy = vi.spyOn(logger, "info");
+      const warnSpy = vi.spyOn(logger, "warn");
+      const malformed = JSON.stringify({ zoom: [{ startMs: 0, endMs: 1000, scaleFrom: 100, scaleTo: 9999 }], captions: [], broll: [] }); // scaleTo out of range
+      const fetchMock = vi.fn().mockResolvedValueOnce(chatResponse(malformed)).mockResolvedValueOnce(chatResponse(VALID_JSON));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+      await provider.plan(BASE_REQUEST);
+
+      const startLogs = infoSpy.mock.calls.filter(([, msg]) => msg === "[gpt5 reasoning] plan_timeline fetch attempt starting").map(([fields]) => fields as { repairAttempt: number });
+      expect(startLogs.map((f) => f.repairAttempt)).toEqual([0, 1]);
+
+      const schemaFailLog = warnSpy.mock.calls.find(([, msg]) => msg === "[gpt5 reasoning] plan_timeline response failed schema validation for some items");
+      expect(schemaFailLog?.[0]).toMatchObject({ repairAttempt: 0, willRepair: true });
+
+      const successLog = infoSpy.mock.calls.find(([, msg]) => msg === "[gpt5 reasoning] plan_timeline fetch attempt succeeded");
+      expect(successLog?.[0]).toMatchObject({ repairAttempt: 1 });
+    });
+
+    it("never logs the API key, the full prompt text, or transcript word text — only numeric/status/classification metadata", async () => {
+      const infoSpy = vi.spyOn(logger, "info");
+      const warnSpy = vi.spyOn(logger, "warn");
+      const secretApiKey = "sk-test-super-secret-key-do-not-leak";
+      const words = [
+        { word: "VerySecretTranscriptWordXyzzy", startMs: 0, endMs: 300 },
+        { word: "AnotherSensitiveWordQwerty", startMs: 300, endMs: 600 },
+      ];
+      const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const provider = new GPT5ReasoningProvider({ apiKey: secretApiKey });
+      await provider.plan({ ...BASE_REQUEST, words });
+
+      const allLoggedPayloads = [...infoSpy.mock.calls, ...warnSpy.mock.calls].map(([fields]) => JSON.stringify(fields));
+      for (const payload of allLoggedPayloads) {
+        expect(payload).not.toContain(secretApiKey);
+        expect(payload).not.toContain("VerySecretTranscriptWordXyzzy");
+        expect(payload).not.toContain("AnotherSensitiveWordQwerty");
+        // The full prompt text is never logged either — only its length —
+        // a real prompt contains this literal TASK-1 marker string.
+        expect(payload).not.toContain("TASK 1 — captions");
+      }
+    });
   });
 
   it("passes videoAnalysis emphasis moments through to the prompt when provided", async () => {

@@ -483,23 +483,68 @@ async function runPlanJsonRepairLoop(params: {
   const { apiKey, model, messages, repairMaxAttempts, errorPrefix, signal } = params;
 
   for (let attempt = 0; attempt <= repairMaxAttempts; attempt++) {
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      // Fix (2026-08-06) — reasoning-tier models (o-series, gpt-5 family)
-      // reject ANY custom temperature value; chatTemperatureParam omits it
-      // entirely for those, detected by model name, not hardcoded per
-      // caller — see openai-chat-params.ts's own doc comment.
-      body: JSON.stringify({ model, messages, ...chatTemperatureParam(model, 0.4), response_format: { type: "json_object" } }),
-      signal,
-    });
+    // Diagnostic instrumentation (2026-08-15, "why is plan_timeline still
+    // timing out") — timing/outcome visibility for each real OpenAI call
+    // this loop makes. `attempt` here is the REPAIR attempt (0 = original
+    // request, 1 = repair retry) — distinct from the engine's own attempt
+    // number logged separately in generation/reasoning.ts. Every log
+    // point below is purely additive: the fetch call, its body, and
+    // `signal` are passed through completely unchanged from before this
+    // instrumentation — nothing here can alter what gets sent or how the
+    // request is cancelled.
+    const attemptStartedAt = Date.now();
+    logger.info({ operation: "plan_timeline", repairAttempt: attempt, repairMaxAttempts, startedAt: attemptStartedAt }, "[gpt5 reasoning] plan_timeline fetch attempt starting");
+
+    let res: Response;
+    try {
+      res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        // Fix (2026-08-06) — reasoning-tier models (o-series, gpt-5 family)
+        // reject ANY custom temperature value; chatTemperatureParam omits it
+        // entirely for those, detected by model name, not hardcoded per
+        // caller — see openai-chat-params.ts's own doc comment.
+        body: JSON.stringify({ model, messages, ...chatTemperatureParam(model, 0.4), response_format: { type: "json_object" } }),
+        signal,
+      });
+    } catch (err) {
+      // Network error OR abort (timeout) — the ONLY case with no HTTP
+      // response at all. Logged then RE-THROWN unchanged (same error
+      // object/message/name) — this instrumentation never swallows or
+      // wraps the original error.
+      const elapsedMs = Date.now() - attemptStartedAt;
+      logger.warn(
+        {
+          operation: "plan_timeline",
+          repairAttempt: attempt,
+          elapsedMs,
+          outcome: err instanceof Error && err.name === "AbortError" ? "aborted" : "network_error",
+          errorName: err instanceof Error ? err.name : typeof err,
+          errorMessage: err instanceof Error ? err.message : String(err),
+          signalAborted: signal?.aborted ?? false,
+        },
+        "[gpt5 reasoning] plan_timeline fetch attempt failed (network error or aborted)"
+      );
+      throw err;
+    }
+    const respondedAt = Date.now();
+    const elapsedMs = respondedAt - attemptStartedAt;
+
     if (!res.ok) {
       const body = await res.text().catch(() => "");
+      logger.warn(
+        { operation: "plan_timeline", repairAttempt: attempt, elapsedMs, httpStatus: res.status, ok: false, outcome: "http_error" },
+        "[gpt5 reasoning] plan_timeline fetch attempt returned a non-OK HTTP status"
+      );
       throw new Error(`${errorPrefix} request failed (${res.status}): ${body.slice(0, 300)}`);
     }
     const json = await res.json();
     const text = json.choices?.[0]?.message?.content;
     if (typeof text !== "string") {
+      logger.warn(
+        { operation: "plan_timeline", repairAttempt: attempt, elapsedMs, httpStatus: res.status, ok: true, outcome: "no_message_content" },
+        "[gpt5 reasoning] plan_timeline response did not contain a message"
+      );
       throw new Error(`${errorPrefix} response did not contain a message.`);
     }
 
@@ -507,7 +552,12 @@ async function runPlanJsonRepairLoop(params: {
     try {
       rawParsed = JSON.parse(text);
     } catch {
-      if (attempt < repairMaxAttempts) {
+      const willRepair = attempt < repairMaxAttempts;
+      logger.warn(
+        { operation: "plan_timeline", repairAttempt: attempt, elapsedMs, httpStatus: res.status, ok: true, outcome: "json_parse_failure", willRepair },
+        "[gpt5 reasoning] plan_timeline response was not valid JSON"
+      );
+      if (willRepair) {
         messages.push({ role: "assistant", content: text });
         messages.push({
           role: "user",
@@ -519,10 +569,28 @@ async function runPlanJsonRepairLoop(params: {
     }
 
     const { data, warnings } = parsePlanOutputLeniently(rawParsed);
+    // Only log usage fields that actually exist on the response — never
+    // assume reasoning_tokens (or any other field) is present.
+    const usage = json.usage as { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number; reasoning_tokens?: number } | undefined;
+    const usageLogFields = {
+      ...(usage?.total_tokens != null ? { usageTotalTokens: usage.total_tokens } : {}),
+      ...(usage?.prompt_tokens != null ? { usagePromptTokens: usage.prompt_tokens } : {}),
+      ...(usage?.completion_tokens != null ? { usageCompletionTokens: usage.completion_tokens } : {}),
+      ...(usage?.reasoning_tokens != null ? { usageReasoningTokens: usage.reasoning_tokens } : {}),
+    };
     if (warnings.length === 0) {
+      logger.info(
+        { operation: "plan_timeline", repairAttempt: attempt, elapsedMs, httpStatus: res.status, ok: true, outcome: "success", willRepair: false, ...usageLogFields },
+        "[gpt5 reasoning] plan_timeline fetch attempt succeeded"
+      );
       return { data, warnings: [], providerRef: json.id, usage: { tokens: json.usage?.total_tokens } };
     }
-    if (attempt < repairMaxAttempts) {
+    const willRepair = attempt < repairMaxAttempts;
+    logger.warn(
+      { operation: "plan_timeline", repairAttempt: attempt, elapsedMs, httpStatus: res.status, ok: true, outcome: "schema_validation_failure", willRepair, droppedItemCount: warnings.length, ...usageLogFields },
+      "[gpt5 reasoning] plan_timeline response failed schema validation for some items"
+    );
+    if (willRepair) {
       messages.push({ role: "assistant", content: text });
       messages.push({
         role: "user",
@@ -535,6 +603,10 @@ async function runPlanJsonRepairLoop(params: {
     // this function's own doc comment above). This is the ONE real
     // behavior difference from runJsonRepairLoop's own "throw once
     // exhausted" contract.
+    logger.info(
+      { operation: "plan_timeline", repairAttempt: attempt, elapsedMs, outcome: "partial_success_after_repair_exhausted", droppedItemCount: warnings.length, ...usageLogFields },
+      "[gpt5 reasoning] plan_timeline repair attempts exhausted — returning whatever validated"
+    );
     return { data, warnings, providerRef: json.id, usage: { tokens: json.usage?.total_tokens } };
   }
 
@@ -842,6 +914,33 @@ export class GPT5ReasoningProvider implements ReasoningProvider {
       throw new Error("gpt5 is enabled but no API key is configured (Admin → AI Providers).");
     }
     const repairMaxAttempts = req.repairMaxAttempts ?? DEFAULT_REPAIR_MAX_ATTEMPTS;
+    const userPrompt = buildPrompt(req);
+
+    // Diagnostic instrumentation (2026-08-15, "why is plan_timeline still
+    // timing out") — request-SIZE visibility only, computed from data
+    // already in scope; never logs the prompt/transcript text itself,
+    // only counts/lengths. approxPromptTokens is a plain chars/4
+    // arithmetic estimate (no tokenizer library — this codebase has no
+    // existing char->token convention to reuse, confirmed by inspecting
+    // generation/cost.ts, which relies on the API's own real usage.tokens,
+    // never an estimate), explicitly labeled "approx" so it's never
+    // mistaken for a real count.
+    logger.info(
+      {
+        operation: "plan_timeline",
+        model: this.model,
+        transcriptWordCount: req.words.length,
+        transcriptCharCount: req.words.reduce((sum, w) => sum + w.word.length, 0),
+        promptCharCount: userPrompt.length,
+        approxPromptTokens: Math.ceil(userPrompt.length / 4),
+        hasVideoAnalysis: !!req.videoAnalysis,
+        emphasisMomentCount: req.videoAnalysis?.emphasisMoments?.length,
+        emotionBeatCount: req.videoAnalysis?.emotionBeats?.length,
+        sceneDescriptionCount: req.videoAnalysis?.visualContext?.length,
+        repairMaxAttempts,
+      },
+      "[gpt5 reasoning] plan_timeline request size"
+    );
 
     const messages: ChatMessage[] = [
       {
@@ -849,7 +948,7 @@ export class GPT5ReasoningProvider implements ReasoningProvider {
         content:
           "You are a precise video-editing assistant that outputs ONLY valid JSON, exactly matching the schema you're given. Never include prose, markdown fences, or explanation outside the JSON object.",
       },
-      { role: "user", content: buildPrompt(req) },
+      { role: "user", content: userPrompt },
     ];
 
     const result = await runPlanJsonRepairLoop({
