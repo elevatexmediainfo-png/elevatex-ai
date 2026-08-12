@@ -510,6 +510,43 @@ describe("GPT5ReasoningProvider.plan", () => {
       expect(userMessage).toContain("Montserrat");
       expect(userMessage).toContain('"style.fontFamily"');
     });
+
+    // Fix (2026-08-17, stabilization audit finding #4) — strengthens WHICH
+    // words get highlighted (this remains GPT's own judgment call every
+    // time — no deterministic keyword list was added in code) without
+    // touching the language/color/font requirements above, which the
+    // preceding tests in this block already re-confirm are untouched.
+    it("contains all 8 power-word priority categories, in priority order", async () => {
+      const userMessage = await getUserMessage();
+      expect(userMessage).toContain("1. Numbers");
+      expect(userMessage).toContain("2. Money / prices / percentages");
+      expect(userMessage).toContain("3. Business keywords");
+      expect(userMessage).toContain("4. Action words");
+      expect(userMessage).toContain("5. Strong emotional words");
+      expect(userMessage).toContain("6. Contrast words");
+      expect(userMessage).toContain("7. Important nouns");
+      expect(userMessage).toContain("8. CTA words");
+    });
+
+    it("tells the model to give the single strongest word yellow and a genuine second word cyan, never inventing a second one", async () => {
+      const userMessage = await getUserMessage();
+      expect(userMessage).toContain("Give the single strongest word from this priority order yellow (ACCENT 1)");
+      expect(userMessage).toContain("give the next-strongest word (only if a genuinely distinct second one exists — don't invent one) cyan (ACCENT 2)");
+    });
+
+    it("keeps every prior rule intact alongside the new priority list: no rainbow, no coloring every word, no more than 3 colors, no red/green", async () => {
+      const userMessage = await getUserMessage();
+      expect(userMessage.toLowerCase()).toContain("rainbow");
+      expect(userMessage).toContain("Do NOT color every word");
+      expect(userMessage).toContain("Do NOT color most of the caption");
+      expect(userMessage).toContain("Do NOT randomly alternate colors");
+      expect(userMessage).toContain("EXACTLY these THREE colors");
+      expect(userMessage).not.toContain("#FF3B30");
+      expect(userMessage).not.toContain("#34C759");
+      // And the language/Devanagari rules from the earlier tests in this
+      // block are still present in the SAME combined guidance block.
+      expect(userMessage).toContain("NEVER Devanagari script");
+    });
   });
 
   it("passes videoAnalysis emphasis moments through to the prompt when provided", async () => {

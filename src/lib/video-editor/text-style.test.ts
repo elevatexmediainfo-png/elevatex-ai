@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_REVEAL_CONFIG, resolveRevealUnits, resolveRunColor, richFormattingAt, splitRichTextSegments, type RevealConfig, type RichTextRun } from "./text-style";
+import {
+  CAPTION_FONT_FAMILY_CSS_VARS,
+  DEFAULT_REVEAL_CONFIG,
+  resolveCaptionFontFamily,
+  resolveCaptionTypography,
+  resolveRevealUnits,
+  resolveRunColor,
+  richFormattingAt,
+  splitRichTextSegments,
+  type RevealConfig,
+  type RichTextRun,
+} from "./text-style";
 
 describe("splitRichTextSegments", () => {
   it("returns one plain segment when there are no runs", () => {
@@ -177,5 +188,78 @@ describe("resolveRunColor", () => {
 
   it("KARAOKE: a non-current word with no richRun color stays undefined (never gets the highlight color)", () => {
     expect(resolveRunColor(undefined, KARAOKE_REVEAL, false)).toBeUndefined();
+  });
+});
+
+// Caption pipeline fix (2026-08-17, stabilization audit finding #5) —
+// Poppins/Montserrat are now actually loaded (lib/fonts.ts, via the
+// existing next/font/google mechanism) as CSS custom properties; this map
+// is the test-safe seam that resolves the LITERAL name GPT/the manual font
+// picker use into the real loaded value. See lib/fonts.test.ts for the
+// companion check that lib/fonts.ts itself actually loads both fonts under
+// these exact CSS variable names (that file can't be imported directly
+// under vitest — next/font/google requires Next's own build pipeline).
+describe("CAPTION_FONT_FAMILY_CSS_VARS / resolveCaptionFontFamily", () => {
+  it("maps poppins and montserrat to their real loaded CSS variables", () => {
+    expect(CAPTION_FONT_FAMILY_CSS_VARS.poppins).toBe("var(--font-poppins)");
+    expect(CAPTION_FONT_FAMILY_CSS_VARS.montserrat).toBe("var(--font-montserrat)");
+  });
+
+  it("resolves 'Poppins'/'Montserrat' (any case) to the loaded CSS variable", () => {
+    expect(resolveCaptionFontFamily("Poppins")).toBe("var(--font-poppins)");
+    expect(resolveCaptionFontFamily("montserrat")).toBe("var(--font-montserrat)");
+    expect(resolveCaptionFontFamily("MONTSERRAT")).toBe("var(--font-montserrat)");
+  });
+
+  it("passes through a font name that isn't Poppins/Montserrat unchanged (e.g. a custom Brand Kit font)", () => {
+    expect(resolveCaptionFontFamily("editor-font-asset123")).toBe("editor-font-asset123");
+  });
+
+  it("returns undefined when no font family was given, letting the caller decide its own default", () => {
+    expect(resolveCaptionFontFamily(undefined)).toBeUndefined();
+  });
+});
+
+// Caption pipeline fix (2026-08-17, stabilization audit findings #2/#5) —
+// resolveCaptionTypography is the tested single source of truth TextLayer
+// now uses for "explicit style wins, otherwise a strong caption default,
+// scoped to captions only (isSubtitle)."
+describe("resolveCaptionTypography", () => {
+  it("caption (isSubtitle=true) with no explicit style receives the strong default: loaded Poppins, weight 800, white", () => {
+    const result = resolveCaptionTypography({}, true);
+    expect(result.fontFamily).toBe("var(--font-poppins)");
+    expect(result.fontWeight).toBe(800);
+    expect(result.color).toBe("#ffffff");
+  });
+
+  it("an explicit GPT-provided fontFamily still wins over the caption default", () => {
+    const result = resolveCaptionTypography({ fontFamily: "Montserrat" }, true);
+    expect(result.fontFamily).toBe("var(--font-montserrat)");
+  });
+
+  it("an explicit GPT-provided fontWeight still wins over the caption default", () => {
+    const result = resolveCaptionTypography({ fontWeight: 600 }, true);
+    expect(result.fontWeight).toBe(600);
+  });
+
+  it("an explicit GPT-provided color still wins over the caption default", () => {
+    const result = resolveCaptionTypography({ color: "#FFD60A" }, true);
+    expect(result.color).toBe("#FFD60A");
+  });
+
+  it("a non-caption text clip (isSubtitle=false) with no explicit style keeps the prior inherit/400 default, untouched", () => {
+    const result = resolveCaptionTypography({}, false);
+    expect(result.fontFamily).toBe("inherit");
+    expect(result.fontWeight).toBe(400);
+    expect(result.color).toBe("#ffffff"); // color's default was always unconditional, isSubtitle-independent
+  });
+
+  it("fallback captions (no style object at all — caption-formatting.ts's buildFallbackCaptionsFromWords) get the same strong caption default as any other caption, with zero semantic highlight logic involved", () => {
+    // Fallback captions never set style.fontFamily/fontWeight/color at all
+    // (an empty object is exactly what reaches this function for them) —
+    // this proves they receive the safe visual defaults (strong font,
+    // 800, white) without needing any new deterministic highlighter.
+    const result = resolveCaptionTypography({}, true);
+    expect(result).toEqual({ fontFamily: "var(--font-poppins)", fontWeight: 800, color: "#ffffff" });
   });
 });

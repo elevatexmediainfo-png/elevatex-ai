@@ -150,6 +150,73 @@ export function resolveRunColor(richRunColor: string | undefined, reveal: Reveal
   return undefined;
 }
 
+// Caption pipeline fix (2026-08-17, stabilization audit finding #5) — a
+// literal font-family name like "Poppins"/"Montserrat" (set by GPT's own
+// caption prompt guidance, gpt5.provider.ts, or picked from the manual
+// editor's own AVAILABLE_FONTS list, lib/admin/config.ts) was never
+// actually loaded as a real webfont anywhere in this codebase before this
+// fix — the browser silently fell back to its generic sans-serif. Both
+// fonts are now loaded via the EXISTING next/font/google mechanism
+// (lib/fonts.ts, same as Inter/Noto Sans Devanagari) as CSS custom
+// properties on <body> (app/layout.tsx) — inherited by every route,
+// including this app's headless export render route (export-worker.ts's
+// page.goto("/editor/[id]/render")), no separate mounting needed. These
+// CSS variable NAMES are duplicated as string literals here (not imported
+// from lib/fonts.ts) because that module calls next/font/google at import
+// time, which requires Next's own build pipeline and is unsafe to import
+// from a plain vitest unit test — this small map is the deliberate,
+// test-safe seam between the two. Keep the variable names in sync with
+// lib/fonts.ts's own `variable: "--font-poppins"` / `"--font-montserrat"`
+// options if either ever changes.
+export const CAPTION_FONT_FAMILY_CSS_VARS: Record<string, string> = {
+  poppins: "var(--font-poppins)",
+  montserrat: "var(--font-montserrat)",
+};
+
+// A name that isn't Poppins/Montserrat (a custom Brand Kit font — see
+// custom-font-faces.tsx — or any other manual-editor font picker entry)
+// passes through UNCHANGED, exactly as before this fix; only these two
+// specific, previously-non-functional names are resolved to their real
+// loaded value. Absent input returns undefined (caller decides its own
+// default) rather than a hardcoded fallback here.
+export function resolveCaptionFontFamily(rawFontFamily: string | undefined): string | undefined {
+  if (!rawFontFamily) return undefined;
+  const key = rawFontFamily.trim().toLowerCase();
+  return CAPTION_FONT_FAMILY_CSS_VARS[key] ?? rawFontFamily;
+}
+
+export interface CaptionTypography {
+  fontFamily: string;
+  fontWeight: number;
+  color: string;
+}
+
+// Caption pipeline fix (2026-08-17, stabilization audit findings #2/#5) —
+// STRONG DEFAULT typography, extracted as its own pure function (same
+// "testable without a React/JSX harness" reasoning as resolveRunColor
+// above — compositor-stage.tsx's TextLayer just calls this once). SCOPED
+// TO CAPTIONS ONLY (`isSubtitle` — true when the clip sits on a SUBTITLE
+// track, the same track kind AI Auto-Edit captions AND their deterministic
+// fallback (buildFallbackCaptionsFromWords, caption-formatting.ts, which
+// never sets a style at all) are always placed on, see
+// ai-timeline-translator.ts's translateCaptions). A manually-created
+// general TEXT/OVERLAY clip is never on a SUBTITLE track, so it keeps its
+// prior "inherit"/400 default, completely untouched by this fix. Priority
+// is always: an explicit value (set by GPT, or a manual edit) wins;
+// otherwise, ONLY for captions, a strong bold default applies instead of
+// the generic browser default. `color` was already an unconditional
+// "#ffffff" default for every text clip before this fix (untouched
+// behavior) — bundled in here too so all three caption-typography
+// defaults are covered by one tested function instead of one tested and
+// two left inline.
+export function resolveCaptionTypography(explicit: { fontFamily?: string; fontWeight?: number; color?: string }, isSubtitle: boolean): CaptionTypography {
+  return {
+    fontFamily: resolveCaptionFontFamily(explicit.fontFamily) ?? (isSubtitle ? CAPTION_FONT_FAMILY_CSS_VARS.poppins : "inherit"),
+    fontWeight: explicit.fontWeight ?? (isSubtitle ? 800 : 400),
+    color: explicit.color ?? "#ffffff",
+  };
+}
+
 export interface RevealUnit {
   text: string;
   isWhitespace: boolean;

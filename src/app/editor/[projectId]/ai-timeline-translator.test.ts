@@ -744,7 +744,13 @@ describe("translateAITimelinePlan", () => {
     expect(deps.addTrackAndClip.removeTrack).toHaveBeenCalledWith("new-track-id");
   });
 
-  it("caption reveal defaults to WORD mode when the plan omits it", async () => {
+  // Caption pipeline fix (2026-08-17, stabilization audit finding #3) —
+  // WORD/POP/150ms replaces the old WORD/FADE/200ms default (a flat,
+  // unhurried fade) — reuses the EXISTING reveal engine (text-style.ts)
+  // verbatim, just a different default value. Only the DEFAULT used when
+  // the plan/fallback captions omit "reveal" entirely; see the next test
+  // for an explicit GPT-authored reveal staying completely untouched.
+  it("caption reveal defaults to WORD/POP/150ms (a short, energetic reveal) when the plan omits it", async () => {
     const project = baseProject({ tracks: [makeTrack({ id: "sub-1", kind: "SUBTITLE" })] });
     const plan = emptyPlan({ captions: [{ text: "Hi", startMs: 0, endMs: 1000 }] });
     const deps = makeFakeDeps();
@@ -753,7 +759,22 @@ describe("translateAITimelinePlan", () => {
     await runModules(result).execute();
 
     expect(deps.clip.addClip).toHaveBeenCalledWith(
-      expect.objectContaining({ content: expect.objectContaining({ reveal: expect.objectContaining({ mode: "WORD" }) }) })
+      expect.objectContaining({ content: expect.objectContaining({ reveal: expect.objectContaining({ mode: "WORD", style: "POP", unitDurationMs: 150 }) }) })
+    );
+  });
+
+  it("an explicit GPT-authored reveal is used completely unchanged, never overridden by the default", async () => {
+    const project = baseProject({ tracks: [makeTrack({ id: "sub-1", kind: "SUBTITLE" })] });
+    const plan = emptyPlan({
+      captions: [{ text: "Hi", startMs: 0, endMs: 1000, reveal: { mode: "KARAOKE", unitDurationMs: 300, style: "COLOR_SWEEP", highlightColor: "#FFD60A" } }],
+    });
+    const deps = makeFakeDeps();
+
+    const result = translateAITimelinePlan(plan, project, deps);
+    await runModules(result).execute();
+
+    expect(deps.clip.addClip).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.objectContaining({ reveal: { mode: "KARAOKE", unitDurationMs: 300, style: "COLOR_SWEEP", highlightColor: "#FFD60A" } }) })
     );
   });
 

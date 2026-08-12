@@ -7,7 +7,7 @@ import {
   type BlendMode,
   type ClipTransform,
 } from "@/lib/video-editor/transform";
-import { DEFAULT_REVEAL_CONFIG, resolveRevealUnits, richFormattingAt, resolveRunColor } from "@/lib/video-editor/text-style";
+import { DEFAULT_REVEAL_CONFIG, resolveCaptionTypography, resolveRevealUnits, richFormattingAt, resolveRunColor } from "@/lib/video-editor/text-style";
 import { computeTrackZIndex } from "@/lib/video-editor/track-stacking";
 import { assignTrackSlots } from "@/lib/video-editor/track-slot-assignment";
 import {
@@ -852,13 +852,19 @@ function TextLayer({
   }
 
   const hasGradient = (content.gradientColors?.length ?? 0) >= 2;
+  // Caption pipeline fix (2026-08-17, stabilization audit finding #5) —
+  // resolveCaptionTypography (text-style.ts) is the tested single source
+  // of truth for "explicit style wins, otherwise a strong caption default"
+  // — see that function's own doc comment for the full reasoning (isSubtitle
+  // scoping, why color's default was already unconditional, etc.).
+  const typography = resolveCaptionTypography({ fontFamily: content.fontFamily, fontWeight: content.fontWeight, color: content.color }, isSubtitle);
   const baseTextStyle: React.CSSProperties = {
-    fontFamily: content.fontFamily ?? "inherit",
+    fontFamily: typography.fontFamily,
     fontSize: content.fontSize ? `${content.fontSize}px` : "24px",
-    fontWeight: content.fontWeight ?? 400,
+    fontWeight: typography.fontWeight,
     letterSpacing: content.letterSpacing ? `${content.letterSpacing}px` : undefined,
     lineHeight: content.lineHeight ?? 1.3,
-    color: hasGradient ? undefined : (content.color ?? "#ffffff"),
+    color: hasGradient ? undefined : typography.color,
     ...(hasGradient
       ? {
           backgroundImage: `linear-gradient(${content.gradientAngleDeg ?? 90}deg, ${content.gradientColors!.join(", ")})`,

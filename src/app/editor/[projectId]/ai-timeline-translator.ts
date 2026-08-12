@@ -482,7 +482,22 @@ function resolveCaptionHighlightRuns(text: string, highlightWords: AICaption["hi
 // existing-vs-fresh-track branching, which doesn't apply there.
 function buildCaptionClipInputs(items: AICaption[]): Omit<AddClipPatch, "trackId">[] {
   return items.map((caption) => {
-    const reveal = caption.reveal ?? { ...DEFAULT_REVEAL_CONFIG, mode: "WORD" as const };
+    // Caption pipeline fix (2026-08-17, stabilization audit finding #3) —
+    // this is the REAL default reveal every AI Auto-Edit caption without
+    // its own explicit "reveal" gets (GPT's own prompt guidance already
+    // tells it omitting "reveal" is fine for the neutral/no-style-preset
+    // case, gpt5.provider.ts — untouched by this fix; fallback captions,
+    // caption-formatting.ts's buildFallbackCaptionsFromWords, never carry
+    // one at all). Previously WORD + FADE (DEFAULT_REVEAL_CONFIG's own
+    // style) at 200ms — a flat, unhurried fade, not the punchy/energetic
+    // feel a modern Reels/Shorts caption wants. WORD + POP at a short
+    // 150ms unit (within the SAME 120-220ms "punchy preset" range the
+    // prompt's own styleSection already recommends GPT reach for) reuses
+    // the EXISTING reveal engine (text-style.ts's resolveRevealUnits/
+    // RevealStyle) verbatim — no new animation system. Only the DEFAULT
+    // used when reveal is absent; any explicit reveal (whole object,
+    // GPT-authored) still wins untouched via `??` short-circuiting.
+    const reveal = caption.reveal ?? { ...DEFAULT_REVEAL_CONFIG, mode: "WORD" as const, style: "POP" as const, unitDurationMs: 150 };
     const richRuns = resolveCaptionHighlightRuns(caption.text, caption.highlightWords);
     const content: ClipContent = {
       text: caption.text,
