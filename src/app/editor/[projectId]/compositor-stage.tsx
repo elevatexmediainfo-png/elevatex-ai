@@ -7,7 +7,7 @@ import {
   type BlendMode,
   type ClipTransform,
 } from "@/lib/video-editor/transform";
-import { DEFAULT_REVEAL_CONFIG, resolveCaptionTypography, resolveRevealUnits, richFormattingAt, resolveRunColor } from "@/lib/video-editor/text-style";
+import { DEFAULT_REVEAL_CONFIG, resolveCaptionTypography, resolveRevealUnits, resolveRunColor, resolveRunFontWeight, richFormattingAt } from "@/lib/video-editor/text-style";
 import { computeTrackZIndex } from "@/lib/video-editor/track-stacking";
 import { assignTrackSlots } from "@/lib/video-editor/track-slot-assignment";
 import {
@@ -911,7 +911,12 @@ function TextLayer({
           // behavior is touched.
           const { bold, italic, underline, color } = richFormattingAt(content.richRuns, unit.charStart, unit.charEnd);
           const runStyle: React.CSSProperties = {
-            fontWeight: bold ? 700 : undefined,
+            // Caption pipeline fix (2026-08-19) — resolveRunFontWeight
+            // (text-style.ts) is the tested single source of truth: a
+            // highlighted/accent word gets EXTRA BOLD (900), scoped to
+            // captions only; the pre-existing explicit `bold` precedence
+            // is untouched.
+            fontWeight: resolveRunFontWeight(bold, color, isSubtitle),
             fontStyle: italic ? "italic" : undefined,
             textDecoration: underline ? "underline" : undefined,
           };

@@ -7,6 +7,7 @@ import {
   resolveCaptionTypography,
   resolveRevealUnits,
   resolveRunColor,
+  resolveRunFontWeight,
   richFormattingAt,
   splitRichTextSegments,
   type RevealConfig,
@@ -188,6 +189,60 @@ describe("resolveRunColor", () => {
 
   it("KARAOKE: a non-current word with no richRun color stays undefined (never gets the highlight color)", () => {
     expect(resolveRunColor(undefined, KARAOKE_REVEAL, false)).toBeUndefined();
+  });
+});
+
+// Caption pipeline fix (2026-08-19, "every word its own visual unit") —
+// resolveRunFontWeight is the tested single source of truth TextLayer now
+// uses so a highlighted (accent-colored) caption word reads as EXTRA BOLD
+// (900), while every normal word stays at the caption's own base BOLD
+// weight (resolveCaptionTypography's 800 default, or GPT's explicit
+// 700-900) — never touched by this function, since it only ever returns
+// undefined for a non-highlighted, non-bold word (letting it inherit the
+// base weight, exactly as before this fix).
+describe("resolveRunFontWeight", () => {
+  it("a highlighted (colored) caption word gets EXTRA BOLD (900)", () => {
+    expect(resolveRunFontWeight(false, "#FFD60A", true)).toBe(900);
+    expect(resolveRunFontWeight(false, "#5AC8FA", true)).toBe(900);
+  });
+
+  it("a normal (uncolored) caption word returns undefined, inheriting the caption's own base BOLD weight unchanged", () => {
+    expect(resolveRunFontWeight(false, undefined, true)).toBeUndefined();
+  });
+
+  it("the pre-existing explicit `bold` rich-run flag still wins, keeping its own exact hardcoded 700 — unrelated to highlightWords", () => {
+    expect(resolveRunFontWeight(true, undefined, true)).toBe(700);
+    expect(resolveRunFontWeight(true, "#FFD60A", true)).toBe(700); // bold wins even when a color is ALSO present
+  });
+
+  it("non-subtitle (general TEXT/OVERLAY) text is completely unchanged — a manually-colored run never gets the caption-only EXTRA BOLD boost", () => {
+    expect(resolveRunFontWeight(false, "#FFD60A", false)).toBeUndefined();
+  });
+
+  it("reproduces the exact word-by-word example: 'Aapko APNA GHAR banana hai' with APNA/GHAR highlighted", () => {
+    // Mirrors resolveRunColor's own precedence for the SAME two words —
+    // together these two functions are what TextLayer actually calls per
+    // word, so this test proves the combined per-word visual result.
+    const NONE_REVEAL: RevealConfig = { ...DEFAULT_REVEAL_CONFIG, mode: "NONE" };
+    const words = [
+      { text: "Aapko", color: undefined },
+      { text: "APNA", color: "#FFD60A" },
+      { text: "GHAR", color: "#5AC8FA" },
+      { text: "banana", color: undefined },
+      { text: "hai", color: undefined },
+    ];
+    const rendered = words.map((w) => ({
+      text: w.text,
+      color: resolveRunColor(w.color, NONE_REVEAL, false),
+      fontWeight: resolveRunFontWeight(false, w.color, true),
+    }));
+    expect(rendered).toEqual([
+      { text: "Aapko", color: undefined, fontWeight: undefined }, // white (inherited) + base BOLD
+      { text: "APNA", color: "#FFD60A", fontWeight: 900 }, // yellow + EXTRA BOLD
+      { text: "GHAR", color: "#5AC8FA", fontWeight: 900 }, // cyan + EXTRA BOLD
+      { text: "banana", color: undefined, fontWeight: undefined }, // white (inherited) + base BOLD
+      { text: "hai", color: undefined, fontWeight: undefined }, // white (inherited) + base BOLD
+    ]);
   });
 });
 

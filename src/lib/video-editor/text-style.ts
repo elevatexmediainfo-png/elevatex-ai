@@ -150,6 +150,27 @@ export function resolveRunColor(richRunColor: string | undefined, reveal: Reveal
   return undefined;
 }
 
+// Caption pipeline fix (2026-08-19, "every word its own visual unit") — a
+// highlighted/accent-colored caption word (richRunColor set — AI Auto-Edit
+// power-word highlighting: highlightWords -> resolveCaptionHighlightRuns()
+// -> RichTextRun.color, ai-timeline-translator.ts) now reads as EXTRA BOLD
+// (900), one tier heavier than the caption's own base weight
+// (resolveCaptionTypography's own 800 default, or GPT's explicit
+// 700-900) — so the 1-2 power words genuinely read as the visual peak of
+// the caption, not just a different color at the same weight. SCOPED TO
+// CAPTIONS ONLY (isSubtitle — same signal resolveCaptionTypography already
+// uses): a manually-colored rich-text run on a general TEXT/OVERLAY clip
+// keeps its prior behavior (undefined, inherits that clip's own base
+// weight) completely untouched. The pre-existing explicit `bold` rich-run
+// flag (a SEPARATE, manual formatting decision, unrelated to
+// highlightWords) keeps its own exact precedence and hardcoded 700,
+// unchanged.
+export function resolveRunFontWeight(bold: boolean, color: string | undefined, isSubtitle: boolean): number | undefined {
+  if (bold) return 700;
+  if (isSubtitle && color) return 900;
+  return undefined;
+}
+
 // Caption pipeline fix (2026-08-17, stabilization audit finding #5) — a
 // literal font-family name like "Poppins"/"Montserrat" (set by GPT's own
 // caption prompt guidance, gpt5.provider.ts, or picked from the manual
