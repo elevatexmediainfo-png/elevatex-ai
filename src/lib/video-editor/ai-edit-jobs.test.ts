@@ -51,6 +51,23 @@ vi.mock("@/lib/generation/reasoning", () => ({ planTimeline: (...args: unknown[]
 const runDirectorPipelineMock = vi.fn();
 vi.mock("./director/orchestrator", () => ({ runDirectorPipeline: (...args: unknown[]) => runDirectorPipelineMock(...args) }));
 
+// Fix (2026-08-16, stabilization audit finding #3) — a PARTIAL mock, same
+// "importOriginal, override one export" pattern already used elsewhere in
+// this codebase (e.g. ai-asset-resolver.test.ts's own ./ai-broll-resolver
+// mock): applyNoDeadScreenFixes defaults to its REAL implementation (set in
+// the global beforeEach below) so every EXISTING no-dead-screen test in
+// this file keeps exercising real gap-detection/fix-building logic
+// unchanged. Only the dedicated describe block further down overrides it
+// (via mockReturnValueOnce) to return a deliberately malformed synthetic
+// item, to prove ai-edit-jobs.ts's own validation drops it without failing
+// the job — real visual-coverage.ts logic never naturally produces an
+// invalid item, so this is the only way to exercise that path.
+const applyNoDeadScreenFixesMock = vi.fn();
+vi.mock("./director/visual-coverage", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./director/visual-coverage")>();
+  return { ...actual, applyNoDeadScreenFixes: (...args: unknown[]) => applyNoDeadScreenFixesMock(...args) };
+});
+
 const resolveBrollItemsMock = vi.fn();
 vi.mock("./ai-broll-resolver", () => ({ resolveBrollItems: (...args: unknown[]) => resolveBrollItemsMock(...args) }));
 
@@ -82,6 +99,8 @@ vi.mock("./ai-scene-removal-proposer", () => ({
 }));
 
 const { processAiEditJob } = await import("./ai-edit-jobs");
+const { applyNoDeadScreenFixes: realApplyNoDeadScreenFixes } = await vi.importActual<typeof import("./director/visual-coverage")>("./director/visual-coverage");
+const { createEmptyVarietyLedger } = await import("./director/variety-ledger");
 
 const BASE_JOB = {
   id: "job_1",
@@ -133,6 +152,10 @@ function mockFullPlanResult() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default to the REAL applyNoDeadScreenFixes for every test — only the
+  // dedicated "invalid auto-inserted item" describe block below overrides
+  // this per-test via mockReturnValueOnce.
+  applyNoDeadScreenFixesMock.mockImplementation(realApplyNoDeadScreenFixes);
   editorProjectFindUniqueMock.mockResolvedValue({ id: "proj_1", aspectRatio: "RATIO_9_16" });
   editorAssetFindFirstMock.mockResolvedValue({ id: "asset_1", status: "READY", kind: "AUDIO", durationSeconds: 10, storageKey: "k" });
   getStorageProviderMock.mockResolvedValue({ getPublicUrl: () => "https://example.com/a.mp4" });
@@ -698,5 +721,156 @@ describe("processAiEditJob — AI Video Director pipeline (flag on)", () => {
       savedPlan.zoom.some((z: { reason?: string }) => z.reason?.includes("no-dead-screen")) ||
       savedPlan.stickers.some((s: { reason?: string }) => s.reason?.includes("no-dead-screen"));
     expect(anyAutoInserted).toBe(true);
+  });
+
+  // Fix (2026-08-16, stabilization audit finding #4) — the legacy path
+  // already falls back to buildFallbackCaptionsFromWords() on a TOTAL
+  // planning failure (see the equivalent legacy-path test in this file);
+  // the Director path never had that fallback wired, so a total first-pass
+  // failure left captions genuinely empty even when real transcript words
+  // existed to caption from (the two tests above use words: [] and so
+  // never exercised this branch at all — this test is the one that
+  // actually has real words). Never overrides captions the Director DID
+  // successfully produce — only reachable when runDirectorPipeline threw.
+  it("Director total failure + real transcript + captions requested -> non-empty deterministic fallback captions", async () => {
+    aiEditJobFindUniqueMock.mockResolvedValue({ ...BASE_JOB, selectedModules: null });
+    runDirectorPipelineMock.mockRejectedValue(new Error("director pipeline blew up"));
+    transcribeAudioMock.mockResolvedValue({
+      providerId: "assemblyai",
+      words: [
+        { word: "hello", startMs: 0, endMs: 300 },
+        { word: "world", startMs: 300, endMs: 600 },
+        { word: "this", startMs: 600, endMs: 900 },
+      ],
+      durationSeconds: 10,
+      costUsd: 0.01,
+    });
+
+    await processAiEditJob("job_1");
+
+    const savedPlan = aiEditJobUpdateMock.mock.calls[0][0].data.timelinePlan;
+    expect(savedPlan.captions.length).toBeGreaterThan(0);
+    expect(savedPlan.captions[0].text).toContain("hello");
+    // planningError semantics unchanged — still surfaces the total-failure
+    // message, the fallback doesn't make the job look like it succeeded.
+    expect(aiEditJobUpdateMock.mock.calls[0][0].data.planningError).toContain("failed to generate ANY creative timeline content");
+  });
+});
+
+// Fix (2026-08-16, stabilization audit finding #3) — GPT's own output is
+// protected item-by-item by parsePlanOutputLeniently, but the no-dead-screen
+// auto-fixer's synthetic broll/zoom/sticker items used to bypass that
+// entirely and only reach the FINAL hard aiTimelinePlanSchema.parse() —
+// one invalid auto-inserted item could throw there and fail the WHOLE job,
+// discarding otherwise-valid captions/broll/etc. too. applyNoDeadScreenFixes
+// itself is mocked per-test here (see the module-level mock above) with a
+// deliberately malformed result — real visual-coverage.ts logic never
+// naturally produces an invalid item, so this is the only way to exercise
+// the failure path these tests prove is now survivable.
+describe("processAiEditJob — auto-inserted no-dead-screen items are validated, not fatal to the job", () => {
+  beforeEach(() => {
+    aiEditJobFindUniqueMock.mockResolvedValue({ ...BASE_JOB, selectedModules: null });
+    // An empty proposed plan on a 10s asset (see the global beforeEach's
+    // durationSeconds: 10) leaves almost the whole video uncovered, well
+    // past AI_EDIT_NO_DEAD_SCREEN_GAP_THRESHOLD_MS (1750ms, this file's
+    // config) — real findDeadScreenGaps() will find a gap, which is all
+    // this describe block needs (applyNoDeadScreenFixes' own RESULT is
+    // mocked below, its real gap-detection input doesn't need to be exact).
+    planTimelineMock.mockResolvedValue({ captions: [], zoom: [], broll: [], stickers: [], sfx: [], transitions: [], costUsd: 0 });
+    resolveBrollItemsMock.mockImplementation((items: unknown[]) => Promise.resolve(items));
+    resolveTimelinePlanAssetsMock.mockImplementation((plan: { stickers: unknown[]; music: unknown; sfx: unknown[] }) => Promise.resolve(plan));
+  });
+
+  it("drops an auto-inserted broll item missing a required field (trackHint), keeps the rest of the plan", async () => {
+    applyNoDeadScreenFixesMock.mockReturnValueOnce({
+      broll: [
+        { startMs: 300, endMs: 400, trackHint: "broll", source: "stock", searchQuery: "office", autoInserted: true }, // valid
+        { startMs: 500, endMs: 600, source: "stock", searchQuery: "office", autoInserted: true }, // invalid: missing required trackHint
+      ],
+      zoom: [],
+      stickers: [],
+      ledger: createEmptyVarietyLedger(),
+      gapsFixed: 1,
+    });
+
+    await processAiEditJob("job_1");
+
+    const savedPlan = aiEditJobUpdateMock.mock.calls[0][0].data.timelinePlan;
+    expect(savedPlan.broll).toHaveLength(1);
+    expect(savedPlan.broll[0].startMs).toBe(300); // the valid item survives
+    expect(aiEditJobUpdateMock.mock.calls[0][0].data.status).toBe("READY_FOR_REVIEW"); // job did not crash
+    expect(aiEditJobUpdateMock.mock.calls[0][0].data.planningError).toContain('no-dead-screen broll[1]" failed validation and was dropped');
+  });
+
+  it("drops an auto-inserted zoom item with an invalid numeric field (scaleTo out of range), keeps the rest of the plan", async () => {
+    applyNoDeadScreenFixesMock.mockReturnValueOnce({
+      broll: [],
+      zoom: [
+        { startMs: 700, endMs: 800, scaleFrom: 100, scaleTo: 110, reason: "no-dead-screen fill" }, // valid
+        { startMs: 900, endMs: 1000, scaleFrom: 100, scaleTo: 5000, reason: "no-dead-screen fill" }, // invalid: scaleTo > 1000
+      ],
+      stickers: [],
+      ledger: createEmptyVarietyLedger(),
+      gapsFixed: 1,
+    });
+
+    await processAiEditJob("job_1");
+
+    const savedPlan = aiEditJobUpdateMock.mock.calls[0][0].data.timelinePlan;
+    expect(savedPlan.zoom).toHaveLength(1);
+    expect(savedPlan.zoom[0].startMs).toBe(700); // the valid item survives
+    expect(aiEditJobUpdateMock.mock.calls[0][0].data.status).toBe("READY_FOR_REVIEW");
+    expect(aiEditJobUpdateMock.mock.calls[0][0].data.planningError).toContain('no-dead-screen zoom[1]" failed validation and was dropped');
+  });
+
+  it("drops an auto-inserted sticker item with an invalid string field (empty assetQuery), keeps the rest of the plan", async () => {
+    applyNoDeadScreenFixesMock.mockReturnValueOnce({
+      broll: [],
+      zoom: [],
+      stickers: [
+        { startMs: 1100, endMs: 1200, assetQuery: "heart icon", reason: "no-dead-screen fill" }, // valid
+        { startMs: 1300, endMs: 1400, assetQuery: "", reason: "no-dead-screen fill" }, // invalid: empty string fails min(1)
+      ],
+      ledger: createEmptyVarietyLedger(),
+      gapsFixed: 1,
+    });
+
+    await processAiEditJob("job_1");
+
+    const savedPlan = aiEditJobUpdateMock.mock.calls[0][0].data.timelinePlan;
+    expect(savedPlan.stickers).toHaveLength(1);
+    expect(savedPlan.stickers[0].startMs).toBe(1100); // the valid item survives
+    expect(aiEditJobUpdateMock.mock.calls[0][0].data.status).toBe("READY_FOR_REVIEW");
+    expect(aiEditJobUpdateMock.mock.calls[0][0].data.planningError).toContain('no-dead-screen stickers[1]" failed validation and was dropped');
+  });
+
+  it("preserves an existing planningError (partial-degradation message) by appending, not overwriting it", async () => {
+    // A genuinely partial planTimeline degradation (some GPT-native items
+    // dropped) already sets planningError before the no-dead-screen pass
+    // ever runs — this proves the auto-insert warning is APPENDED to it,
+    // never silently replacing the original degradation notice.
+    planTimelineMock.mockResolvedValue({
+      captions: [],
+      zoom: [],
+      broll: [],
+      stickers: [],
+      sfx: [],
+      transitions: [],
+      costUsd: 0,
+      warnings: ['"broll[0]" failed validation and was dropped (some GPT field issue).'],
+    });
+    applyNoDeadScreenFixesMock.mockReturnValueOnce({
+      broll: [{ startMs: 500, endMs: 600, source: "stock", searchQuery: "office", autoInserted: true }], // invalid: missing trackHint
+      zoom: [],
+      stickers: [],
+      ledger: createEmptyVarietyLedger(),
+      gapsFixed: 1,
+    });
+
+    await processAiEditJob("job_1");
+
+    const planningError = aiEditJobUpdateMock.mock.calls[0][0].data.planningError as string;
+    expect(planningError).toContain("Some items in the AI's plan were invalid"); // original GPT-native degradation message
+    expect(planningError).toContain('no-dead-screen broll[0]" failed validation and was dropped'); // appended, not replaced
   });
 });

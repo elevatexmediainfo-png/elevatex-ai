@@ -5,7 +5,7 @@ import { transcribeAudio } from "@/lib/generation/transcription";
 import { MOCK_PROVIDER_ID } from "@/lib/generation/types";
 import { analyzeVideo } from "@/lib/generation/video-understanding";
 import { planTimeline } from "@/lib/generation/reasoning";
-import type { ReasoningPlanRequest } from "@/lib/providers/reasoning/types";
+import { safeArraySection, type ReasoningPlanRequest } from "@/lib/providers/reasoning/types";
 import type { VideoUnderstandingResultWithProvider } from "@/lib/providers/video-understanding";
 import { resolveBrollItems } from "./ai-broll-resolver";
 import { resolveTimelinePlanAssets } from "./ai-asset-resolver";
@@ -34,6 +34,9 @@ import {
 } from "./editing-density";
 import {
   aiTimelinePlanSchema,
+  aiBrollSchema,
+  aiZoomSchema,
+  aiStickerSchema,
   AI_TIMELINE_SCHEMA_VERSION,
   AI_ZOOM_SOURCE_CLIP_PLACEHOLDER,
   type AIBroll,
@@ -558,6 +561,21 @@ export async function processAiEditJob(jobId: string): Promise<void> {
           // message above (some items dropped, most still applied).
           planningError = `The AI Video Director failed to generate ANY creative timeline content (captions, b-roll, zoom, stickers, music, sfx, transitions) for this video: ${err instanceof Error ? err.message : "unknown error"}. Only scene removal (computed independently, before this step) succeeded.`;
           logger.error({ err, jobId }, "[ai edit job] director pipeline planning failed completely — continuing with sceneRemoval only, no creative content generated");
+          // Fix (2026-08-16, stabilization audit finding #4) — the legacy
+          // path's own catch (below) already falls back to the deterministic
+          // buildFallbackCaptionsFromWords() chunker on a total failure (see
+          // that call site's own doc comment); this Director-path catch
+          // never had the equivalent, leaving captions at their empty
+          // default with no recovery even though real, already-transcribed
+          // words exist to caption from. planningError above is left exactly
+          // as before — this only ensures a viewer isn't left with a fully
+          // blank caption track. Never overrides captions the Director DID
+          // successfully produce — this branch only runs when the pipeline's
+          // first pass threw entirely, before any captions existed at all.
+          if (wantsModule("captions") && transcript.words.length > 0) {
+            captions = buildFallbackCaptionsFromWords(transcript.words).map((c) => ({ text: c.text, startMs: c.startMs, endMs: c.endMs }));
+            logger.info({ jobId, fallbackCaptionCount: captions.length }, "[ai edit job] director pipeline: used deterministic word-chunk fallback captions after total planning failure");
+          }
         }
       } else {
       const repairMaxAttempts = await getConfig("AI_EDIT_REASONING_REPAIR_MAX_ATTEMPTS");
@@ -779,10 +797,48 @@ export async function processAiEditJob(jobId: string): Promise<void> {
           existingBroll: brollProposals,
           maxDwellMs,
         });
-        brollProposals = [...brollProposals, ...fixes.broll];
-        zoom = [...zoom, ...fixes.zoom.map((z) => ({ ...z, clipId: AI_ZOOM_SOURCE_CLIP_PLACEHOLDER }))];
-        stickers = [...stickers, ...fixes.stickers];
-        const insertedCount = fixes.broll.length + fixes.zoom.length + fixes.stickers.length;
+        // Fix (2026-08-16, stabilization audit finding #3) — these synthetic
+        // items are appended straight into the plan and, unlike GPT's own
+        // output (protected item-by-item by parsePlanOutputLeniently
+        // upstream), previously only ever reached the FINAL hard
+        // aiTimelinePlanSchema.parse() below — one invalid auto-inserted
+        // item (a bad field this heuristic's own construction code
+        // produced) could throw there and fail the ENTIRE job, discarding
+        // otherwise-good captions/broll/etc. too (the searchQueries>10 cap,
+        // 2026-08-13, was one real instance of exactly this failure class).
+        // Reuses safeArraySection verbatim (reasoning/types.ts) — the SAME
+        // lenient, item-by-item gate GPT's own output already gets, not a
+        // second implementation. Schema/limits/thresholds are untouched:
+        // this only decides whether an already-produced item is KEPT, never
+        // changes what a valid item looks like. clipId is applied to zoom
+        // fixes BEFORE validation so aiZoomSchema's own requirement for it
+        // is checked against the real, final value.
+        const autoInsertWarnings: string[] = [];
+        const validBrollFixes = safeArraySection(fixes.broll, aiBrollSchema, "no-dead-screen broll", autoInsertWarnings);
+        const validZoomFixes = safeArraySection(
+          fixes.zoom.map((z) => ({ ...z, clipId: AI_ZOOM_SOURCE_CLIP_PLACEHOLDER })),
+          aiZoomSchema,
+          "no-dead-screen zoom",
+          autoInsertWarnings
+        );
+        const validStickerFixes = safeArraySection(fixes.stickers, aiStickerSchema, "no-dead-screen stickers", autoInsertWarnings);
+
+        if (autoInsertWarnings.length > 0) {
+          // Visible in both the job's own planningError (same surfaced-
+          // degradation channel GPT-native item drops already use — never
+          // silently swallowed) and the logs (full per-item Zod detail, via
+          // safeArraySection's own warning message) — genuine programming/
+          // schema problems in the auto-fixer's own construction code stay
+          // fully observable, they're just no longer fatal to the job.
+          const autoInsertMessage = `Some auto-inserted "no dead screen" safety-net items were invalid and were skipped, everything else still applied: ${autoInsertWarnings.join(" ")}`;
+          planningError = planningError ? `${planningError} ${autoInsertMessage}` : autoInsertMessage;
+          logger.warn({ jobId, autoInsertWarnings }, "[ai edit job] no-dead-screen pass produced one or more invalid auto-inserted items — dropped, rest of the plan (including the rest of this pass's own fixes) preserved");
+        }
+
+        brollProposals = [...brollProposals, ...validBrollFixes];
+        zoom = [...zoom, ...validZoomFixes];
+        stickers = [...stickers, ...validStickerFixes];
+        const insertedCount = validBrollFixes.length + validZoomFixes.length + validStickerFixes.length;
         logger.info(
           { jobId, gapsFixed: gaps.length, visualEventsInserted: insertedCount, maxDwellMs, hadPlanningError: planningError != null },
           "[ai edit job] no-dead-screen pass filled uncovered talking-head stretches"

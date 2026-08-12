@@ -203,7 +203,18 @@ export type ReasoningPlanOutput = z.infer<typeof reasoningPlanOutputSchema>;
 // — there's nothing to salvage from that shape. "music" is a lone object,
 // not an array, so it gets its own single safeParse rather than
 // safeArraySection.
-function safeArraySection<T>(raw: unknown, itemSchema: z.ZodType<T>, sectionName: string, warnings: string[]): T[] {
+//
+// Exported (2026-08-16, stabilization audit finding #3) — reused as-is by
+// ai-edit-jobs.ts to validate the no-dead-screen auto-fixer's own synthetic
+// broll/zoom/sticker items before they're merged into the plan. Those items
+// previously bypassed this lenient, item-by-item gate entirely (they're
+// appended straight into the arrays this function's OWN caller,
+// parsePlanOutputLeniently, already protects for the model's output) and
+// only ever reached the plan's final hard aiTimelinePlanSchema.parse() —
+// one invalid auto-inserted field could fail the ENTIRE job, discarding
+// otherwise-valid captions/broll/etc. Same function, same semantics, a
+// second caller — not a duplicated implementation.
+export function safeArraySection<T>(raw: unknown, itemSchema: z.ZodType<T>, sectionName: string, warnings: string[]): T[] {
   if (raw === undefined) return [];
   if (!Array.isArray(raw)) {
     warnings.push(`"${sectionName}" was expected to be an array in the model's response but was not — treated as empty for this attempt.`);

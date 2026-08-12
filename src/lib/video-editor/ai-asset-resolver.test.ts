@@ -148,7 +148,7 @@ describe("resolveSfx", () => {
       outcomes: [{ providerId: "pixabay", results: query === "whoosh" ? [{ externalId: "sfx-1", title: "whoosh", previewUrl: "p", downloadUrl: "d", kind: "AUDIO" }] : [] }],
     }));
     pickBestStockResultMock.mockImplementation((outcomes: { results: unknown[] }[]) =>
-      outcomes[0]?.results.length ? { providerId: "pixabay", result: outcomes[0].results[0] } : null
+      outcomes[0]?.results.length ? { providerId: "pixabay", result: outcomes[0].results[0], relevanceScore: 0.9 } : null
     );
     materializeStockAssetMock.mockResolvedValue({ id: "asset-whoosh", url: "https://cdn/whoosh.mp3", thumbnailUrl: null });
 
@@ -158,6 +158,45 @@ describe("resolveSfx", () => {
     expect(results[0].assetId).toBe("asset-whoosh");
     expect(results[1].assetId).toBeUndefined();
     expect(results[1].resolutionNote).toContain("No stock audio match");
+  });
+
+  // Fix (2026-08-16, stabilization audit finding #1/#2) — resolveSfxItem
+  // used to have NO relevance floor at all (unlike stickers/broll), so
+  // whatever pickBestStockResult returned got materialized regardless of
+  // score. Same 0.5 default threshold stickers/broll already use.
+  it("accepts a relevant SFX candidate (relevanceScore >= 0.5)", async () => {
+    searchStockMediaMock.mockResolvedValue({ outcomes: [{ providerId: "pixabay", results: [{ externalId: "sfx-relevant", title: "whoosh transition", previewUrl: "p", downloadUrl: "d", kind: "AUDIO" }] }] });
+    pickBestStockResultMock.mockReturnValue({ providerId: "pixabay", result: { externalId: "sfx-relevant", title: "whoosh transition", previewUrl: "p", downloadUrl: "d", kind: "AUDIO" }, relevanceScore: 0.8 });
+    materializeStockAssetMock.mockResolvedValue({ id: "asset-relevant-sfx", url: "https://cdn/whoosh.mp3", thumbnailUrl: null });
+
+    const items: AISfx[] = [{ atMs: 1000, assetQuery: "whoosh" }];
+    const [result] = await resolveSfx(items, CTX);
+
+    expect(result.assetId).toBe("asset-relevant-sfx");
+    expect(materializeStockAssetMock).toHaveBeenCalled();
+  });
+
+  it("rejects an irrelevant low-score SFX candidate instead of forcing a bad asset (relevanceScore < 0.5)", async () => {
+    searchStockMediaMock.mockResolvedValue({ outcomes: [{ providerId: "pixabay", results: [{ externalId: "sfx-weak", title: "totally unrelated ambient track", previewUrl: "p", downloadUrl: "d", kind: "AUDIO" }] }] });
+    pickBestStockResultMock.mockReturnValue({ providerId: "pixabay", result: { externalId: "sfx-weak", title: "totally unrelated ambient track", previewUrl: "p", downloadUrl: "d", kind: "AUDIO" }, relevanceScore: 0.2 });
+
+    const items: AISfx[] = [{ atMs: 1000, assetQuery: "whoosh" }];
+    const [result] = await resolveSfx(items, CTX);
+
+    expect(result.assetId).toBeUndefined();
+    expect(result.resolutionNote).toContain("below the 0.5 confidence threshold");
+    expect(materializeStockAssetMock).not.toHaveBeenCalled();
+  });
+
+  it("does not apply a relevance floor to music — resolveMusic's own behavior is unchanged by the SFX fix", async () => {
+    searchStockMediaMock.mockResolvedValue({ outcomes: [{ providerId: "pixabay", results: [{ externalId: "trk-weak", title: "totally unrelated track", previewUrl: "p", downloadUrl: "d", kind: "AUDIO" }] }] });
+    pickBestStockResultMock.mockReturnValue({ providerId: "pixabay", result: { externalId: "trk-weak", title: "totally unrelated track", previewUrl: "p", downloadUrl: "d", kind: "AUDIO" }, relevanceScore: 0.05 });
+    materializeStockAssetMock.mockResolvedValue({ id: "asset-music-weak", url: "https://cdn/asset-music-weak.mp3", thumbnailUrl: null });
+
+    const result = await resolveMusic({ searchQuery: "any mood", duckingEnabled: true }, CTX);
+
+    expect(result?.assetId).toBe("asset-music-weak");
+    expect(materializeStockAssetMock).toHaveBeenCalled();
   });
 });
 

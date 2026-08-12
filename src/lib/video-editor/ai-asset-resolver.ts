@@ -38,6 +38,18 @@ export interface TimelineAssetResolutionContext {
 // to whenever a job doesn't override it.
 const STICKER_MIN_RELEVANCE_SCORE = 0.5;
 
+// Fix (2026-08-16, stabilization audit finding #1/#2) — resolveSfxItem
+// below had no relevance floor at all — unlike stickers (fixed 2026-08-12,
+// immediately above) and broll's own resolveStockBroll, whatever
+// resolveStockAudio's pickBestStockResult returned got materialized
+// regardless of how low its own relevanceScore was. Same fixed 0.5
+// default broll/stickers already use — SFX has no per-job configurable
+// override today either, same reasoning as STICKER_MIN_RELEVANCE_SCORE's
+// own doc comment. Deliberately a SEPARATE constant (not a shared import)
+// so SFX and stickers can be tuned independently in the future without
+// coupling the two.
+const SFX_MIN_RELEVANCE_SCORE = 0.5;
+
 // Milestone 9's STOCK_ASSET_LIBRARY (Admin Panel, `lib/admin/config.ts`)
 // — "Media Library's Stock assets tab and the Video Editor's Sticker
 // layer both read this same curated list" per its own doc comment. Real,
@@ -95,12 +107,26 @@ async function resolveSticker(item: AISticker, ctx: TimelineAssetResolutionConte
   }
 }
 
-async function resolveStockAudio(query: string, ctx: TimelineAssetResolutionContext): Promise<{ id: string; url: string; thumbnailUrl: string | null } | null> {
+// `minRelevanceScore` (2026-08-16) — optional, same shape as
+// ai-broll-resolver.ts's resolveStockBroll: when given and the best pick's
+// own relevanceScore falls below it, this rejects the candidate (`rejected`
+// set, `resolved` stays null) instead of materializing a poor match.
+// resolveMusic below never passes this (stays undefined), so music's own
+// resolution behavior is completely unchanged by this fix — only
+// resolveSfxItem opts in.
+async function resolveStockAudio(
+  query: string,
+  ctx: TimelineAssetResolutionContext,
+  minRelevanceScore?: number
+): Promise<{ resolved: { id: string; url: string; thumbnailUrl: string | null } | null; rejected?: { title: string; relevanceScore: number } }> {
   const { outcomes } = await searchStockMedia("STOCK_MEDIA", query, { type: "audio", perPage: 5 });
   const picked = pickBestStockResult(outcomes, "AUDIO", query);
-  if (!picked) return null;
+  if (!picked) return { resolved: null };
+  if (minRelevanceScore != null && picked.relevanceScore < minRelevanceScore) {
+    return { resolved: null, rejected: { title: picked.result.title, relevanceScore: picked.relevanceScore } };
+  }
   const materialized = await materializeStockAsset(ctx.userId, picked.providerId, "STOCK_MEDIA", picked.result);
-  return materialized;
+  return { resolved: materialized };
 }
 
 // CRITICAL per the founder's own instruction: this function only ever
@@ -117,7 +143,7 @@ async function resolveMusic(item: AIMusic | undefined, ctx: TimelineAssetResolut
   if (!item.searchQuery) return { ...item, resolutionNote: "No searchQuery was provided." };
 
   try {
-    const resolved = await resolveStockAudio(item.searchQuery, ctx);
+    const { resolved } = await resolveStockAudio(item.searchQuery, ctx);
     if (!resolved) return { ...item, resolutionNote: `No stock audio match for "${item.searchQuery}".` };
     return { ...item, assetId: resolved.id, resolvedAssetUrl: resolved.thumbnailUrl ?? resolved.url };
   } catch (err) {
@@ -132,7 +158,21 @@ async function resolveSfxItem(item: AISfx, ctx: TimelineAssetResolutionContext):
   if (!item.assetQuery) return { ...item, resolutionNote: "No assetQuery was provided." };
 
   try {
-    const resolved = await resolveStockAudio(item.assetQuery, ctx);
+    const { resolved, rejected } = await resolveStockAudio(item.assetQuery, ctx, SFX_MIN_RELEVANCE_SCORE);
+    if (rejected) {
+      // Same rejection pattern as resolveSticker/resolveStockBroll above —
+      // a match was found but scored too low to trust, so it's kept
+      // unresolved (no assetId) with a resolutionNote explaining why,
+      // rather than materializing a poor match.
+      logger.warn(
+        { assetQuery: item.assetQuery, bestTitle: rejected.title, relevanceScore: rejected.relevanceScore, threshold: SFX_MIN_RELEVANCE_SCORE },
+        "[ai asset resolver] best SFX match scored below the relevance confidence threshold — rejecting rather than using a poor match"
+      );
+      return {
+        ...item,
+        resolutionNote: `Best stock match ("${rejected.title}") scored ${rejected.relevanceScore.toFixed(2)} relevance for "${item.assetQuery}", below the ${SFX_MIN_RELEVANCE_SCORE} confidence threshold.`,
+      };
+    }
     if (!resolved) return { ...item, resolutionNote: `No stock audio match for "${item.assetQuery}".` };
     return { ...item, assetId: resolved.id, resolvedAssetUrl: resolved.thumbnailUrl ?? resolved.url };
   } catch (err) {
