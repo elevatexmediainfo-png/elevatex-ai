@@ -504,6 +504,19 @@ describe("GPT5ReasoningProvider.plan", () => {
       expect(userMessage).toContain("Do NOT randomly alternate colors");
     });
 
+    // Fix (2026-08-18) — narrows the typical highlight count from "usually
+    // 2-4" down to "usually 1-2" (a real, deliberate wording change — the
+    // schema's own highlightWords.max(4) ceiling is untouched, this only
+    // steers GPT's normal/typical behavior lower, an occasional 3rd/4th
+    // word is still schema-valid when genuinely warranted). A plain,
+    // all-white caption remains explicitly valid too.
+    it("steers the typical highlight count to 1-2 words per caption, not 2-4", async () => {
+      const userMessage = await getUserMessage();
+      expect(userMessage).toContain("USUALLY JUST 1-2 highlighted words per caption");
+      expect(userMessage).toContain("Not every caption needs highlighting at all — a plain, all-white caption is a completely valid, common choice");
+      expect(userMessage).not.toContain("usually 2-4");
+    });
+
     it("recommends an existing bold Google Font (Poppins/Montserrat) via the existing style.fontFamily field, not a new mechanism", async () => {
       const userMessage = await getUserMessage();
       expect(userMessage).toContain("Poppins");
