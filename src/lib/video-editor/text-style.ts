@@ -129,6 +129,27 @@ export const DEFAULT_REVEAL_CONFIG: RevealConfig = {
   highlightColor: "#FFD60A",
 };
 
+// Fix (2026-08-15) — richFormattingAt() already computed a reveal unit's
+// `color` (AI Auto-Edit power-word highlighting: highlightWords ->
+// resolveCaptionHighlightRuns() -> RichTextRun.color,
+// ai-timeline-translator.ts), but the renderer (TextLayer,
+// compositor-stage.tsx) never applied it to the rendered span, silently
+// dropping colors that were already being generated. Extracted as its
+// own pure function (not inlined in the renderer) so this decision is
+// covered by a real unit test without needing a React component test
+// harness — none exists in this project yet, and building one was out of
+// scope for this fix. Precedence matches richFormattingAt's own doc
+// comment: an explicit richRun color is always a hard override; KARAOKE's
+// reveal.highlightColor only ever applies as a fallback for the CURRENT
+// word when no richRun color is set — exactly the pre-existing KARAOKE
+// behavior, now just reachable alongside richRun colors instead of being
+// unconditionally overwritten by them.
+export function resolveRunColor(richRunColor: string | undefined, reveal: RevealConfig, isCurrentKaraokeWord: boolean): string | undefined {
+  if (richRunColor) return richRunColor;
+  if (reveal.mode === "KARAOKE" && isCurrentKaraokeWord) return reveal.highlightColor;
+  return undefined;
+}
+
 export interface RevealUnit {
   text: string;
   isWhitespace: boolean;

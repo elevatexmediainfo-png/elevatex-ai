@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_REVEAL_CONFIG, resolveRevealUnits, richFormattingAt, splitRichTextSegments, type RevealConfig, type RichTextRun } from "./text-style";
+import { DEFAULT_REVEAL_CONFIG, resolveRevealUnits, resolveRunColor, richFormattingAt, splitRichTextSegments, type RevealConfig, type RichTextRun } from "./text-style";
 
 describe("splitRichTextSegments", () => {
   it("returns one plain segment when there are no runs", () => {
@@ -145,5 +145,37 @@ describe("richFormattingAt", () => {
         3
       ).color
     ).toBe("#FF3B30");
+  });
+});
+
+// Fix (2026-08-15) — richFormattingAt() (above) already computed `color`
+// correctly; the real bug was that the renderer (TextLayer, compositor-
+// stage.tsx) never applied it. resolveRunColor() is the extracted,
+// tested single source of truth for the precedence TextLayer now uses.
+describe("resolveRunColor", () => {
+  const NONE_REVEAL: RevealConfig = { ...DEFAULT_REVEAL_CONFIG, mode: "NONE" };
+  const WORD_REVEAL: RevealConfig = { ...DEFAULT_REVEAL_CONFIG, mode: "WORD" };
+  const KARAOKE_REVEAL: RevealConfig = { ...DEFAULT_REVEAL_CONFIG, mode: "KARAOKE", highlightColor: "#FF3B30" };
+
+  it("returns an explicit richRun color for a normal (non-karaoke) reveal", () => {
+    expect(resolveRunColor("#FFD60A", NONE_REVEAL, false)).toBe("#FFD60A");
+    expect(resolveRunColor("#FFD60A", WORD_REVEAL, false)).toBe("#FFD60A");
+  });
+
+  it("returns undefined (falls back to the base/primary color) when no richRun color is set on a normal reveal", () => {
+    expect(resolveRunColor(undefined, NONE_REVEAL, false)).toBeUndefined();
+    expect(resolveRunColor(undefined, WORD_REVEAL, false)).toBeUndefined();
+  });
+
+  it("KARAOKE: an explicit richRun color wins even on the current word (hard override, matches richFormattingAt's own documented precedence)", () => {
+    expect(resolveRunColor("#5AC8FA", KARAOKE_REVEAL, true)).toBe("#5AC8FA");
+  });
+
+  it("KARAOKE: falls back to reveal.highlightColor for the current word when no richRun color is set (pre-existing behavior, unchanged)", () => {
+    expect(resolveRunColor(undefined, KARAOKE_REVEAL, true)).toBe("#FF3B30");
+  });
+
+  it("KARAOKE: a non-current word with no richRun color stays undefined (never gets the highlight color)", () => {
+    expect(resolveRunColor(undefined, KARAOKE_REVEAL, false)).toBeUndefined();
   });
 });

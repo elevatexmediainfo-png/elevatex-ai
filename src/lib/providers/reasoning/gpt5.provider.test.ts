@@ -447,6 +447,71 @@ describe("GPT5ReasoningProvider.plan", () => {
     });
   });
 
+  // Fix (2026-08-15, "captions appearing in Devanagari script") — tightened
+  // CAPTION_VOICE_AND_HIGHLIGHT_GUIDANCE, included unconditionally in every
+  // plan_timeline prompt (not gated behind a style preset). These are
+  // prompt-content assertions only — no LLM call semantics changed, no new
+  // call added, no schema/timing touched.
+  describe("caption voice/highlight guidance — Roman Hinglish + 3-color hierarchy", () => {
+    async function getUserMessage(): Promise<string> {
+      const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
+      vi.stubGlobal("fetch", fetchMock);
+      const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
+      await provider.plan(BASE_REQUEST);
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      return body.messages.find((m: { role: string }) => m.role === "user").content as string;
+    }
+
+    it("requires Roman/Latin script for Hindi/Hinglish speech and explicitly forbids Devanagari", async () => {
+      const userMessage = await getUserMessage();
+      expect(userMessage).toContain("MUST use Roman/Latin script");
+      expect(userMessage).toContain("NEVER Devanagari script");
+    });
+
+    it("explicitly forbids stiff/academic transliteration, not just Devanagari", async () => {
+      const userMessage = await getUserMessage();
+      expect(userMessage.toLowerCase()).toContain("academic");
+      expect(userMessage.toLowerCase()).toContain("transliteration");
+    });
+
+    it("contains the exact desired natural-Hinglish example, distinct from both the Devanagari and academic-transliteration bad examples", async () => {
+      const userMessage = await getUserMessage();
+      expect(userMessage).toContain("जिससे हमें चार साल की उम्र में"); // BAD (Devanagari)
+      expect(userMessage).toContain("Jisase hamem caar saal kii umar mem"); // BAD (academic)
+      expect(userMessage).toContain("Jisse humein 4 saal ki umar mein"); // GOOD (natural)
+    });
+
+    it("contains the 3-color hierarchy: white (primary), yellow (accent 1), cyan/light blue (accent 2)", async () => {
+      const userMessage = await getUserMessage();
+      expect(userMessage).toContain("PRIMARY");
+      expect(userMessage).toContain("#FFFFFF");
+      expect(userMessage).toContain("ACCENT 1");
+      expect(userMessage).toContain("#FFD60A");
+      expect(userMessage).toContain("ACCENT 2");
+      expect(userMessage).toContain("#5AC8FA");
+    });
+
+    it("no longer offers red or green as highlight colors (tightened from 5 colors down to exactly 3)", async () => {
+      const userMessage = await getUserMessage();
+      expect(userMessage).not.toContain("#FF3B30"); // red — removed
+      expect(userMessage).not.toContain("#34C759"); // green — removed
+    });
+
+    it("explicitly prohibits rainbow/random per-word coloring", async () => {
+      const userMessage = await getUserMessage();
+      expect(userMessage.toLowerCase()).toContain("rainbow");
+      expect(userMessage).toContain("Do NOT color most of the caption");
+      expect(userMessage).toContain("Do NOT randomly alternate colors");
+    });
+
+    it("recommends an existing bold Google Font (Poppins/Montserrat) via the existing style.fontFamily field, not a new mechanism", async () => {
+      const userMessage = await getUserMessage();
+      expect(userMessage).toContain("Poppins");
+      expect(userMessage).toContain("Montserrat");
+      expect(userMessage).toContain('"style.fontFamily"');
+    });
+  });
+
   it("passes videoAnalysis emphasis moments through to the prompt when provided", async () => {
     const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
     vi.stubGlobal("fetch", fetchMock);
@@ -556,7 +621,12 @@ describe("GPT5ReasoningProvider.plan", () => {
 
   // TASKS 1/2/3/4/5/6/8/9/10 (2026-08-07 — "upgrade the entire AI Auto-Edit
   // pipeline").
-  it("instructs viral hook-style captions, Roman-script Hinglish default, power words, and CTA generation", async () => {
+  // Fix (2026-08-15) — the literal "Roman-script Hinglish" phrase and the
+  // red (#FF3B30) highlight color were both intentionally removed/replaced
+  // when this guidance was tightened (see the dedicated "caption voice/
+  // highlight guidance" describe block above for the full new-wording
+  // coverage) — updated here to match, not weakened.
+  it("instructs viral hook-style captions, Roman/Latin script default, power words, and CTA generation", async () => {
     const fetchMock = vi.fn().mockResolvedValue(chatResponse(VALID_JSON));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -567,11 +637,11 @@ describe("GPT5ReasoningProvider.plan", () => {
     const userMessage = body.messages.find((m: { role: string }) => m.role === "user").content as string;
     expect(userMessage).toContain("viral, hook-style captions");
     expect(userMessage).toContain("WARNING, STOP, SAVE, SECRET, PRO TIP, DON'T, BIGGEST, WHY, HOW, TOP 3, IMPORTANT, NEVER");
-    expect(userMessage).toContain("Roman-script Hinglish");
+    expect(userMessage).toContain("MUST use Roman/Latin script");
     expect(userMessage).toContain("NEVER Devanagari script");
     expect(userMessage).toContain("Follow For More");
     expect(userMessage).toContain("highlightWords");
-    expect(userMessage).toContain("#FF3B30");
+    expect(userMessage).toContain("#FFD60A");
   });
 
   it("instructs zoom triggers based on questions/numbers/emphasis with anti-repetition guidance", async () => {
@@ -968,7 +1038,7 @@ describe("GPT5ReasoningProvider — Director agents", () => {
     expect(result.captions).toEqual([{ text: "Hello world.", startMs: 0, endMs: 600 }]);
     const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
     expect(userMessage).toContain("viral, hook-style captions");
-    expect(userMessage).toContain("Roman-script Hinglish");
+    expect(userMessage).toContain("MUST use Roman/Latin script");
     expect(userMessage).toContain("highlightWords");
   });
 
@@ -988,20 +1058,29 @@ describe("GPT5ReasoningProvider — Director agents", () => {
   });
 
   // Quality upgrade (2026-08-07, TASK 6) — the Director-only caption
-  // enhancement (Hinglish restructuring example, finance vocabulary, 2-4
-  // color instruction) must reach the Caption agent's own prompt, WITHOUT
-  // altering the legacy buildPrompt()'s shared CAPTION_VOICE_AND_HIGHLIGHT_
-  // GUIDANCE constant (see gpt5.provider.test.ts's own "legacy path"
-  // describe block for byte-identical verification of that).
-  it("planCaptions prompt: TASK 6 restructuring example, finance vocabulary, and 2-4 color instruction", async () => {
+  // enhancement (Hinglish restructuring example, power-word color
+  // guidance) must reach the Caption agent's own prompt, WITHOUT altering
+  // the legacy buildPrompt()'s shared CAPTION_VOICE_AND_HIGHLIGHT_GUIDANCE
+  // constant (see gpt5.provider.test.ts's own "legacy path" describe block
+  // for byte-identical verification of that).
+  //
+  // Fix (2026-08-15) — the old finance-vocabulary word list and "2-4
+  // DIFFERENT colors" wording were both intentionally replaced when the
+  // color guidance was tightened to a fixed 3-color hierarchy (white/
+  // yellow/cyan, never rainbow) — see the dedicated "caption voice/
+  // highlight guidance" describe block above for full coverage of the new
+  // wording; this test now just confirms that guidance reaches the
+  // Director's planCaptions prompt too, alongside the restructuring example.
+  it("planCaptions prompt: TASK 6 restructuring example and 3-color highlight guidance", async () => {
     const fetchMock = vi.fn().mockResolvedValue(chatResponse(JSON.stringify({ captions: [] })));
     vi.stubGlobal("fetch", fetchMock);
     const provider = new GPT5ReasoningProvider({ apiKey: "test-key" });
     await provider.planCaptions({ words, storyBeats: [] });
     const userMessage = JSON.parse(fetchMock.mock.calls[0][1].body as string).messages[1].content;
     expect(userMessage).toContain("Aaj Investment Seekhte Hai");
-    expect(userMessage).toContain("Investment, Money, Profit, Growth, Business, Success, Mistake, Secret, Truth, Reality");
-    expect(userMessage).toContain("2-4 DIFFERENT colors");
+    expect(userMessage).toContain("#FFD60A");
+    expect(userMessage).toContain("#5AC8FA");
+    expect(userMessage).toContain("Do NOT color most of the caption");
   });
 
   // Polish pass (2026-08-07, "never cover faces") — a real gap: the

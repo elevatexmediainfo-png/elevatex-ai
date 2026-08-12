@@ -7,7 +7,7 @@ import {
   type BlendMode,
   type ClipTransform,
 } from "@/lib/video-editor/transform";
-import { DEFAULT_REVEAL_CONFIG, resolveRevealUnits, richFormattingAt } from "@/lib/video-editor/text-style";
+import { DEFAULT_REVEAL_CONFIG, resolveRevealUnits, richFormattingAt, resolveRunColor } from "@/lib/video-editor/text-style";
 import { computeTrackZIndex } from "@/lib/video-editor/track-stacking";
 import { assignTrackSlots } from "@/lib/video-editor/track-slot-assignment";
 import {
@@ -892,7 +892,18 @@ function TextLayer({
         {revealUnits.map((unit, i) => {
           if (unit.isWhitespace) return <React.Fragment key={i}>{unit.text}</React.Fragment>;
 
-          const { bold, italic, underline } = richFormattingAt(content.richRuns, unit.charStart, unit.charEnd);
+          // Fix (2026-08-15) — richFormattingAt() already computes `color`
+          // (AI Auto-Edit power-word highlighting: highlightWords ->
+          // resolveCaptionHighlightRuns() -> RichTextRun.color,
+          // ai-timeline-translator.ts), but this span only ever applied
+          // bold/italic/underline from the same call, silently dropping
+          // the color that was already being generated. resolveRunColor()
+          // (text-style.ts) is the tested single source of truth for the
+          // precedence (richRun color always wins; KARAOKE's own
+          // highlightColor only ever applies as a fallback for the
+          // current word). No other formatting, timing, or reveal
+          // behavior is touched.
+          const { bold, italic, underline, color } = richFormattingAt(content.richRuns, unit.charStart, unit.charEnd);
           const runStyle: React.CSSProperties = {
             fontWeight: bold ? 700 : undefined,
             fontStyle: italic ? "italic" : undefined,
@@ -901,14 +912,14 @@ function TextLayer({
 
           if (reveal.mode === "KARAOKE") {
             return (
-              <span key={i} style={{ ...runStyle, color: unit.isCurrent ? reveal.highlightColor : undefined }}>
+              <span key={i} style={{ ...runStyle, color: resolveRunColor(color, reveal, unit.isCurrent) }}>
                 {unit.text}
               </span>
             );
           }
           if (reveal.mode === "NONE") {
             return (
-              <span key={i} style={runStyle}>
+              <span key={i} style={{ ...runStyle, color: resolveRunColor(color, reveal, false) }}>
                 {unit.text}
               </span>
             );
@@ -919,7 +930,7 @@ function TextLayer({
               ? { opacity: unit.progress, display: "inline-block", transform: `scale(${0.5 + 0.5 * unit.progress})` }
               : { opacity: unit.progress };
           return (
-            <span key={i} style={{ ...runStyle, ...revealStyle }}>
+            <span key={i} style={{ ...runStyle, color: resolveRunColor(color, reveal, false), ...revealStyle }}>
               {unit.text}
             </span>
           );
