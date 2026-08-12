@@ -167,7 +167,24 @@ export const CONFIG_REGISTRY = {
   },
   GENERATION_TIMEOUT_MS_REASONING: {
     schema: z.number().int().min(1000).max(600_000),
-    default: 60_000,
+    // Fix (2026-08-20, production reliability investigation) — raised
+    // 60_000 -> 120_000. The repair loop (AI_EDIT_REASONING_REPAIR_MAX_
+    // ATTEMPTS, default 1) can require up to 2 sequential real OpenAI
+    // calls (original + one repair round) sharing this SAME engine-attempt
+    // timeout window (gpt5.provider.ts's runPlanJsonRepairLoop reuses the
+    // one AbortSignal engine.ts's withTimeout() creates per attempt) — a
+    // budget sized for 1 call was structurally too tight for an
+    // architecture that can need 2. Real production evidence: "All
+    // REASONING providers failed for plan_timeline: gpt5 (2 attempt(s):
+    // Timed out after 60000ms)" — confirmed root cause of captions
+    // falling back to buildFallbackCaptionsFromWords() (raw, unstyled,
+    // sometimes-Devanagari transcript text) instead of GPT's own
+    // Roman-Hinglish/styled output. 120_000 is 2x the prior value,
+    // structurally derived from "the design already allows 2 sequential
+    // calls per attempt," not an arbitrary guess — see this fix's own
+    // investigation report for the full reasoning. No retry/repair/prompt/
+    // schema logic changed; this is the one config number that governs it.
+    default: 120_000,
     label: "Reasoning (timeline planning) timeout (ms)",
     description: "How long the engine waits for a single GPT-5.x captions/zoom planning call before treating it as failed — text-only, no large upload, so a much shorter ceiling than transcription/video understanding. Phase 12 Module 4.",
     category: "generation_policy",
